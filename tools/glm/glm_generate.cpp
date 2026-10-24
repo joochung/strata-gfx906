@@ -380,8 +380,7 @@ int main(int argc, char ** argv) {
     // it.  Each stage keeps its OWN state (KDA/conv, MLA cache, indexer pools), landing pad and graphs.
     bool staged = false;
     StagedRun sr;
-    int relay_pass_cap = 0;   // the staged run's pass cap (0 = not staged)
-    // (filled after split_plan below, which is where the model's layer count first becomes known)
+    int relay_pass_cap = 0;   // the staged run's pass cap (0 = not staged); set from --gpus below, before dense.init
 
     GlmDense dense;
     GlmDenseConfig dc;
@@ -390,9 +389,19 @@ int main(int argc, char ** argv) {
     dc.n_threads = a.threads > 0 ? a.threads : 8;
     dc.ctx = a.ctx > 0 ? a.ctx : (int64_t) prompt.size() + a.n_predict + 8;
     // A staged run never runs a pass bigger than the staging, so the instance is sized for THAT instead of
-    // --prefill-chunk: a 512-token chunk scratch and its compute buffer stay unallocated.  relay_pass_cap is set by
-    // the split plan below, before dense.init, and stays 0 when --gpus names one stage.
+    // --prefill-chunk: the 512-token chunk scratch and its compute buffer stay unallocated.  The cap is decided
+    // HERE, before dense.init, from --gpus alone: one named device is one stage, whatever the layer points say,
+    // and it is init() that does the sizing.  The full split plan below still validates the layer points and the
+    // device identities, and is what sets `staged`.  Without --gpus, or with one device named, this stays 0 and
+    // dc.max_tokens is --prefill-chunk, exactly as in the last release.
     dc.max_tokens = std::max(1, a.prefill_chunk);
+    if (!a.split.gpus.empty()) {   // --gpus was given (split_args filled a.split.gpus only then)
+        std::vector<int> gpus_named;
+        if (strata::gfx906::split_ints(a.split.gpus, gpus_named) && gpus_named.size() > 1) {
+            relay_pass_cap = std::min(a.relay_chunk > 0 ? a.relay_chunk : 64, dc.max_tokens);
+            dc.max_tokens = relay_pass_cap;
+        }
+    }
     dc.allow_long_ctx = a.allow_long;
     dc.dense_requant = a.dense_requant;
     std::string err;
@@ -425,16 +434,14 @@ int main(int argc, char ** argv) {
                          a.split.n_stage, a.split.gpus.c_str(), same_device_example(a.split.n_stage).c_str());
             return 2;
         }
-        if (a.split.n_stage > 1) {   // the staged run: its stage ranges and its pass cap, before the engine is sized
+        if (a.split.n_stage > 1) {   // the staged run: its stage ranges (the pass cap was set before dense.init)
             staged = true;
-            relay_pass_cap = std::min(a.relay_chunk > 0 ? a.relay_chunk : 64, (int) dc.max_tokens);
             sr.cap = relay_pass_cap;
             for (int s = 0; s < a.split.n_stage; ++s) {
                 sr.lb.push_back(a.split.begin(s));
                 sr.le.push_back(a.split.end[(size_t) s]);
                 sr.stage.push_back(std::make_unique<GlmDense>());
             }
-            dc.max_tokens = relay_pass_cap;   // the instance, and every stage, is sized for a staged pass
             std::fprintf(stderr, "relay: staged run, %d stage(s) on one device, pass cap %d tokens (--relay-chunk)\n",
                          a.split.n_stage, relay_pass_cap);
         }
