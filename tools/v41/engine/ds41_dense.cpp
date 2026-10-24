@@ -1317,6 +1317,9 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     // share_weights (set by build_stages): this stage takes NO weight tensors of its own - it adopted the owner's map
     // BEFORE this init ran (build_stages adopts first, because init builds graphs that look weights up by name).
     if (!im.share_weights && !load_weights(im, err)) return false;
+    // P5.3b SHAPE NOTE: the token ring that feeds these reads is filled in upload_pass, i.e. only on the stage that
+    // runs begin() (stage 0).  So engram layers must live in ONE stage - the cache rule gives that for this model's
+    // pair (1, 14), and a boundary between them would leave a stage hashing against a ring it never fed.
     // The Engram tables are ~GBs of host memory and only the layer range that holds an engram layer reads them, so a
     // stage that owns none does not open them (its graphs never ask: no layer in its range has an eslot).
     const int64_t sen = im.state_end();
