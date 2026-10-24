@@ -288,6 +288,14 @@ not allow (the cache rule, above); and a config that asks a stage to hold rings 
 aborts - the cache rule made that shape unnecessary, and a stage holding a ring nobody reads is a stage the rule was
 not understood by).
 
+**Engram tables follow the range, and the token ring follows the stage.** The Engram tables are GBs of host memory and
+only the range that holds an Engram layer reads them, so a stage opens them only if its own `[lb, le)` holds one
+(`im.eng_slots` = the slots in range, passed to `rows`/`start` so a stage cannot even ask for a row of a layer it does
+not run).  At the witness's boundary (37) the whole Engram pair sits in stage 0.  What does NOT follow the range is the
+engine's rolling token ring (`set_token`): the hash window at position p needs the previous n-1 tokens, and a later
+pass's hash reaches below its own first token, so EVERY stage feeds every token its run sees, including the tail-only
+stage.  That is host memory, not device state, and it is the one thing a stage must duplicate rather than partition.
+
 **The tier needs no cross-device transport** and that is a design fact, not a simplification: at this engine's seam
 the MoE tier is host-in / host-out (`attn_router` returns `fn` on the host, `finish` takes `routed_sum` on the host),
 so it does not care which card ran the layers between its calls.  What it DID need is device pinning - it used to run
