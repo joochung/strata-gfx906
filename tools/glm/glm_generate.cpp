@@ -304,13 +304,11 @@ static bool staged_pass(StagedRun & sr, int n, int pos0,
     };
     // one call per pass, on the LAST stage: every stage after the first owns no token ids, so it is told where the next
     // pass starts (the KDA state cannot rewind, so the ordered-position check stays the engine's, not the caller's)
+    // The driver calls this ONCE per pass, after the last stage's layers ran: the head, and nothing else.  The
+    // stages' ordered-position guard is the last release's own bookkeeping, unchanged: every stage's attn_router_n
+    // checks its pos0 against the next_pos its previous pass left (witness #4 saw a per-pass advance call layered
+    // on top of that double the count and refuse the second pass: "position 0 but the recurrent state is at 14").
     const auto advance = [&](int s, std::string & e) -> bool {
-        for (int k = 1; k < n_stage; ++k)
-            if (!sr.stage[(size_t) k]->advance_stage_pos(pos0, n)) {
-                e = "stage " + std::to_string(k) + ": " + sr.stage[(size_t) k]->last_error();
-                return false;
-            }
-        // every layer of the pass has run; the head reads the last stage's own state region, exactly as unsplit
         if (!finish_head(n)) { e = "head: " + sr.stage[(size_t) s]->last_error(); return false; }
         ++sr.n_pass;
         return true;

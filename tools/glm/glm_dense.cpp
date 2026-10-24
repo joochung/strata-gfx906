@@ -879,9 +879,6 @@ bool GlmDense::init(const std::string & model_path, const GlmDenseConfig & cfg, 
         !load_weights(*im.model, im.backend, im.w, cfg.skip_routed_experts, g.n_layer, err, cfg.dense_requant, im.lb,
                       weight_end(g.n_layer, im.le), im.is_last))
         return false;
-    // A LATER stage takes no token ids, so it cannot see positions advance by itself: the engine tells it with
-    // advance_stage_pos() once per pass, after the last stage's layers ran.  Every stage starts its next_pos at 0,
-    // which is where a later stage's first relayed pass begins too.
     im.next_pos = 0;
     if (im.lb == 0) {   // only the first stage looks tokens up; the others receive embeddings or relayed state
         size_t sh = 0;
@@ -1111,19 +1108,6 @@ bool GlmDense::restore() {
 // in order and cannot rewind) needs the engine to tell it where the next pass starts.  Same check as attn_router_n's,
 // same wording, so a caller sees one rule rather than two: an out-of-order pass on a stage whose recurrent state is
 // already past that position is refused rather than silently mis-sliced.
-bool GlmDense::advance_stage_pos(int pos0, int n) {
-    Impl & im = *p_;
-    if (im.lb == 0) { im.err = "advance_stage_pos: the first stage tracks its own positions"; return false; }
-    if (n < 1) { im.err = "advance_stage_pos: no tokens"; return false; }
-    if (pos0 != im.next_pos) {
-        im.err = "advance_stage_pos: position " + std::to_string(pos0) + " but the recurrent state is at " +
-                 std::to_string(im.next_pos) + " (KDA state cannot rewind; reset() to start over)";
-        return false;
-    }
-    im.next_pos = pos0 + n;
-    return true;
-}
-
 int GlmDense::snapshot_pos() const { return p_->snap_pos; }
 
 // P5.3 step 1: the boundary hand-off OUT of a producer stage.  The pass's state is x_state's token columns [0,n) at
@@ -1433,7 +1417,8 @@ bool GlmDense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
     }
     if (ggml_backend_graph_compute_async(im.backend, var->gf) != GGML_STATUS_SUCCESS) { im.err = "attn graph compute failed"; return false; }
     // The layer that advances the position is the LAST one this instance runs - the model's last layer unsplit, the
-    // last stage's last layer on a split run (an earlier stage leaves next_pos where the pass started).
+    // EVERY stage's last layer, on a split run too: a later stage's own attn_router_n guard then sees the pos0 of
+    // its next pass against the next_pos THIS pass left, exactly like the unsplit engine - no extra bookkeeping call.
     if (il + 1 == im.le) im.next_pos = pos0 + n;
 
     // one readback: n blocks [fn | ids | wts]

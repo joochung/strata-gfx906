@@ -153,11 +153,6 @@ public:
     /// into this stage's state region, which its first layer then reads.  Any stage can do either.
     bool relay_read_out(int n, void * dst, size_t dst_bytes);
     bool relay_write_in(int n, const void * src, size_t src_bytes);
-    /// P5.3 step 1: tell a LATER stage that the pass at positions [pos0, pos0+n) is the next one.  It owns no token
-    /// ids, so it cannot see positions advance on its own, and its ordered-position rule (the KDA state cannot
-    /// rewind) still has to hold.  Refused, with the same wording as the attention check, if pos0 is not where its
-    /// recurrent state says the next pass starts.  The first stage tracks its own positions and refuses this call.
-    bool advance_stage_pos(int pos0, int n);
     /// Selection-only bias per expert of layer il (cache-aware routing); zeros = the model's routing.
     void set_route_bias(int il, const float * bias);
     /// Forget every position (KDA state, conv state, MLA cache rows are simply overwritten from position 0 on).

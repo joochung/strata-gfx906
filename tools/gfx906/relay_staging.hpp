@@ -308,9 +308,9 @@ struct RelayStaging {
 /// `stage_in(s, payload, bytes, err)`  uploads the slot into stage s's landing pad and copies it into the columns
 ///                     its layers read.  The offset is each stage's own business: the producer knows the column
 ///                     its range ends at, the consumer the column its range starts at.
-/// `advance(s, err)`   called ONCE per pass, on the LAST stage, after its layers ran.  A later stage owns no token
-///                     ids, so the engine advances every stage after the first from this one call; the first stage
-///                     tracks its own positions and is never passed to it.
+/// `advance(s, err)`   called ONCE per pass, on the LAST stage, after its layers ran - the engine's seam for the
+///                     head and its per-pass bookkeeping.  Stage positions need no call here: every stage checks
+///                     and advances its own next_pos from the pos0 its attn_router_n receives (the release's rule).
 ///
 /// Everything waits on the host, which is the native relay's rule: the producer's stream is synced inside the
 /// read-out before the successor is launched (docs/gfx906/P5-RELAY-PATTERN.md section 1a).
