@@ -21,6 +21,10 @@
 # ONE ENGINE AT A TIME (SVM crash rule): refuses while any engine is alive (vLLM included -
 # stop it first), or below MIN_AVAIL_GIB (floor per docs/gfx906/P4-RAM-BUDGET.md, arena+25).
 # Deliberate deltas vs the serve config, same as P4.2: no --prune, --route-bias, --lora.
+# Margin 4.0 is the witnessed smoke number (run-p4.2-glm-smoke.sh:54, logs/p4.2-base-20261022-180307.log
+# rc=0): the chunk-MMQ c_stage (2 x 1 GiB device halves) is allocated AFTER the auto expert slots fill to
+# the margin, so margin 2.0 OOMs there (witness #2 died exactly there at 2.0; serve needs 5.0 only for the
+# wrap-up-prefill MMQ burst, which a 14-token smoke + greedy decode does not run).
 set -u
 cd "$(dirname "$0")/../.."
 TS=$(date +%Y%m%d-%H%M%S)
@@ -69,7 +73,7 @@ EOF
 MODEL=/ai/models/hf.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/Maya-L/GLM-5.3-Flash-Maya-L-IQ3_S-00001-of-00004.gguf
 ARGS=(-m "$MODEL" --backend cuda --experts gpu --ids-file "$IDS" -n 64
       --ctx 32768 --arena-gib "$ARENA_GIB" --arena-skip-resident --prefill-chunk 4096 --chunk-mmq
-      --vram-margin 2.0 --arena-adapt --pcie auto --stop 154820,154827,154829)
+      --vram-margin 4.0 --arena-adapt --pcie auto --stop 154820,154827,154829)
 
 # Each run: stdout = the greedy token ids (one per line, glm_generate.cpp prints "%d\n"),
 # stderr = the engine log.  sleep between runs so a finished engine's VRAM is really gone.
