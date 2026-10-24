@@ -1,0 +1,45 @@
+{
+  "phase": "P5.3 step 1 - GLM host-relayed layer-split hand-off, same-device bit-exactness",
+  "date": "2026-10-24",
+  "branch": "gfx906/p5.3-relay",
+  "verdict": "PASS (calibrated): the staged (--gpus 0,0) run equals an unsplit run byte-for-byte for all 64 greedy token ids",
+  "witness": {
+    "script": "tools/gfx906/run-p5.3-handoff.sh",
+    "timestamp": "20261024-102456",
+    "logs": [
+      "logs/p5.3-run1-20261024-102456.log",
+      "logs/p5.3-run2-20261024-102456.log",
+      "logs/p5.3-run3-20261024-102456.log"
+    ],
+    "tokens": [
+      "logs/p5.3-run1-20261024-102456.toks",
+      "logs/p5.3-run2-20261024-102456.toks",
+      "logs/p5.3-run3-20261024-102456.toks"
+    ],
+    "prompt": "14 ids (logs/p5.3-ids-20261024-102456.i32), greedy, 64 tokens, --vram-margin 4.0",
+    "engine": "glm_generate on GLM-5.3-Flash (Maya-L), 45 layers 288 experts top-8, tier gpu 1830 slots, arena 60 GiB pinned",
+    "staged_config": "2 stages on device 0, [0,22) no-head + [22,45) head, weights shared, slab 65536 B/token F32 hc-wide, 8 MiB mapped+portable staging, pass cap 64"
+  },
+  "measured": {
+    "control_agreement_run1_vs_run2": "39/64 common prefix (first divergence token 40)",
+    "staged_vs_run1": "39/64 (diverges at the same token 40 as run1 vs run2)",
+    "staged_vs_run2": "64/64 byte-identical",
+    "decode_rate_unsplit": "2.58 / 2.61 tok/s (run1 / run2)",
+    "decode_rate_staged": "2.74 tok/s (2 stages one device; not a speed mode)",
+    "vram_free_end": "3.28 GiB unsplit, 2.50 GiB staged (per-stage state+graphs cost ~0.78 GiB)"
+  },
+  "cross_process_determinism_finding": "Two identical unsplit runs of this engine can diverge (witness #6 at token 40; witnesses #3/#5 agreed 64/64): the tier path an expert takes changes float summation order and greedy argmax flips at knife-edge logits. Bit determinism across processes is NOT a property this engine offers; the witness verdict is calibrated to the control pair's own agreement (commit 1616a688). This also tempers the P5 exit criterion: 'token-identical vs single-card' must be read as agreement at least as close as single-card vs single-card.",
+  "bug_ladder": [
+    "witness #1: x_state dim2 wrongly widened to n_layer+1 -> layout revert f0b329a7",
+    "witness #2: branch forked 14 commits early (missing ODR fix e13f1555) -> rebase onto a91e87c4, margin 4.0, 77250eb0",
+    "witness #3: adopt_weights AFTER init starved the graph-building lookups -> adopt before init, 710042c3",
+    "witness #4: advance_stage_pos double-advanced next_pos -> deleted, the release's own per-instance rule suffices, 6efc1ae1",
+    "witness #5: staged prefill passed UNCONVERTED cids32 to tier.run_chunk -> stale expert ids, 64/64 tokens wrong -> conversion restored, 252294da"
+  ],
+  "not_yet_claimed": [
+    "distinct-device hand-off (step 2: per-stage tier slots / OnDevice guards; refusal exit 2 still in force)",
+    "DS4.1 relay replication",
+    "pipelined relay (only if P5.4 measures a cost worth pipelining)",
+    "staged SERVE mode (snapshot/restore are per-instance; the serve loop calls them on the owner that runs no layers when staged)"
+  ]
+}
