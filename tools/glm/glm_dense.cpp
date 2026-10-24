@@ -871,9 +871,10 @@ bool GlmDense::init(const std::string & model_path, const GlmDenseConfig & cfg, 
     if (!cfg.is_last && im.le == g.n_layer) { err = "stage [" + std::to_string(im.lb) + "," + std::to_string(im.le) +
                                                    ") is not the last stage but ends at layer " +
                                                    std::to_string(g.n_layer); return false; }
-    // share_weights (set by build_stages) skips the load: the stage adopts the owner's tensors below instead.  The
-    // map is left EMPTY on purpose - WStore::get aborts on a name that is not there, so a stage that asks for a tensor
-    // before its owner handed them over fails loudly rather than reading a dangling pointer.
+    // share_weights (set by build_stages) skips the load: the stage has adopted the owner's tensors BEFORE this init
+    // runs (build_stages adopts first, because the graph builds at the end of init look weights up).  A stage that
+    // reaches a graph build without ever having adopted keeps an EMPTY map and WStore::get aborts on the first name -
+    // loudly, rather than reading a dangling pointer.
     if (!cfg.share_weights &&
         !load_weights(*im.model, im.backend, im.w, cfg.skip_routed_experts, g.n_layer, err, cfg.dense_requant, im.lb,
                       weight_end(g.n_layer, im.le), im.is_last))
@@ -1216,6 +1217,13 @@ bool GlmDense::build_stages(std::vector<std::unique_ptr<GlmDense>> & stage, cons
         GlmDenseConfig sc = cfg[s];
         sc.share_weights = true;   // init(): geometry, checks and graphs - but no weight tensors of its own
         sc.backend = im.backend;   // the owner's backend; the stage neither creates nor frees one
+        // Adopt BEFORE init: init ends by building graphs (ensure_n(1) and this stage's predict graphs), and a
+        // graph build looks weights up by name.  Witness #3 (logs/p5.3-run3-20261024-081532.log) saw the stage's
+        // first eager lookup - blk.3.hc_attn_fn.weight, the model's first hyper-connection tensor - hit the still-
+        // empty map and abort loudly, exactly as init's share_weights comment forecasts.  Borrowing the map up
+        // front is safe under the same invariant as the borrow after it: w_owner is set first, so the stage's
+        // destructor frees nothing it borrowed, and init with share_weights never touches w itself.
+        stage[s]->p_->adopt_weights(&im);
         if (!stage[s]->init(im.model_path, sc, err)) {
             err = "build_stages: stage " + std::to_string(s) + ": " + err;
             return false;
@@ -1227,6 +1235,8 @@ bool GlmDense::build_stages(std::vector<std::unique_ptr<GlmDense>> & stage, cons
             err = "build_stages: stage " + std::to_string(s) + "'s geometry does not match the model this instance loaded";
             return false;
         }
+        // idempotent re-adopt: the map cannot have changed while init ran on one thread, but the geometry check
+        // above is only worth its cost if the borrow is stated at both ends of it
         st.adopt_weights(&im);
     }
     return true;
