@@ -69,6 +69,31 @@ engine reported `length` at 55 of 64 tokens after a wrap-up prefill, and the ser
 analysed in [P4.3-serve-stop-analysis.md](P4.3-serve-stop-analysis.md)):
 [XOLOTL-PORT.md](XOLOTL-PORT.md).
 
+### Layer split for the ported engines: phase P5, step 1 hand-off proven (2026-10-24)
+
+The GLM engine now runs a STAGED pass opt-in (`--gpus 0,0`): the model is split into two stage
+instances over their layer ranges, each owning its KDA/conv/MLA state, and the activation state at
+each boundary is relayed through 8 MiB of pinned host memory (one synchronized copy out and one in,
+64 KiB per token as F32 hc-wide state). Witness on this box: the staged run's 64 greedy token ids
+are byte-identical to an unsplit run of the same prompt
+([receipt](../../benchmarks/gfx906/receipts/2026-10-24-p5.3-glm-relay-handoff-pass.json),
+logs/p5.3-*-20261024-102456). Without the flag nothing changes: the engine builds one instance and
+runs as before.
+
+Measured alongside, and it bounds what any parity claim on this engine can mean: two IDENTICAL
+unsplit runs of this engine can diverge - that witness's control pair agreed on 39 of 64 tokens.
+The path an expert takes (VRAM-resident, CPU arena, PCIe, file tier) changes float summation
+order, and greedy argmax flips at knife-edge logits. Bit determinism across processes is not a
+property this engine offers; the hand-off witness is therefore judged against the control pair's
+own agreement, which the staged run matched (64/64 against one control, and parting from the other
+exactly where the controls part from each other). Staged on one card costs about 0.78 GiB more
+VRAM (per-stage state and graphs) and is a correctness mode, not a speed mode.
+
+Not proven at this checkpoint: hand-off across DIFFERENT cards (the engine still refuses `--gpus
+0,1`; the expert tier allocates its slots on one device and is the next work item), the DS4.1
+engine under staging, staged serve mode (conversation snapshot/restore is per-instance today), and
+any scaling number - the 1/2/4-card curve is P5.5 and no throughput claim is made here.
+
 ## Checked-in CLI
 
 The checked-in gfx906 command entry point is [`tools/gfx906.py`](../../tools/gfx906.py). Run
