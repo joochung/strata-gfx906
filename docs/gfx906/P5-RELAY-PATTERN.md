@@ -221,49 +221,70 @@ reads, with no payload round trip.  `relay_staging.hpp` sizes the slots and hand
 the producer's stream completion observed by the HOST before the successor is launched; there is no cross-device
 CUDA event anywhere in this engine.
 
-**The payload is THREE regions, not one.** GLM hands on `x_state` alone.  DS4.1 hands on:
+**THE ONE THING THAT MAKES DS4.1 DIFFERENT FROM GLM: ITS CACHES ARE SHARED, AND A CACHE CANNOT CROSS A CARD.**
+Everything else about the port follows from that.  In GLM every layer keeps its own KV and reads only it, so a
+boundary can sit almost anywhere.  In DS4.1 a layer reads the compressed KV of the LATEST kv source at or below it and
+the index keys of the latest index source at or below it (`Ds41Geometry::kv_src / idx_src`) - so layer 39 reads layer
+20's compressed KV and layer 36's index keys, and those rings are persistent GPU state allocated once, read by POINTER
+inside a graph.  The relay moves per-token state; it has no way to move a cache, and a per-pass D2H/H2D of a visible
+cache would be gigabytes a token.  Therefore:
 
-| region | tensor | bytes / token (this model) | why it is there |
+> **THE CACHE RULE.**  A stage boundary must be at or above the model's LAST shared-cache layer + 1
+> (`Ds41Dense::split_min_boundary`).  For the shipped 40-layer build: kv sources {2,8,14,20}, index sources
+> {2,8,14,20,24,28,32,36}, so the floor is **37** and the only mid-model split is `--layer-split 37` - layers [0,37) on
+> one card, the tail [37,40) on the other.  Boundaries at 3, 9, 15 or 21 - which a reader who knows the GLM engine
+> would guess, since the layer before each is both a kv and an index source - are REFUSED, with the floor named in the
+> message.  `split_boundaries_ok` enforces it before anything is allocated; `build_attn` aborts if a stage is ever
+> built by hand over a ring it does not own.
+
+**The payload - two regions on this model, and the third one is provably unreachable.** GLM hands on `x_state` alone:
+
+| region | tensor | bytes / token | carried on this model? |
 |---|---|---|---|
-| residual | `x_state` F32 [D, HC, NC] | 5120 x 4 x 4 = 81 920 | the successor's first layer reads it |
-| hc pre-mix | `pre_state` F32 [HC, NC] | 16 | this model's layer l hands layer l+1 an explicit pre-mix; GLM folds that into x_state |
-| candidates | `cand` I32 [CB, NC] | 8 192 | layer `cand_layer` = 20 picks the 2048 blocks the indexers of 24/28/32/36 rank INSIDE |
+| residual | `x_state` F32 [D, HC, NC] | 5120 x 4 x 4 = 81 920 | yes - the successor's first layer reads it |
+| hc pre-mix | `pre_state` F32 [HC, NC] | 16 | yes - this model's layer l hands layer l+1 an explicit pre-mix; GLM folds it into x_state |
+| candidates | `cand` I32 [CB, NC] | 8 192 | **no** - see below |
+
+The candidate column is per-token state, so it COULD ride along like the other two and the machinery is there
+(`relay_cand_from` for the in-place read, a payload region for the copy).  It never does, and the reason is a THEOREM
+about the two rules rather than a property of this checkpoint: a boundary must sit at or above the model's last kv /
+index source + 1, and every layer that ranks inside the candidate blocks IS an index source - so no reader can ever be
+at or above the floor it must clear, and producer plus readers always share a stage.  `test_split_geometry.cpp` asserts
+exactly that (`split_candidates_cross` is false for every shape it can build, including three-stage plans and models
+whose sources are rearranged), which makes the candidate region code a model with a cache OUTSIDE those two lists would
+need - a hybrid SSM state, or a cache named by a key the geometry does not read yet - at 8 KiB a token.  Kept, sized,
+gated, and honest about not firing here.  The witness therefore gates on `cand 0)` in the slab line: a non-zero value
+means the geometry moved underneath the witness, not that a feature turned on.
 
 Each region starts at byte 0 of its tensor (the pass's columns are the leading columns of a column-major tensor), so
-one boundary is a small number of contiguous copies in that fixed order, and `relay_slab_bytes()` is the one number
-both sides size their staging from.
+one boundary is a small number of contiguous copies in a fixed order, and `relay_slab_bytes()` is the ONE number both
+sides size their staging from.  It is deliberately a function of the GEOMETRY, never of a stage's range: two sides of a
+boundary that each computed their own idea of where the copy ends is the worst possible failure mode, so a stage copies
+the whole payload even when it will not read one of its regions.
 
-**Decision 1 - the candidate column is either borrowed or relayed, never recomputed.** A boundary that separates layer
-20 from the indexers above it (the witness splits at 21) has two legal resolutions and the engine picks by card:
-on ONE card the successor's graphs point at the producer's own `cand` tensor (`relay_cand_from`) - zero copies and
-bit-exact by construction, because the ids are the producer's bits, not a re-selection; ACROSS cards nothing may read
-another card's tensor, so the column rides in the payload (8 KiB a token, one memcpy).  Both are bit-exact; neither
-re-runs the top-k.  What is refused outright is a split that STRANDS the producer - stage s can only reach stage s-1,
-so a reader two or more stages behind the producer has nobody to take the column from.
+**Decision 1 - a shared weight set cannot serve two cards.** ggml hands the host an iGPU device pointer, and these two
+cards' copy engines cannot read each other's memory, so a stage that borrows the owner's tensors must run on the
+owner's card.  A cross-card split therefore loads one weight set per card (`--relay-copy-weights`) - the reason the
+witness's cross-device runs need the memory budget - and `ds41_generate` refuses the combination that would look
+cheaper and cannot work.
 
-**Decision 2 - the KV rule, enforced at the geometry rather than discovered in a graph.** A stage's LAST layer must be
-the producer of both the compressed KV and the index keys its successor reads, because that is the only persistent
-state a boundary cannot leave in place: the successor reads those rings by POINTER inside one graph, and relaying them
-per pass would be a D2H/H2D of the whole visible cache every token.  `Ds41Geometry::kv_src/idx_src` resolve to "the
-latest source <= l", so requiring the layer before a boundary to be BOTH a kv source and an index source makes every
-successor read only its own producer's rings.  For the shipped 40-layer build that admits a boundary after layers
-2, 8, 14 and 20 - `--layer-split 16`, `19`, `25` are refused as messages, not as null tensors mid-graph.
-
-**Decision 3 - the pass unit is decoupled from the state columns.** A staged run drops the layer-major WALK (the relay
+**Decision 2 - the pass unit is decoupled from the state columns.** A staged run drops the layer-major WALK (the relay
 has no seam for a sub-batch another stage's graphs wrote) but keeps its column budget: passes of `sr.unit` tokens cycle
 through `NC` columns at `col0 = (pos / unit) % (NC / unit)`, and the position the graphs see is the run's own, not the
 column's.  That is what lets a prompt longer than the window (and longer than the columns, for that matter) run at all,
 and it is why `relay_write_in` takes the ABSOLUTE source position: producer and consumer derive the same column from
 it, so the payload's offset is 0 on both sides.  `set_pass_cap()` narrows a stage's pass without touching its columns -
-a stage that borrows another's candidate tensor must keep the columns that tensor spans.
+a stage that reads another's candidate tensor in place must keep the columns that tensor spans.
 
 **What a staged run refuses**, each with a message rather than a wrong answer: `--serve` (conversation reuse -
 snapshot / park / restore - is per-instance and a staged conversation spans several instances); DSpark (a rejected
 draft overwrites positions a stage already handed over); a stage that shares weights but lands on a different card
 (ggml hands the host an iGPU device pointer that the dGPU's copy engine cannot read, so use `--relay-copy-weights`);
 a pass that would overrun a stage's rings (the per-stage cap is the LAST stage's - the only range that ever sees the
-whole prefix - because an earlier stage's rings hold only `[lb, state_end)`'s output); and a `--layer-split` the
-geometry does not allow.
+whole prefix - because an earlier stage's rings hold only its own range's output); a `--layer-split` the geometry does
+not allow (the cache rule, above); and a config that asks a stage to hold rings it does not run (`cfg.state_le != le`
+aborts - the cache rule made that shape unnecessary, and a stage holding a ring nobody reads is a stage the rule was
+not understood by).
 
 **The tier needs no cross-device transport** and that is a design fact, not a simplification: at this engine's seam
 the MoE tier is host-in / host-out (`attn_router` returns `fn` on the host, `finish` takes `routed_sum` on the host),
@@ -272,10 +293,21 @@ on the ambient device, always 0, because the dense half was its only GPU user - 
 `TierDev` RAII guard at every CUDA seam makes it name its own card even while another stage sets the ambient device.
 
 **Where to read it**: the arithmetic gate is `tools/gfx906/test_split_geometry.{hpp,cpp}` (plain g++, no ggml, no GPU:
-the KV rule, the candidate rule, the payload size, stated against a copied geometry), wired into
+the cache rule, the candidate rule, the payload size, stated against a copied geometry), wired into
 `tools/gfx906/gate-device-split.sh`; the runtime witness is `tools/gfx906/run-p5.3b-ds41-handoff.sh` (five runs: two
 unsplit controls, one `--gpus 0,0` same-card split, two `--gpus 0,1 --relay-copy-weights` twins, verdict calibrated
 against the twin pairs' own agreement, exactly as GLM's witness does).
+
+**One limitation, stated where it can be seen: a DS4.1 split is a tail split, not an even one.** The GLM engine can put
+half the model on each card; here the cache rule permits only `--layer-split 37` of 40 layers, so the second card runs a
+3-layer tail plus the head and lm_head (about a third of the 3 GB of per-layer weights, and much less of the compute).
+That is enough to witness the hand-off moving a real stage and to prove the bytes survive a card change, and it is what
+the geometry allows.  Making DS4.1 splittable anywhere in the middle means relaying a CACHE, not a token column: the
+successor's rings would have to be fed from the producer's compressed KV / index keys, which is a per-pass copy of a
+growing cache rather than 80 KiB a token - that is P5.4/P5.5 territory (the tier split and the scaling curve), not
+something to fake with a boundary that happens to fall on a source layer.  The gate keeps the boundary floor honest:
+if the checkpoint's source lists change, `split_min_boundary` moves and the witness's constant has to move with it
+(`test_plan_gate` asserts the current pairing).
 
 ---
 

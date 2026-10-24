@@ -310,10 +310,11 @@ struct StagedRun {
     std::vector<Ds41DenseConfig> cfg;                // the config each stage was built with (kept for the startup line)
     strata::gfx906::RelayStaging st;                 // the pinned-or-plain staging between them
     size_t slab = 0;                                 // relay_slab_bytes(): the same on every stage
-    // The relayed payload's regions, from the geometry: cand = cand_layer's candidate blocks ride along, xs / ps =
-    // the x_state and pre_state columns, cb = their cand bytes.  A staged run that puts layer 20's producer and its
-    // readers on ONE card relays the state only (cb 0) and reads the producer's candidate tensor in place.
-    bool cand_relay = true;
+    // The relayed payload's regions, from the geometry: xs / ps = the x_state and pre_state columns, cand / cb =
+    // cand_layer's candidate blocks and their bytes.  Under the cache rule the candidate region is NOT carried (a reader
+    // can never reach the boundary floor - see Ds41Dense::cand_can_cross), so cand_relay starts false and the plan sets it
+    // only for a geometry whose caches are not the KV / index source lists.
+    bool cand_relay = false;
     size_t xs = 0, ps = 0, cb = 0;
     // True when the candidate column CROSSES a boundary in this split, i.e. some stage after the producer reads it
     // (by relay or in place).  -1 = the producer and every reader are in ONE stage and nothing crosses at all, which
@@ -327,6 +328,12 @@ struct StagedRun {
     // from the first stage after init (the run cannot know it before the instance sized it).
     int64_t cols = 0;
     std::vector<int64_t> lb, le;                     // the stage ranges, from the split plan
+    // The layer one-past the state a stage owns (the boundary rule's state_end, computed from the geometry before the
+    // stages exist - see the pre-build block).  Equal to le for a stage whose successor starts at its own sources, and
+    // above it otherwise; it is what each stage's config is built with, and it must agree with what Ds41Dense computes
+    // internally, because the relay's per-stage ring caps and the state allocation both read it.
+    std::vector<int64_t> st_le;
+    std::vector<int64_t> run_le;   // the layer one-past the last layer a stage RUNS (its range's end; see st_le)
     std::vector<int> dev;                            // the card each stage runs on (a.split.dev, from --gpus)
     // The pass cap a STAGE may run, by ratio: the compressed rows a stage of THIS range ranks over are the visible
     // rows MINUS the rows its own range has not produced (a stage's rings hold only [lb, state_end)'s output, so the
@@ -352,10 +359,12 @@ struct StagedRun {
     /// position in the callback's signature, would put a value only the run knows into the shared hand-off shape).
     int64_t pos_of = 0;
 
-    /// The stage that owns `l` (the run's layer loop asks this every layer).
+    /// The stage that RUNS `l`.  run_le is the stage's range end - with the cache rule no layer reads across a
+    /// boundary - but the loop and the refusal messages read run_le rather than repeating `le` everywhere, so one
+    /// place defines the tiling.
     int owner(int64_t l) const {
-        for (size_t s = 0; s < le.size(); ++s) if (l < le[s]) return (int) s;
-        return (int) le.size() - 1;
+        for (size_t s = 0; s < run_le.size(); ++s) if (l < run_le[s]) return (int) s;
+        return (int) run_le.size() - 1;
     }
 };
 
@@ -375,7 +384,8 @@ static bool staged_stage_layers(StagedRun & sr, int s, int n, int * ids, float *
                                                           int n, float * out)> & experts,
                                 std::string & err) {
     Ds41Dense & d = *sr.stage[(size_t) s];
-    for (int64_t l = sr.lb[(size_t) s]; l < sr.le[(size_t) s]; ++l) {
+    // The stage's own range, layer by layer (see StagedRun::run_le for why the loop reads run_le).
+    for (int64_t l = sr.lb[(size_t) s]; l < sr.run_le[(size_t) s]; ++l) {
         const float * fn = nullptr;
         if (!d.attn_router((int) l, ids, wts, &fn)) { err = d.last_error(); return false; }
         if (!experts((int) l, ids, wts, fn, n, routed)) { err = "tier refused at layer " + std::to_string(l); return false; }
@@ -452,26 +462,24 @@ static bool staged_pass(StagedRun & sr, int n, int pos0,
     const auto stage_out = [&](int s, uint8_t * slot, size_t slot_bytes, std::string & e) -> bool {
         const double tr = now_ms();
         // The producer writes the state regions and, when the candidates cross a card, its candidate column too.
-        // That is the SLAB minus cand_owner's candidate bytes: the instance itself was told which regions it owns.
-        const bool with_cand = sr.cand_owner < 0 || sr.cand_relay || s != sr.cand_owner;
-        const size_t bytes = with_cand ? sr.slab : sr.slab - sr.cb;
+        // The bytes this boundary moves are the same on both sides, with ONE exception explained below.
         (void) slot_bytes;   // the instance sizes the copy by its OWN slab (see relay_read_out's comment)
-        const bool okc = sr.stage[(size_t) s]->relay_read_out(n, slot, bytes);
+        const bool okc = sr.stage[(size_t) s]->relay_read_out(n, slot, sr.slab);
         sr.ms_relay += now_ms() - tr;
         if (!okc) { e = "stage " + std::to_string(s) + ": " + sr.stage[(size_t) s]->last_error(); return false; }
         sr.n_boundary++;
-        sr.bytes_relayed += bytes;
+        sr.bytes_relayed += sr.slab * (size_t) n;
         return true;
     };
     // the slot straight into the consumer's state region - the region its first layer reads (no landing pad)
     const auto stage_in = [&](int s, const uint8_t * slot, size_t slot_bytes, std::string & e) -> bool {
         const double tr = now_ms();
-        const bool with_cand = sr.cand_owner < 0 || sr.cand_relay || s != sr.cand_owner + 1;
-        const size_t bytes = with_cand ? sr.slab : sr.slab - sr.cb;
-        (void) slot_bytes;   // the instance sizes the copy by its OWN slab (see relay_write_in's comment)
+        // The payload's size is a property of the GEOMETRY, identical on both sides of the boundary by construction
+        // (relay_slab_bytes() never looks at a stage's range), so the two sides cannot disagree about where a copy ends.
+        (void) slot_bytes;   // the instance sizes the copy by its OWN slab, which is the same number
         // pos0 is the unit index; the position the payload lands at is the run's, and the caller passes it in via
         // sr.pos_of (set by staged_feed / staged_step just before the pass).
-        const bool okc = sr.stage[(size_t) s]->relay_write_in(n, slot, bytes, sr.pos_of);
+        const bool okc = sr.stage[(size_t) s]->relay_write_in(n, slot, sr.slab, sr.pos_of);
         sr.ms_relay += now_ms() - tr;
         if (!okc) { e = "stage " + std::to_string(s) + ": " + sr.stage[(size_t) s]->last_error(); return false; }
         return true;
@@ -625,54 +633,55 @@ int main(int argc, char ** argv) {
         }
         std::fprintf(stderr, "ds41_generate: %s\n", strata::gfx906::split_describe(a.split).c_str());
         if (a.split.n_stage > 1) {
-            // THE KV RULE, checked before anything is allocated, so a bad --layer-split is a message and not a stage
-            // that fails mid-graph.  This model's boundaries are its kv AND index source layers: 2, 8, 14, 20, 24, 28,
-            // 32, 36 (for a 40-layer build), so --layer-split 21 is refused and --layer-split 20 is not.
+            // THE CACHE RULE, checked before anything is allocated, so a bad --layer-split is a message and not a
+            // stage that fails mid-graph (Ds41Dense::split_boundaries_ok enforces the same thing): this model shares a
+            // compressed KV and an index-key cache across layers, those caches are persistent GPU state, and the relay
+            // moves per-token state only - so a boundary must sit above the LAST layer any later stage reads from.
             std::vector<int64_t> ends(a.split.end);
             ends.pop_back();   // the last stage ends the model; that boundary is not a boundary
+            // An EVEN split (--layer-split unset) is a reasonable thing to type and, on this model, always wrong: the
+            // stages of a 40-layer model land at 13/26 for three cards and 20 for two, all below the floor.  The
+            // geometry's floor is knowable here, so the message offers the number that works.
+            const bool even_split = a.split.auto_split;
+            // THE MINIMUM BOUNDARY, from the geometry, before anything is allocated: this model's caches (compressed
+            // KV, index keys) are persistent state the per-token relay cannot move, so a stage boundary has to sit
+            // above every layer a later stage reads from - the model's LAST kv / index source.  The message names the
+            // number, because --layer-split is a layer count and the natural guess (the middle of the model) is wrong.
+            const int64_t min_e = Ds41Dense::split_min_boundary(G);
+            for (size_t i = 0; i < ends.size(); ++i) {
+                if (ends[i] < min_e) {
+                    std::fprintf(stderr, "ds41_generate: --layer-split %s: a boundary at layer %lld is below this "
+                                         "model's last shared-cache layer %lld; the next stage would read a compressed "
+                                         "KV / index cache the previous stage owns and the relay cannot move.  Split at "
+                                         "layer %lld or above%s\n",
+                                 even_split ? "(auto)" : a.split.layer_split.c_str(), (long long) ends[i],
+                                 (long long) (min_e - 1), (long long) min_e,
+                                 (min_e < n_layer ? ", e.g. --layer-split " + std::to_string(min_e) : "").c_str());
+                    return 2;
+                }
+            }
             std::string berr;
             if (!Ds41Dense::split_boundaries_ok(G, ends, berr)) {
                 std::fprintf(stderr, "ds41_generate: --layer-split %s: %s\n", a.split.layer_split.c_str(), berr.c_str());
                 return 2;
             }
-            // the candidate-blocks rule (P5.3b).  cand_layer's layer picks the 2048 blocks the later indexers rank
-            // inside, and its writer and readers cannot share a graph once a boundary separates them.  Two ways to run
-            // anyway: on ONE card the readers point at the producer's own tensor (no copy, the producer's bits), and
-            // across cards the candidate column rides in the relay payload - Ds41Dense moves it as the third region of
-            // the same contiguous copy as x_state and pre_state, so it costs CB ints a token (8 KiB) and one memcpy.
-            // What is NOT allowed is a same-device split that leaves the candidates to nobody (a reader would use a
-            // column that was never written) or a stage range that skips the producer entirely.
-            {
-                std::string cerr;
-                // The real question is whether the CANDIDATE column crosses a card: a same-card boundary may borrow the
-                // producer's tensor in place, a cross-card one must relay it.  Passing cross_card = false for a same-card
-                // split lets the rule below choose the in-place read; a split that strands the producer (its readers two
-                // or more stages away) is refused by the function itself, whichever way the cards fall.
-                const bool crosses_card = !a.split.same_device;
-                std::vector<int64_t> ends_for_cand = ends;
-                ends_for_cand.push_back((int64_t) G.ratio.size());   // the last stage's end, so stage_of() sees every stage
-                if (!Ds41Dense::stages_keep_candidates_local(G, ends_for_cand, /* cross_card = */ crosses_card, cerr)) {
-                    // cand_layer and its readers are in different stages: decide who produces the column.
-                    int own = -1;
-                    for (size_t s = 0; s < sr.le.size(); ++s)
-                        if (sr.lb[s] <= G.cand_layer && G.cand_layer < sr.le[s]) own = (int) s;
-                    if (own < 0) {
-                        std::fprintf(stderr, "ds41_generate: --layer-split %s: no stage owns layer %lld, which picks the "
-                                             "candidate blocks the later indexers rank inside\n",
-                                     a.split.layer_split.c_str(), (long long) G.cand_layer);
-                        return 2;
-                    }
-                    // RELAY ACROSS CARDS ONLY WHEN THE COLUMN ACTUALLY CROSSES ONE.  A boundary inside the producer's
-                    // own stage has nothing to hand over, and a payload that carries the candidates anyway would move
-                    // bytes no stage reads (and change the slab on the wrong side of the split).
-                    const bool crosses_boundary = (int64_t) G.cand_layer + 1 < G.ratio.size() &&
-                                                  ends_for_cand[(size_t) own] > (int64_t) G.cand_layer + 1;
-                    sr.cand_owner = crosses_boundary ? own : -1;
-                    sr.cand_relay = crosses_boundary && crosses_card;   // one card: read the producer's tensor in place
-                    if (sr.cand_owner >= 0)
-                        std::fprintf(stderr, "relay: layer %lld's candidate blocks (stage %d) %s the stages after it\n",
-                                     (long long) G.cand_layer, own,
-                                     sr.cand_relay ? "are relayed to" : "are read in place by");
+            // THE CANDIDATE COLUMN (P5.3b).  Layer cand_layer writes the blocks the indexers ABOVE it rank inside, so a
+            // boundary that separates the writer from a reader has to hand the column over: the payload carries it and
+            // each consumer copies it into a column of its own, which works at any height and across cards (a column is
+            // per-token state, so it hops stage by stage and no producer is stranded).  Whether this MODEL can ever be
+            // separated that way is Ds41Dense::cand_can_cross: a boundary sits at or above the cache floor, and this
+            // model's last indexer (36) is below its floor (37), so a legal split leaves producer and readers together
+            // and the payload stays at the two state columns.  A model with an indexer above the floor pays 8 KiB a
+            // token and the message below says so.  (relay_cand_from is the extra optimization for the producer's
+            // immediate successor on the same card: read its tensor, no copy at all.)
+            if (Ds41Dense::cand_can_cross(G)) {
+                int own = 0;
+                for (int64_t e : ends) if ((int64_t) G.cand_layer >= e) ++own;   // the stage that RUNS cand_layer
+                if (own < (int) ends.size() && ends[(size_t) own] > (int64_t) G.cand_layer) {
+                    sr.cand_owner = own;
+                    sr.cand_relay = true;   // the region rides in the payload and every later stage copies it forward
+                    std::fprintf(stderr, "relay: layer %lld's candidate blocks (stage %d) are relayed to the stages "
+                                         "after it\n", (long long) G.cand_layer, own);
                 }
             }
             // A split across cards needs a CUDA build (the CPU backend has one "device") and every named device below
@@ -695,9 +704,17 @@ int main(int argc, char ** argv) {
             for (int s = 0; s < a.split.n_stage; ++s) {
                 sr.lb.push_back(a.split.begin(s));
                 sr.le.push_back(a.split.end[(size_t) s]);
+                // A stage's state and its run are both its range: with the boundary rule no layer reads across one.
+                sr.st_le.push_back(sr.le[(size_t) s]);
+                sr.run_le.push_back(sr.le[(size_t) s]);
                 sr.dev.push_back(a.split.dev[(size_t) s]);
                 sr.stage.push_back(std::make_unique<Ds41Dense>());
             }
+            // SAY THE PLAN before anything is allocated, so a plan that is wrong is visible next to what it breaks.
+            for (size_t s = 0; s < sr.lb.size(); ++s)
+                std::fprintf(stderr, "relay:   plan stage %zu: layers [%lld,%lld)\n", s, (long long) sr.lb[s],
+                             (long long) sr.le[s]);
+
             std::string devs;
             for (size_t s = 0; s < sr.dev.size(); ++s) devs += (s ? "," : "") + std::to_string(sr.dev[s]);
             std::fprintf(stderr, "relay: staged run, %d stage(s) on device(s) %s, pass cap %d tokens (--relay-chunk)\n",
@@ -882,6 +899,9 @@ int main(int argc, char ** argv) {
             Ds41DenseConfig sc = dc;
             sc.lb = sr.lb[s];
             sc.le = sr.le[s];
+            sc.staged = true;              // the pass-column window and the state region the boundary rule implies
+            sc.state_le = sr.st_le[s];     // the layer one-past the rings this stage must own (see StagedRun::st_le)
+
             sc.is_first = (s == 0);
             sc.is_last = (s + 1 == sr.stage.size());
             sc.backend = be_for(sr.dev[s]);
@@ -922,27 +942,36 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "ds41_generate: staged run: %s\n", err.c_str());
             return 2;
         }
-        // The candidate-block decision (see the split check above): on one card, every stage AFTER the producer reads
-        // the producer's column in place and so holds no candidate region of its own; across cards (or when this stage
-        // IS the producer or the first reader) the region rides in the payload.  Setting it changes a stage's
-        // relay_slab_bytes(), so it happens before the staging is sized and before the slabs are compared.
-        //
-        // A borrowed column is read at THIS stage's pass offset while the producer wrote it at ITS OWN, so the two
-        // stages must run the same pass width - which is why a same-card split that borrows keeps every stage at the
-        // single cap sr.cap (the pre-build check above refused any split where that would overrun a stage's rings).
-        if (sr.cand_owner >= 0) {
-            for (size_t s = 0; s < sr.stage.size(); ++s) {
-                const bool borrow = !sr.cand_relay && (int) s > sr.cand_owner;
-                sr.stage[s]->relay_cand_from(borrow ? sr.stage[(size_t) sr.cand_owner].get() : nullptr);
-            }
-        }
-        sr.slab = sr.stage[0]->relay_slab_bytes();
-        for (size_t s = 0; s < sr.stage.size(); ++s)
-            if (sr.stage[s]->relay_slab_bytes() != sr.slab) {   // init's geometry check makes this a formality
-                std::fprintf(stderr, "ds41_generate: stage %zu's token slab is %zu bytes, the model's is %zu - the "
-                                     "staging cannot line them up\n", s, sr.stage[s]->relay_slab_bytes(), sr.slab);
+        // THE CANDIDATE COLUMN, storage.  A stage that does not run cand_layer reads a column somebody else produced.
+        // The RELAY is the source of truth (the payload carries the column, each consumer copies it into its own
+        // tensor), so the value is the producer's bits at every height of the split and on every card.  On top of that,
+        // a stage that shares the PRODUCER's card and follows it directly MAY point its graphs at the producer's tensor
+        // instead - same memory, no copy, bit-exact by construction.  That shortcut is sound only for the IMMEDIATE
+        // successor (a later stage would read a column the payload has already moved past) and only if the two stages
+        // run the same pass width - which is why a staged run keeps every stage at the single cap sr.cap.
+        for (size_t s = 0; s < sr.stage.size(); ++s) {
+            const bool borrow = sr.cand_owner >= 0 && !sr.cand_relay && (int) s == sr.cand_owner + 1 &&
+                                sr.dev[s] == sr.dev[(size_t) sr.cand_owner];
+            sr.stage[s]->relay_cand_from(borrow ? sr.stage[(size_t) sr.cand_owner].get() : nullptr);
+            if (!sr.stage[s]->last_error().empty()) {
+                std::fprintf(stderr, "ds41_generate: stage %zu: %s\n", s, sr.stage[s]->last_error().c_str());
                 return 2;
             }
+        }
+        // THE PAYLOAD IS ONE NUMBER, the same at every boundary (Ds41Dense::relay_slab_bytes is deliberately the same
+        // expression on every stage: state columns + the candidate column whenever the model has candidates a later
+        // stage reads).  A consumer that reads the producer's column in place simply does not copy that region -
+        // relay_write_in sizes its own copy by what THIS instance owns - so the slot never needs to change shape
+        // mid-run.  Verify the stages actually agree; if one differs, the two sides of a boundary disagree about where
+        // a copy ends, which is a layout bug and not a configuration.
+        sr.slab = sr.stage[0]->relay_slab_bytes();
+        for (size_t s = 1; s < sr.stage.size(); ++s) {
+            if (sr.stage[s]->relay_slab_bytes() == sr.slab) continue;
+            std::fprintf(stderr, "ds41_generate: stage %zu's token slab is %zu bytes, stage 0's is %zu - the two sides "
+                                 "of a boundary would copy different amounts\n", s, sr.stage[s]->relay_slab_bytes(),
+                         sr.slab);
+            return 2;
+        }
         // Every stage was built at dc.max_pass = sr.cap (build_stages requires the configs to agree), so every stage's
         // pass window is sr.cap and the unit is sr.cap: one piece per stage per pass, column for column.
         for (size_t s = 0; s < sr.stage.size(); ++s) sr.pcap.push_back(sr.cap);
@@ -973,14 +1002,16 @@ int main(int argc, char ** argv) {
                              s, sr.cols_of[s], (long long) sr.cols);
         sr.xs = (size_t) (G.n_embd * G.hc * 4);   // a token's x_state column
         sr.ps = (size_t) (G.hc * 4);              // ... and its pre_state column
-        sr.cb = sr.slab - sr.xs - sr.ps;          // 0 unless the candidates ride along
-        if ((int64_t) sr.cb != (int64_t) (sr.cand_relay ? G.cand_blocks * 4 : 0)) {
-            std::fprintf(stderr, "ds41_generate: the token slab is %zu bytes = x %zu + pre %zu + %zu; expected %lld of "
-                                 "candidate bytes (%s): the relay's layout and the model's do not agree\n",
-                         sr.slab, sr.xs, sr.ps, sr.cb, (long long) (sr.cand_relay ? G.cand_blocks * 4 : 0),
-                         sr.cand_relay ? "carried" : "not carried");
+        // The slab's THIRD region, checked against the geometry rather than trusted: it is the candidate column when
+        // the model has candidates a later stage reads, and nothing otherwise.
+        if ((int64_t) (sr.slab - sr.xs - sr.ps) != (int64_t) (Ds41Dense::cand_can_cross(G) ? G.cand_blocks * 4 : 0)) {
+            std::fprintf(stderr, "ds41_generate: the token slab is %zu bytes = x %zu + pre %zu + %zu, but the model's "
+                                 "candidate column is %zu: the relay's layout and the model's do not agree\n",
+                         sr.slab, sr.xs, sr.ps, sr.slab - sr.xs - sr.ps,
+                         (size_t) (Ds41Dense::cand_can_cross(G) ? G.cand_blocks * 4 : 0));
             return 2;
         }
+        sr.cb = sr.slab - sr.xs - sr.ps;   // the candidate bytes a boundary copy moves (accounting only)
         // The route bias is per layer, and on a staged run each layer belongs to a stage: hand it there.  (`dense`
         // still holds the weights the stages share, but it runs no layers, so a bias set only on it would be lost.)
         {
@@ -1012,7 +1043,7 @@ int main(int argc, char ** argv) {
                      (long long) sr.st.plan.bytes, sr.st.note.c_str());
         for (size_t s = 0; s < sr.stage.size(); ++s)
             std::fprintf(stderr, "relay:   stage %zu: device %d, layers [%lld,%lld)  head %s  weights %s  engram %zd/%zd\n",
-                         s, sr.dev[s], (long long) sr.lb[s], (long long) sr.le[s],
+                         s, sr.dev[s], (long long) sr.lb[s], (long long) sr.run_le[s],
                          sr.stage[s]->is_last_stage() ? "here" : "not here",
                          sr.stage[s]->weights_shared() ? "shared" : "own copy",
                          sr.stage[s]->engram_slots().size(), G.engram_layers.size());

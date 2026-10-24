@@ -8,26 +8,28 @@
 # tools/gfx906/run-p4.4-ds41-smoke.sh).
 #
 # WHAT IT WITNESSES.  The staged run splits the 40 dense layers into stage instances whose boundary crosses the
-# host-pinned staging (docs/gfx906/P5-RELAY-PATTERN.md, implemented in ds41_dense.cpp's relay_read_out /
-# relay_write_in and ds41_generate.cpp's staged_pass).  DS4.1 relays THREE regions per token, not one: x_state
-# (D x HC F32 = 80 KiB), pre_state (HC F32 = 16 B) and - when the boundary separates layer 20 from the indexers that
-# rank inside its blocks - the candidate blocks (CB I32 = 8 KiB).
+# host-pinned staging (docs/gfx906/P5-RELAY-PATTERN.md section 6b, implemented in ds41_dense.cpp's relay_read_out /
+# relay_write_in and ds41_generate.cpp's staged_pass).  DS4.1's payload is TWO regions on this model, x_state
+# (D x HC F32 = 80 KiB) and pre_state (HC F32 = 16 B): the candidate column (CB I32 = 8 KiB) is a third region the
+# machinery supports, but the cache rule below keeps cand_layer and every reader of its blocks in one stage, so it
+# never crosses - the run says "cand 0" in its slab line, and that is the expected value, not a missing feature.
 #   run1 / run2   unsplit, twice: this engine's cross-process reproducibility, measured, not assumed.
-#   run3          --gpus 0,0 --layer-split 21: two stages on ONE card, sharing the owner's weights, with the
-#                 candidate column borrowed in place (no copy).  The P5.3b step-1 hand-off check.
-#   run4 / run5   --gpus 0,1 --layer-split 21 --relay-copy-weights, twice: stage 1 on the second card with its OWN
+#   run3          --gpus 0,0 --layer-split $SPLIT: two stages on ONE card, sharing the owner's weights.  The P5.3b
+#                 step-1 hand-off check: same card, same weights, so a divergence can only come from the hand-off.
+#   run4 / run5   --gpus 0,1 --layer-split $SPLIT --relay-copy-weights, twice: stage 1 on the second card with its OWN
 #                 weights and state, the same bytes over the same host seam.  The P5.3b step-2 cross-device check,
 #                 with a twin because a cross-card run is judged against its own variant's agreement.
 #
-# WHY THE BOUNDARY IS 21 AND NOT, SAY, 15.  Two geometry rules, both enforced by the engine (ds41_dense.cpp) and
-# restated for a host-only gate in tools/gfx906/test_split_geometry.hpp:
-#   THE KV RULE    - the layer BEFORE a boundary must produce both the compressed KV and the index keys its
-#                    successor reads.  For this model that allows a boundary after layers 2, 8, 14, 20 (and after 20
-#                    the successor's sources are its own), so --layer-split 21 is legal and 16/19/25 are refused.
-#   THE CANDIDATE  - layer 20 (cand_layer) picks the 2048 blocks the indexers of 24/28/32/36 rank inside.  A boundary
-#                    at 21 puts the producer alone in stage 0, so exactly one boundary crosses the column: relayable
-#                    across cards (run4/run5), borrowable in place on one card (run3).  Anything farther strands the
-#                    producer and the engine refuses the plan.
+# WHY THE BOUNDARY IS 37 AND NOT, SAY, 21.  THE CACHE RULE, enforced by the engine (Ds41Dense::split_min_boundary /
+# split_boundaries_ok) and restated for the host-only gate in tools/gfx906/test_split_geometry.hpp:
+#   A layer reads the compressed KV of the latest kv source at or below it and the index keys of the latest index
+#   source at or below it, and those caches are PERSISTENT GPU state.  The relay moves per-token state only - x_state,
+#   pre_state - so a boundary must sit above EVERY layer a later stage reads from.  This model's kv sources are
+#   {2,8,14,20} and its index sources {2,8,14,20,24,28,32,36}: layer 39 still reads layer 20's compressed KV and layer
+#   36's index keys, so the floor is 36 + 1 = 37 and the only mid-model split is layers [0,37) plus the tail [37,40).
+#   3/9/15/21 (the cuts the GLM engine would allow, since the layer before each is both a kv and an index source) are
+#   refused here with the floor named.  The tail is a third of the model's 3 GB of per-layer weights and its full
+#   compute: enough to show the hand-off moves a real stage, and the only thing the geometry permits.
 #
 # THE VERDICT IS CALIBRATED, NOT ABSOLUTE (the lesson of GLM witness #6, which saw two IDENTICAL unsplit runs
 # diverge at token 40 of 64): which path an expert takes (VRAM hit, CPU pool, PCIe, file) changes float summation
@@ -93,11 +95,10 @@ np.array(ids, dtype=np.int32).tofile(sys.argv[1])
 print(f"prompt ids: {len(ids)} tokens -> {sys.argv[1]}")
 EOF
 
-# The boundary the split is built around, in ONE place: run3/4/5 all use it, and the engine refuses anything else
-# (see the two rules above).  If the model's geometry ever changes, this number and test_split_geometry.hpp move.
-# = cand_layer + 1: the boundary BOTH rules allow AND that separates layer 20's candidate blocks from the indexers
-# above them, so the run exercises the DS4.1-specific third region of the payload.
-SPLIT=21
+# The boundary the split is built around, in ONE place: run3/4/5 all use it, and the engine refuses anything below it
+# (see the cache rule above).  = the model's last shared-cache layer (index source 36) + 1.  If the model's geometry
+# ever changes, this number and test_split_geometry.hpp move together - the gate refuses a stale list.
+SPLIT=${SPLIT:-37}
 ARGS=(-m "$M/V41-GSQ.gguf" --backend cuda --experts gpu
       --engram "$M/engram/l1:$M/engram/l14" --rank "$M/rank.bin"
       --ids-file "$IDS" -n 64 --arena-gib "$ARENA_GIB" --arena-adapt --vram-margin 1.0
@@ -137,11 +138,18 @@ if ! run_step run5 "${ENG[@]}" "${ARGS[@]}" --gpus 0,1 --layer-split "$SPLIT" --
 fi
 
 # The staged runs must say WHAT they did; a run that silently fell back to the single-instance path is not a witness.
-grep -m4 -E "relay: staged run|relay: layer 20|relay: [0-9]+ state columns|relay: [0-9]+ passes" \
+# The lines that prove the run was staged at all, and that its payload is the shape the cache rule predicts: a slab of
+# x_state + pre_state with cand 0 (the candidate column never crosses on this model), on the boundary the engine
+# refused anything below.  A run whose slab says cand 8192 ran a different geometry than this witness documents.
+grep -m5 -E "relay: staged run|relay:   plan stage|relay: token slab|relay:   stage |layer split:" \
     "logs/p5.3b-run3-${TS}.log" | sed 's/^/[run3 0,0] /'
+grep -m1 "token slab" "logs/p5.3b-run3-${TS}.log" | grep -q "cand 0)" || {
+    echo "P5.3b WITNESS: FAIL - run3's payload carries a candidate region (cand != 0); the geometry moved under the witness"; exit 1; }
 for r in run4 run5; do
-    grep -m4 -E "relay: staged run|relay: layer 20|weights own copy|relay: [0-9]+ passes" \
+    grep -m5 -E "relay: staged run|relay:   plan stage|relay: token slab|weights own copy|relay:   stage " \
         "logs/p5.3b-${r}-${TS}.log" | sed "s/^/[${r} 0,1] /"
+    grep -m1 "weights own copy" "logs/p5.3b-${r}-${TS}.log" >/dev/null || {
+        echo "P5.3b WITNESS: FAIL - ${r} did not load its own weights on the second card (no 'weights own copy' line)"; exit 1; }
 done
 for r in run3 run4 run5; do
     if ! grep -q "relay: staged run" "logs/p5.3b-${r}-${TS}.log"; then
@@ -155,20 +163,19 @@ for r in run3 run4 run5; do
     [ -n "$line" ] || { echo "P5.3b WITNESS: FAIL - $r printed no relay summary (the relay never ran?)"; exit 1; }
     echo "[${r}] ${line}"
 done
-# A one-card split must BORROW layer 20's candidate column (no copy); a two-card split must RELAY it.  If either
-# prints the other's line, the slab the staging was sized from is the wrong one.
-if grep -q "are read in place by" "logs/p5.3b-run3-${TS}.log"; then
-    echo "[run3] candidates: borrowed in place (as a same-card split must)"
-else
-    echo "P5.3b WITNESS: FAIL - run3 did not report borrowing layer 20's candidates"; exit 1
-fi
-for r in run4 run5; do
-    if grep -q "are relayed to" "logs/p5.3b-${r}-${TS}.log"; then
-        echo "[${r}] candidates: relayed across the boundary (as a cross-card split must)"
-    else
-        echo "P5.3b WITNESS: FAIL - ${r} did not report relaying layer 20's candidates"; exit 1
+# THE CANDIDATE COLUMN NEVER CROSSES HERE, and a staged run that says otherwise ran a different geometry than this
+# witness documents.  Under the cache rule (the header) a boundary sits at or above the model's last shared-cache layer,
+# and every layer that ranks inside cand_layer's blocks IS an index source, hence below that floor - so producer and
+# readers always share a stage.  The engine therefore prints neither "borrowed in place" nor "relayed to": the column is
+# read by the layer above the one that wrote it, exactly as an unsplit run reads it.  That is the expected line, so the
+# gate is the ABSENCE of the other two.
+for r in run3 run4 run5; do
+    if grep -qE "are read in place by|are relayed to" "logs/p5.3b-${r}-${TS}.log"; then
+        echo "P5.3b WITNESS: FAIL - ${r} moved the candidate column across a boundary; the cache rule no longer holds"
+        exit 1
     fi
 done
+echo "[run3/4/5] candidates: stayed inside the producer's stage (cache rule held; payload = x_state + pre_state)"
 
 # ---- verdict
 lcp() {  # longest common prefix of two token-id files

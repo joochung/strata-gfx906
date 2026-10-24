@@ -116,6 +116,8 @@ bool is_routed(const std::string & n) {
 // block's ffn_norm / router / routing-bias weights in the fused finish+predict graph, so a producer loads it too.
 bool skip_weight_stage(const std::string & n, bool skip_experts, int64_t n_layer, int64_t wl, int64_t wle,
                       bool last_stage) {
+    // P5.3b: the boundary rule may make a stage RUN a layer above its range (the producer of the rings its successor
+    // reads).  Those layers' weights are part of the stage's work, so the driver widens wle and this stays consistent.
     if (skip_experts && is_routed(n)) return true;
     if (n.rfind("blk.", 0) == 0) {
         const int64_t il = std::atoll(n.c_str() + 4);
@@ -155,15 +157,52 @@ struct Ds41Dense::Impl {
     /// executes block le).  Defaults: the whole model.
     int64_t lb = 0, le = 0, wl = 0, wle = 0;
     bool is_first = true, is_last = true;
-    /// The layer range the persistent state was allocated for: [lb, le).  A stage's LAST layer (le-1) is the producer
-    /// of the compressed KV / index keys its successor's layers read (the geometry's kv_src/idx_src resolve to the
-    /// latest source <= l), so its rings live here; the successor's layers only ever READ tensors this stage owns.
-    /// That is why a stage on ANOTHER card must be handed the KV too (the engine relays it, or the two stages share
-    /// the producer's card) - see the note at the state allocation in init().
-    int64_t state_end() const { return le; }
+    /// The layer range the PERSISTENT state was allocated for: [lb, state_end()) == the stage's own range [lb, le).
+    /// THE SHARED-CACHE RULE (Ds41Dense::split_min_boundary) says why it can be that simple: a layer reads the
+    /// compressed KV / index keys of the LATEST source at or below it, those caches are persistent GPU state, and the
+    /// relay moves per-token state only - so a boundary may not sit below the last source, and every read of a ring
+    /// stays inside the stage that runs its producer.  A stage on another card therefore never reaches a ring it does
+    /// not hold, and a ring a stage does not run is simply not allocated (null), which is what makes attn_router(il)
+    /// and build_attn fail loudly for another stage's layer instead of building a graph over NULL.
+    int64_t state_end() const { return st_end; }
+    /// Compute the state region from the stage's range and cache it (init()'s allocation loops read it many times).
+    /// With the boundary rule it is exactly the range the stage runs; see the check inside.
+    void compute_state_end() {
+        // With the shared-cache rule (Ds41Dense::split_boundaries_ok) in force, every cache a stage's layers read was
+        // produced by a layer of THIS stage: a boundary may not sit below the model's last source layer, so a
+        // successor never reads across one.  A stage's persistent rings are therefore exactly the layers it runs, and
+        // a config that claims otherwise is a bug in the driver, not a shape to support.
+        if (cfg_state_le > 0 && cfg_state_le != le) {
+            std::fprintf(stderr, "[ds41_dense] stage [%lld,%lld): the run asked for state to layer %lld; a stage's "
+                         "persistent rings are exactly the layers it runs\n", (long long) lb, (long long) le,
+                         (long long) cfg_state_le);
+            std::abort();
+        }
+        // A boundary below the last source would need a cache this stage does not run.  init() is where the rings get
+        // allocated, so the rule is re-checked here rather than trusted from the caller - the abort names the layer to
+        // move the cut to, which is the message a user with a hand-built config needs.
+        if (staged && le < nl) {
+            const int64_t min_e = Ds41Dense::split_min_boundary(g);
+            if (le < min_e) {
+                std::fprintf(stderr, "[ds41_dense] stage [%lld,%lld): a boundary at %lld is below this model's last "
+                             "source layer %lld - the next stage would read a cache it does not own\n",
+                             (long long) lb, (long long) le, (long long) le, (long long) (min_e - 1));
+                std::abort();
+            }
+        }
+        st_end = le;
+    }
+    int64_t cfg_state_le = 0; ///< cfg.state_le, kept for the consistency check in compute_state_end()
+    /// The layer one-past-the-last layer that allocates persistent rings.  With the shared-cache rule this is the
+    /// state region, which is the stage's own range; allocation loops and the weight bounds read it through this name
+    /// so a future rule that widens the region has one place to do it.
+    int64_t alloc_end() const { return std::max(st_end, le); }
+    int64_t st_end = 0;      ///< the cached result of compute_state_end(); set before any allocation loop reads it
     /// P5.3b: does THIS stage run layer `il`?  Every per-layer entry point says so or fails loudly - a layer run
-    /// twice would double-advance the state and a layer nobody runs would leave a relayed column unwritten.
-    bool owns_layer(int64_t il) const { return il >= lb && il < le; }
+    /// twice would double-advance the state and a layer nobody runs would leave a relayed column unwritten.  The
+    /// stage's run is its range, and the shared-cache rule guarantees no layer of a later stage reads a ring this
+    /// stage's layers wrote (or the reverse), so range and rings are the same set of layers.
+    bool owns_layer(int64_t il) const { return il >= lb && il < alloc_end(); }
     /// P5.3b: true once this instance is part of a staged run (build_stages sets it on every stage).  It is what makes
     /// the graph builders take the pass's column window from the impl instead of the caller's argument, and what
     /// enables window_col0(); a single-instance run never reads either.
@@ -213,6 +252,11 @@ struct Ds41Dense::Impl {
     /// where it cannot: it is a per-token top-k selection crossing cards, and reading the producer's own tensor keeps
     /// the gathered ids bit-identical to the unsplit run.
     ggml_tensor * cand_src_prev = nullptr;
+    /// P5.3b: the CANDIDATE PRODUCER publishes its own tensor here (in place of publishing a relayed copy) so a stage
+    /// that shares its backend can read it without a copy.  The producer ALWAYS publishes: the decision of who reads
+    /// it in place is taken after init(), by whoever wires the stages, and a tensor that was never published cannot
+    /// be read by a stage whose own region nobody wrote.  Valid only while the producer outlives the readers.
+    ggml_tensor * cand_published = nullptr;
     /// P5.3b: the PRODUCER's pass window when its candidate column is read in place (relay_cand_from).  The writer
     /// aligns its column to its own window; this stage reads it at ITS offset, so the two must be the same size.
     /// The engine's staged run keeps every stage at one pass cap (build_stages requires the configs to agree and
@@ -310,11 +354,31 @@ struct Ds41Dense::Impl {
         if (gctx) ggml_free(gctx);
         if (own_backend && backend) ggml_backend_free(backend);
     }
-    /// Does a stage's relay payload carry cand_layer's candidate blocks?  True iff some stage owns that layer (the
-    /// only writer) AND some layer AFTER it reads it, i.e. the model has an index source past cand_layer (it does).
-    /// A property of the geometry, so it can be asked before any stage exists - and it must be: the engine sizes the
-    /// staging slab before it builds the stages.
-    static bool cand_is_relayed(const strata::v41::Ds41Geometry & g) {
+    /// Does THIS stage run the layer that writes the candidate blocks?  Its own graphs produce the column, so it owns
+    /// and publishes it whichever way the readers get it.
+    bool owns_cand_producer() const { return lb <= g.cand_layer && g.cand_layer < le; }
+    /// Does this stage's OWN candidate column get filled from the boundary payload?  True unless the geometry never
+    /// separates the column from its readers (cand_can_cross false, the shipped case) or its graphs read the producer's
+    /// tensor in place (relay_cand_from, a same-card option).  The PAYLOAD number stays a function of the GEOMETRY alone
+    /// so the two sides of a boundary can never disagree about where a copy ends.
+    bool cand_region_owned() const { return Impl::cand_can_cross(g) && cand_src_prev == nullptr; }
+    /// Can a LEGAL boundary (at or above this model's cache floor) separate cand_layer from a layer that ranks inside
+    /// its blocks?  A reader at or below the floor is in the producer's own stage whatever the plan, so only a reader AT
+    /// OR ABOVE it separates - and since the floor is the model's LAST kv / index source + 1 while every such reader IS
+    /// an index source, no model whose caches are those two lists ever answers yes.  DeepSeek-V4.1-Flash: last indexer
+    /// 36, floor 37, no.  Consequence, and it is worth stating where the code is read: under the cache rule a staged run
+    /// always relays the TWO state columns and nothing else; the candidate region below is for a model with a cache
+    /// OUTSIDE these lists (a hybrid SSM state, a cache keyed by something Ds41Geometry does not read yet).
+    static bool cand_can_cross(const strata::v41::Ds41Geometry & g) {
+        if (g.cand_layer < 0 || g.cand_layer >= (int64_t) g.ratio.size()) return false;
+        const int64_t floor_e = Ds41Dense::split_min_boundary(g);
+        for (int64_t k : g.index_sources) if (k > g.cand_layer && k >= floor_e) return true;
+        return false;
+    }
+    /// Does the model's routing consult cand_layer's column at all - is there an INDEXER above the producer?  (This
+    /// model: yes, 24/28/32/36.)  That alone does not make the column relayable (see cand_can_cross), but it decides
+    /// whether holding the column is worth any state at all.
+    static bool cand_has_readers(const strata::v41::Ds41Geometry & g) {
         if (g.cand_layer < 0 || g.cand_layer >= (int64_t) g.ratio.size()) return false;
         for (int64_t k : g.index_sources) if (k > g.cand_layer) return true;
         return false;
@@ -584,10 +648,26 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     // P5.3b: the compressed KV / index keys a layer reads belong to the LATEST source at or below it, which may be a
     // layer no stage in this run allocated state for (the model's first kv/index source is layer 2, so a split at
     // layer 2 leaves stage 1 with no producer).  Null is a bug we want loud, not a null into a graph.
-    if (L.ratio && (!im.ly[(size_t) L.kvl].comp || !im.ly[(size_t) L.idxl].idxk)) {
-        std::fprintf(stderr, "[ds41_dense] build_attn: layer %lld reads the KV of layer %lld / the index keys of "
-                     "layer %lld, whose state this stage does not own\n", (long long) il, (long long) L.kvl,
-                     (long long) L.idxl);
+    // A LAYER READS ACROSS STAGES, AND NO BOUNDARY FIXES THAT.  The compressed KV of layer kvl is a persistent cache
+    // that lives on the card of the stage which RUNS kvl, and layer `il` reads it by pointer inside its graph; the
+    // relay hands over per-token state (x_state / pre_state) and has no way to move a cache.  So a split's stage set has
+    // to be cut where no layer reads across - which for a model with shared caches means a stage set whose boundaries
+    // leave every reader in its producer's stage.  build_stages refuses those plans; reaching this line means a stage
+    // was built by hand or the geometry has a shape the boundary floor does not describe, so it is fatal, not recoverable.
+    // (The GLM engine's layers keep their own caches, so the same code shape there is a legal split; see
+    // docs/gfx906/P5-RELAY-PATTERN.md section 6b for the two engine shapes.)
+    if (L.ratio && !im.owns_layer(L.kvl)) {
+        std::fprintf(stderr, "[ds41_dense] build_attn: layer %lld reads the compressed KV of layer %lld, which this "
+                     "stage [%lld,%lld) does not run; a stage boundary must be above the model's last shared-cache "
+                     "layer %lld\n", (long long) il, (long long) L.kvl, (long long) im.lb, (long long) im.le,
+                     (long long) (Ds41Dense::split_min_boundary(im.g) - 1));
+        std::abort();
+    }
+    if (L.ratio && !im.owns_layer(L.idxl)) {
+        std::fprintf(stderr, "[ds41_dense] build_attn: layer %lld reads the index keys of layer %lld, which this "
+                     "stage [%lld,%lld) does not run; a stage boundary must be above the model's last shared-cache "
+                     "layer %lld\n", (long long) il, (long long) L.idxl, (long long) im.lb, (long long) im.le,
+                     (long long) (Ds41Dense::split_min_boundary(im.g) - 1));
         std::abort();
     }
     const Ds41Geometry & G = im.g;
@@ -867,10 +947,10 @@ static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc,
     using L_t = Ds41Dense::Impl::Layer;
     L_t & L = im.ly[(size_t) il];
     // P5.3b: as in build_attn - a layer whose KV / index-key source this stage does not own is a bug, said loudly.
-    if (L.ratio && (!im.ly[(size_t) L.kvl].comp || !im.ly[(size_t) L.idxl].idxk)) {
-        std::fprintf(stderr, "[ds41_dense] build_attn_kv_only: layer %lld reads the KV of layer %lld / the index "
-                     "keys of layer %lld, whose state this stage does not own\n", (long long) il, (long long) L.kvl,
-                     (long long) L.idxl);
+    if (L.ratio && (!im.owns_layer(L.kvl) || !im.owns_layer(L.idxl))) {
+        std::fprintf(stderr, "[ds41_dense] build_attn_kv_only: layer %lld reads the KV of layer %lld / the index keys "
+                     "of layer %lld, outside this stage [%lld,%lld)\n", (long long) il, (long long) L.kvl,
+                     (long long) L.idxl, (long long) im.lb, (long long) im.le);
         std::abort();
     }
     const Ds41Geometry & G = im.g;
@@ -1186,6 +1266,11 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     im.le = cfg.le > 0 ? cfg.le : im.nl;
     im.is_first = cfg.is_first;
     im.is_last = cfg.is_last;
+    // A hand-built config with a real range is staged too, so the state region follows the boundary rule here and not
+    // only inside build_stages: the two must agree, and init() is the one place that both paths pass through.
+    im.staged = cfg.staged || (im.lb != 0 || im.le != im.nl);
+    im.cfg_state_le = cfg.state_le;
+    im.compute_state_end();
     if (im.lb < 0 || im.le > im.nl || im.lb >= im.le) {
         err = "stage layer range [" + std::to_string(im.lb) + "," + std::to_string(im.le) +
               ") is not inside the model's [0," + std::to_string(im.nl) + ")";
@@ -1200,7 +1285,9 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     // A stage that borrows the whole load (share_weights) loads nothing, so its bounds do not matter; leaving them
     // full-width keeps them honest if a borrowed Impl is ever asked what the model has.
     im.wl = im.share_weights ? 0 : im.lb;
-    im.wle = im.share_weights ? im.nl : weight_end(im.nl, im.le);
+    // The weight bounds: the layers it RUNS plus the one block its last layer reads ahead into (see Impl::wle).
+    im.wle = im.share_weights ? im.nl
+                              : (im.alloc_end() >= im.nl ? im.nl : weight_end(im.nl, im.alloc_end()));
     const Ds41Geometry & G = im.g;
     im.D = G.n_embd; im.HC = G.hc; im.DH = G.d_head; im.DHR = G.d_rope; im.NH = G.n_head; im.OG = G.o_groups;
     im.OL = G.o_lora; im.OGD = G.n_head * G.d_head / G.o_groups; im.RQ = G.r_q; im.SWA = G.n_swa;
@@ -1274,7 +1361,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     // this stage's end), so its rings belong here and the successor's layers - which only READ them - allocate none.
     // A stage that ends the model allocates to nl (its own range, unchanged).  Layers outside the range keep null
     // state tensors, which is also what makes attn_router(il) fail loudly for another stage's layer.
-    const int64_t s_end = sen;
+    const int64_t s_end = im.alloc_end();
     for (int64_t l = im.lb; l < s_end; ++l) {
         auto & L = im.ly[(size_t) l];
         L.raw = T(kvt, { im.DH, im.RAW });
@@ -1298,6 +1385,9 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     im.sbuf = ggml_backend_alloc_ctx_tensors(im.sctx, im.backend);
     if (!im.sbuf) { err = "cannot allocate the decode state"; return false; }
     ggml_backend_buffer_clear(im.sbuf, 0);
+    // P5.3b: a staged producer of the candidate blocks publishes the tensor its graphs just built.  See
+    // cand_published above; a single-instance run leaves it null and nothing reads it.
+    if (im.staged && im.owns_cand_producer()) im.cand_published = im.cand;
     // the ratio-2 state scores start at -1e30 (an unwritten state gets softmax weight 0); sel = 0 (a valid row)
     for (auto & L : im.ly)
         if (L.st_sc) { std::vector<float> v((size_t) (im.DH * 2), -1.0e30f); ggml_backend_tensor_set(L.st_sc, v.data(), 0, v.size() * 4); }
@@ -1354,70 +1444,55 @@ int64_t Ds41Dense::stage_layers() const { return p_->le - p_->lb; }
 int64_t Ds41Dense::n_layer_total() const { return p_->nl; }
 bool Ds41Dense::is_last_stage() const { return p_->is_last; }
 bool Ds41Dense::weights_shared() const { return p_->w_owner != nullptr; }
-bool Ds41Dense::relay_carries_cand() const { return Impl::cand_is_relayed(p_->g); }
+bool Ds41Dense::relay_carries_cand() const { return cand_can_cross(p_->g); }
 // P5.3b: is there a layer AFTER cand_layer that ranks inside its candidate blocks (the same test the relay payload
 // uses), and where would a boundary have to fall to separate the producer from a reader?
-bool Ds41Dense::stages_keep_candidates_local(const strata::v41::Ds41Geometry & g, const std::vector<int64_t> & ends_in,
-                                            bool cross_card, std::string & err) {
-    if (!Impl::cand_is_relayed(g)) return true;   // no candidate blocks, or nobody after them reads them
-    // ends_in may be the split's FULL end list (the last one being n_layer, from --gpus' default tiling) or the
-    // boundary list only; drop the trailing n_layer so `stage_of` counts stages, not ends.
-    std::vector<int64_t> ends = ends_in;
-    const int64_t n_layer = (int64_t) g.ratio.size();
-    while (!ends.empty() && ends.back() >= n_layer) ends.pop_back();
-    const int64_t cl = g.cand_layer;
-    int64_t last_reader = -1;
-    for (int64_t k : g.index_sources) if (k > cl) last_reader = std::max(last_reader, k);
-    // The producer is in the stage whose range holds cl; a reader is in the stage holding some index source > cl.
-    auto stage_of = [&](int64_t l) { int s = 0; for (int64_t e : ends) if (l >= e) ++s; return s; };
-    // The producer's stage must end at cl + 1, so the producer is the stage IMMEDIATELY before the first reader and
-    // the in-place read (relay_cand_from) reaches it.  With more than two stages, a reader two or more stages after the
-    // producer has nothing to borrow: stage s reads stage s-1's column, which never held the producer's.
-    const int owner = stage_of(cl), reader = stage_of(last_reader);
-    if (owner == reader) return true;
-    if (owner + 1 != reader) {
-        err = "layer " + std::to_string(cl) + " picks the candidate blocks the indexers of layer " +
-              std::to_string(last_reader) + " rank inside, and this split puts the producer " +
-              std::to_string(reader - owner) + " stage(s) away from a reader; only the stage right after the producer "
-              "can reach its candidate column, so end stage " + std::to_string(owner) + " at layer " +
-              std::to_string(cl + 1) + " (or past the last index source).";
-        return false;
-    }
-    if (cross_card) {
-        // ACROSS CARDS the candidate column rides in the relay payload: no stage can read another card's tensor, so
-        // every stage keeps a region of its own and the slab stays the same number on both sides.  The engine's split
-        // check (ds41_generate.cpp) turns this into that decision, and refuses only what is genuinely unrunnable - a
-        // producer its readers cannot reach, which the stranded case above already reported.
-        return true;
-    }
-    // ONE CARD: the successor's graphs may point at the producer's own tensor (relay_cand_from), which is bit-exact by
-    // construction and costs no copy.  A caller that has not decided yet gets false and makes the choice.
-    err = "layer " + std::to_string(cl) + "'s candidate blocks are read by layer " + std::to_string(last_reader) +
-          "'s indexer, which this boundary puts in another stage; on one card the successor can read the producer's "
-          "column in place (the engine does that with relay_cand_from).";
-    return false;
-}
-
 size_t Ds41Dense::relay_cand_bytes(const strata::v41::Ds41Geometry & g) {
-    return Impl::cand_is_relayed(g) ? (size_t) (g.cand_blocks * 4) : 0;
+    return cand_can_cross(g) ? (size_t) (g.cand_blocks * 4) : 0;
 }
-bool Ds41Dense::cand_relay_needed(const strata::v41::Ds41Geometry & g) { return Impl::cand_is_relayed(g); }
+/// Can a LEGAL boundary (at or above the model's cache floor) separate cand_layer from a layer that ranks inside its
+/// blocks?  A reader at or below the floor shares the producer's stage whatever the plan, so only a reader ABOVE it -
+/// which needs an index source above every cache source - makes the payload carry the column.  DeepSeek-V4.1-Flash:
+/// last indexer 36, floor 37, so no: a staged run of this model relays the two state columns and nothing else.
+bool Ds41Dense::cand_can_cross(const strata::v41::Ds41Geometry & g) { return Impl::cand_can_cross(g); }
 std::vector<int64_t> Ds41Dense::engram_slots() const { return p_->eng_slots; }
 
-/// "2, 8, 14, 20, 24, 28, 32, 36" - the layers a boundary may legally follow (the intersection of the kv and
-/// index source lists), for build_stages' rejection message.
+/// "2, 8, 14, 20, 24, 28, 32, 36" - the layers whose rings a successor reads, for build_stages' rejection message.
 static std::string ds41_source_layers_str(const strata::v41::Ds41Geometry & g) {
     std::string r;
     for (int64_t l = 0; l < (int64_t) g.ratio.size(); ++l)
-        if (g.is_kv_source(l) && g.is_index_source(l)) { if (!r.empty()) r += ", "; r += std::to_string(l); }
+        if (g.is_kv_source(l) || g.is_index_source(l)) { if (!r.empty()) r += ", "; r += std::to_string(l); }
     return r.empty() ? "none" : r;
 }
+/// P5.3b: THE CACHE SPLIT - why a DeepSeek-V4.1 stage boundary has to sit above the last source layer.
+///
+/// A layer l reads the compressed KV of kv_src(l) and the index keys of idx_src(l): the LATEST source at or below l.
+/// Those rings are PERSISTENT GPU state, allocated once and written as the run advances - not per-pass activations.
+/// The relay moves x_state, pre_state and the candidate column, all sized PER TOKEN, and there is no mechanism to move
+/// a KV cache: a stage on another card simply cannot read a ring the stage before it wrote, and a stage on the same
+/// card cannot be told to hold a ring a layer it does not run produced.
+///
+/// Which rings must therefore stay put?  Every ring any later layer reads.  In this model the topmost layers still
+/// read layer 20's compressed KV and layer 36's index keys, so a boundary below 37 would strand a cache.  The rule is
+/// then simply: no boundary below LAST_SOURCE + 1, where LAST_SOURCE is the model's last kv or index source.  The
+/// per-token state crosses at the boundary as usual; the caches never do, which is the difference between this engine
+/// and the GLM one (whose layers all keep their own cache and whose split sits at a layer whose successor recomputes
+/// everything it reads).
+int64_t Ds41Dense::split_min_boundary(const strata::v41::Ds41Geometry & g) {
+    int64_t last = -1;
+    for (int64_t l : g.kv_sources) last = std::max(last, l);
+    for (int64_t l : g.index_sources) last = std::max(last, l);
+    return last + 1;      // -1 + 1 = 0 for a model with no shared caches at all: any boundary is fine
+}
 
-// P5.3b: the same rule build_stages enforces, factored out so a caller can check a planned --layer-split against the
-// GEOMETRY alone (no weights, no state, no GPU).  `ends` = the end of every stage but the last.
+/// P5.3b: THE BOUNDARY CHECK, as a pure function of the geometry, so a caller can vet a planned --layer-split before
+/// allocating anything (ds41_generate does exactly that) and build_stages can enforce the same thing.  Every boundary
+/// must be at or above split_min_boundary(); anything lower strands a cache (see above), and the message names the
+/// layer to move the cut to.  `ends` = the end of every stage but the last, ascending.
 bool Ds41Dense::split_boundaries_ok(const strata::v41::Ds41Geometry & g, const std::vector<int64_t> & ends,
                                     std::string & err) {
     const int64_t n_layer = (int64_t) g.ratio.size();
+    const int64_t min_e = split_min_boundary(g);
     int64_t prev = 0;
     for (size_t i = 0; i < ends.size(); ++i) {
         const int64_t e = ends[i];
@@ -1426,12 +1501,11 @@ bool Ds41Dense::split_boundaries_ok(const strata::v41::Ds41Geometry & g, const s
                   ") and above the previous boundary " + std::to_string(prev);
             return false;
         }
-        const int64_t last = e - 1;
-        if (!g.is_kv_source(last) || !g.is_index_source(last)) {
-            err = "a boundary after layer " + std::to_string(last) + " would leave the next stage reading the "
-                  "compressed KV of layer " + std::to_string(g.kv_src(e)) + " and the index keys of layer " +
-                  std::to_string(g.idx_src(e)) + ", state the previous stage does not own; a stage boundary must come "
-                  "after a kv AND index source layer (this model's: " + ds41_source_layers_str(g) + ")";
+        if (e < min_e) {
+            err = "a boundary at layer " + std::to_string(e) + " would leave the next stage reading the compressed KV / "
+                  "index keys of layer " + std::to_string(min_e - 1) + ", which live on the previous stage's card; this "
+                  "model's stages must split at layer " + std::to_string(min_e) + " or above (its last kv / index "
+                  "source is " + std::to_string(min_e - 1) + " and the relay moves per-token state, not caches)";
             return false;
         }
         prev = e;
@@ -1445,10 +1519,15 @@ bool Ds41Dense::split_boundaries_ok(const strata::v41::Ds41Geometry & g, const s
 // numbers - a region is one contiguous copy, and the relay's staging is in this order.
 size_t Ds41Dense::relay_slab_bytes() const {
     const Impl & im = *p_;
-    size_t s = (size_t) (im.D * im.HC * 4) + (size_t) (im.HC * 4);
-    // The candidate column rides along unless this stage was told it reads the producer's tensor in place
-    // (relay_cand_from): then it has no candidate region and the payload is the state region alone.
-    if (relay_owns_cand_region()) s += (size_t) (im.CB * 4);   // im.cand is I32 [CB, NC]
+    const size_t xs = (size_t) (im.D * im.HC * 4), ps = (size_t) (im.HC * 4);
+    // THE PAYLOAD IS THE SAME NUMBER ON EVERY STAGE, and it includes the candidate column whenever ANY stage of the
+    // run produces it (i.e. whenever the model has candidates at all and the run is staged).  The producer always has
+    // a region of its own, so it always sends the region; whether a given CONSUMER copies it or ignores it is decided
+    // by relay_write_in from that consumer's own relay_owns_cand_region().  Making the number depend on the reader
+    // would make the two sides of a boundary disagree on where the copy ends, which is worse than copying 8 KiB/token
+    // that one stage will not use - and that is the whole cost: CB * 4 = 8 KiB on top of 80 KiB of state.
+    size_t s = xs + ps;
+    if (im.staged && cand_can_cross(im.g)) s += (size_t) (im.CB * 4);   // im.cand is I32 [CB, NC]
     return s;
 }
 
@@ -1528,6 +1607,22 @@ bool Ds41Dense::build_stages(std::vector<std::unique_ptr<Ds41Dense>> & stage, co
                 return false;
             }
         }
+        // P5.3b: a stage on a FOREIGN backend cannot be in shape (b) - its successor would read a ring that lives on
+        // this stage's card, and there is no way to hand over persistent state (the payload is sized per token and a
+        // KV ring is not).  A caller may still describe such a plan; build_stages refuses it here, where the config's
+        // backend is known.  Shape (a) boundaries - the successor starts at its own sources - are the only ones a
+        // cross-card split may use.
+        if (le < n_layer && cfg[s].backend && cfg[s].backend != im.backend) {
+            const int64_t kv = im.g.kv_src(le), ix = im.g.idx_src(le);
+            const bool own_sources = im.g.is_kv_source(le) && im.g.is_index_source(le);
+            const bool reaches_below = (kv >= 0 && kv < le) || (ix >= 0 && ix < le);
+            if (!own_sources || reaches_below) {
+                err = "build_stages: stage " + std::to_string(s) + " is on another backend and its successor reads the "
+                      "rings of layer " + std::to_string(std::max(kv, ix)) + ", which live on this stage's card; only a "
+                      "boundary at the successor's own kv AND index source layer may cross a card";
+                return false;
+            }
+        }
         next_lb = le;
     }
     if (next_lb != n_layer) {
@@ -1578,7 +1673,9 @@ bool Ds41Dense::relay_read_out(int n, void * dst, size_t dst_bytes) {
     if (n < 1 || n > (int) im.NC) { im.err = "relay_read_out: pass size out of range"; return false; }
     if (!dst) { im.err = "relay_read_out: no destination"; return false; }
     const size_t xs = (size_t) (im.D * im.HC * 4), ps = (size_t) (im.HC * 4);
-    // the cand region is this instance's to copy only if it produced it (see relay_slab_bytes's rule)
+    // The producer publishes the candidate column when the geometry can separate it from a reader (cs > 0); the byte
+    // count is a function of the GEOMETRY, never of a stage's range, which is the property that makes the two sides of a
+    // boundary agree on where the copy ends.  cs is 0 on any model whose caches are its KV / index source lists.
     const size_t cs = relay_slab_bytes() - xs - ps;
     const size_t bytes = ((xs + ps + cs) * (size_t) n);
     if (dst_bytes < bytes) {
@@ -1605,7 +1702,11 @@ bool Ds41Dense::relay_write_in(int n, const void * src, size_t src_bytes, int64_
     if (n < 1 || n > (int) im.NC) { im.err = "relay_write_in: pass size out of range"; return false; }
     if (!src) { im.err = "relay_write_in: no payload"; return false; }
     const size_t xs = (size_t) (im.D * im.HC * 4), ps = (size_t) (im.HC * 4);
-    const size_t cs = relay_slab_bytes() - xs - ps;   // 0 when this stage reads the producer's candidates in place
+    // The whole payload, always: this stage owns a column of its own unless it reads the producer's tensor in place,
+    // and even then copying the region it received into the column it will not read is harmless (the region is 8 KiB a
+    // token).  Skipping it would make a stage's copy depend on a choice its PRODUCER cannot see, and the two sides'
+    // idea of the payload's end is the one thing that must never disagree.
+    const size_t cs = relay_slab_bytes() - xs - ps;
     const size_t bytes = ((xs + ps + cs) * (size_t) n);
     if (src_bytes < bytes) {
         im.err = "relay_write_in: the staging slot holds " + std::to_string(src_bytes) + " bytes, the pass needs " +
@@ -1656,7 +1757,7 @@ void Ds41Dense::relay_cand_from(Ds41Dense * src) {
     im.cand_src_cap = src->p_->S;
 }
 bool Ds41Dense::relay_owns_cand_region() const {
-    return Impl::cand_is_relayed(p_->g) && !p_->cand_src_prev;
+    return cand_can_cross(p_->g) && !p_->cand_src_prev;
 }
 
 void Ds41Dense::set_route_bias(int il, const float * bias) {

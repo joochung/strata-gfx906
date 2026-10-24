@@ -64,7 +64,17 @@ struct Ds41DenseConfig {
     /// state, the routing bias) is allocated for this range's layers only, and the layer graphs run only over this
     /// stage's layers; the relay of tools/gfx906/relay_staging.hpp hands the state over at a boundary.
     int64_t lb = 0, le = 0;   ///< le 0 = n_layer (filled in from the GGUF when not given)
+    /// P5.3b: the layer ONE PAST the persistent rings this stage owns - the boundary rule's state_end: this stage's
+    /// range plus the source layer(s) its SUCCESSOR's first layer reads (a boundary at layer 21 leaves the successor
+    /// reading layer 20's compressed KV / index keys, so stage 0 holds layer 20's rings).  Must be >= le; 0 = the
+    /// stage's own range, which is correct only when the successor starts at its own kv AND index source, and for the
+    /// last stage.  A driver that knows the whole split computes it with Ds41Dense::stage_state_end().
+    int64_t state_le = 0;
     bool is_first = true, is_last = true;
+    /// P5.3b (set by build_stages): this instance is one stage of a staged run.  A range that is not the whole model
+    /// implies it, so callers rarely set this; it exists for the (rare) case of a stage whose range IS the model,
+    /// which still needs the staged pass-column window and the state region the boundary rule gives it.
+    bool staged = false;
     /// P5.3b (set by build_stages, not by callers): read the geometry and build the state and graphs but take NO weight
     /// tensors of our own; the owner hands its own over immediately before that init runs.
     bool share_weights = false;
@@ -110,27 +120,22 @@ public:
     /// every stage that borrowed from it.  A null entry is created; on failure `err` says which stage and why.
     bool build_stages(std::vector<std::unique_ptr<Ds41Dense>> & stage, const std::vector<Ds41DenseConfig> & cfg,
                       std::string & err);
-    /// P5.3b, the CANDIDATE exception to the KV rule: the candidate blocks of layer `cand_layer` are produced by one
-    /// layer and consumed by the indexers AFTER it (this model: layer 20 writes, 24/28/32/36 read), so a boundary that
-    /// separates them leaves the reader needing the writer's selection.  `ends` is the split's stage ends, ascending.
-    /// Returns true when NOTHING crosses - the producer and every reader are in one stage, OR the stages are on
-    /// different cards (`cross_card`) and the column simply rides in the relay payload, which is bit-exact because it
-    /// moves the producer's own ids rather than re-running a knife-edge top-k.  Returns false in the two cases the
-    /// engine must then handle: a same-card split that has to decide between relaying and reading the producer's
-    /// tensor in place (relay_cand_from - the cheaper, bit-exact-by-construction choice), and a split that STRANDS the
-    /// producer, whose readers are more than one stage behind it and so have no neighbouring tensor to reach; the
-    /// latter is a refusal, and `err` says which boundary to move where.  Pure - geometry only, no allocation.
-    // `ends` may be the FULL end list (last == n_layer) or the boundary list only; either reads the same.
-    static bool stages_keep_candidates_local(const strata::v41::Ds41Geometry & g, const std::vector<int64_t> & ends_in,
-                                             bool cross_card, std::string & err);
-    /// P5.3b, the CANDIDATE exception (only the engine calls this, and only for a SAME-device split whose boundary
-    /// separates layer cand_layer from the indexers that rank inside its blocks - see stages_keep_candidates_local).
-    /// Tell this stage that its candidate blocks come from ANOTHER stage's instance: `src` is that instance's payload
-    /// tensor, and this stage reads it in place instead of its own (one card, so a graph may point at it - no copy, and
-    /// the ids are the producer's own bits).  It then holds no candidate region of its own, so relay_slab_bytes() drops
-    /// by relay_cand_bytes(geom()) - call it BEFORE the staging is sized, and set the same flag on every stage that
-    /// reads the producer's column (they all inherit it, not just the next one).  `src` must be a stage built from this
-    /// same model, on this same backend, and must outlive this stage.
+    /// P5.3b: THE CACHE SPLIT - the lowest layer a stage boundary may sit at.  A layer reads the compressed KV /
+    /// index keys of the LATEST source at or below it (Ds41Geometry::kv_src / idx_src), and those rings are persistent
+    /// GPU state: the relay hands over x_state / pre_state / the candidate column PER TOKEN and has no way to move a
+    /// cache, so a stage boundary has to be above every layer whose rings a later stage reads.  The layers that read
+    /// them reach back over the whole model (this model's topmost layers still read layer 20's compressed KV and layer
+    /// 36's index keys), so the answer is the model's LAST kv / index source + 1.  The per-token state crosses freely;
+    /// it is only the caches that cannot.  Pure - geometry only, so a caller can check a --layer-split before
+    /// allocating anything, and the witness can name the legal range without a model load.
+    static int64_t split_min_boundary(const strata::v41::Ds41Geometry & g);
+    /// P5.3b, the CANDIDATE exception (only the engine calls this, and only for a SAME-device split that puts
+    /// cand_layer's producer and its readers in different stages).  Point this stage's graphs at ANOTHER stage's
+    /// candidate tensor instead of its own: `src` is that stage's instance, its tensor is read in place (one card, so a
+    /// graph may point at it - no copy, and the ids are the producer's own bits).  The stage then owns no candidate
+    /// region of its own, so relay_slab_bytes() drops by relay_cand_bytes(geom()): call this BEFORE sizing the
+    /// staging.  Set it on EVERY stage that reads the producer's column, not just the next one.  `src` must be a stage
+    /// of the same model on the same backend, and must outlive this stage.
     void relay_cand_from(Ds41Dense * src);
     /// The bytes per token of the relay payload.  A boundary carries the state a successor's first layer reads: the
     /// x_state token column (D * HC * 4) and the pre_state column (HC * 4), plus - when THIS stage produced the
@@ -166,12 +171,13 @@ public:
     /// order Ds41Engram::rows() returns them in.  Empty when the range holds none (a stage on a second card then reads
     /// NO Engram rows at all) and every slot when unsplit.
     std::vector<int64_t> engram_slots() const;
-    /// P5.3b: does the model's routing depend on the `cand_layer` candidates (i.e. is there an index source after it)?
-    /// Same test as relay_carries_cand, and the reason a split boundary has to be chosen with the candidate column in
-    /// mind: the producer is a single layer whose top-k list the layers above it rank inside, so a boundary is either
-    /// above the producer (nothing crosses) or immediately after it (the column is borrowed in place on one card,
-    /// relayed across two).  Anything farther strands the producer and is refused.
-    static bool cand_relay_needed(const strata::v41::Ds41Geometry & g);
+    /// P5.3b: CAN a legal stage boundary separate cand_layer from a layer that ranks inside its blocks?  That, and not
+    /// "does the model have candidates", is what decides whether the payload carries the column: the boundary floor is
+    /// split_min_boundary() (the model's last shared-cache layer + 1), and on this model the floor (37) is above the
+    /// last indexer (36), so every reader of layer 20's blocks is in the producer's own stage and the column never
+    /// crosses.  A model with an index source ABOVE its floor can separate them, and its payload carries the 8 KiB a
+    /// token.  Pure - geometry only - because the engine sizes the staging before any stage exists.
+    static bool cand_can_cross(const strata::v41::Ds41Geometry & g);
 
     /// Start a pass: tokens tids[0..n) at positions pos0.., n <= max_pass.  Embeddings + Engram rows (the hash
     /// needs the 3 tokens before pos0: the history is kept by position, so a re-decoded position overwrites it).

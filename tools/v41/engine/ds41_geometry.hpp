@@ -80,6 +80,14 @@ struct Ds41Geometry {
         for (int64_t k : index_sources) if (k <= l) s = k;
         return s;
     }
+    /// The last layer that runs an indexer, or -1 when the model has none.  Together with cand_layer it says whether the
+    /// candidate column could ever have to cross a stage boundary: only a reader at or above the boundary floor (the
+    /// last cache source + 1, see Ds41Dense::split_min_boundary) can end up in another stage.
+    int64_t last_indexer() const {
+        int64_t s = -1;
+        for (int64_t k : index_sources) if (k > s) s = k;
+        return s;
+    }
     int64_t hc_mix() const { return (2 + hc) * hc; }
 
 private:
