@@ -105,11 +105,12 @@ public:
     /// destroyed BEFORE the instance that owns the weights.
     bool weights_shared() const;
     /// P5.3b: can a split with boundaries at `ends` (one-past-the-last-layer of every stage but the last, ascending)
-    /// be run at all, given the model's kv / index source layers?  Same rule build_stages enforces: a boundary must
-    /// come after a layer that is BOTH a compressed-KV source and an index-key source, because that is the only
-    /// persistent state a boundary can leave in place for a successor on another card (the successor reads the
-    /// producer's rings by pointer inside one graph).  Pure - geometry only, no allocation - so a caller can validate
-    /// its --layer-split before loading anything.  On false, `err` says which boundary and what is legal.
+    /// be run at all, given the model's kv / index source layers?  The rule build_stages enforces is THE READER'S
+    /// SIDE of the shared caches: every ring a stage's layers read must have been written by a layer THAT STAGE runs,
+    /// because a ring is persistent GPU state the successor reads by pointer inside one graph and the relay moves
+    /// per-token state only.  Equivalently: every boundary is a layer of split_valid_boundaries().  Pure - geometry
+    /// only, no allocation - so a caller can validate its --layer-split before loading anything.  On false, `err`
+    /// says which boundary, why, and what the legal set is.
     static bool split_boundaries_ok(const strata::v41::Ds41Geometry & g, const std::vector<int64_t> & ends,
                                     std::string & err);
     /// Build the STAGES of a split run on this instance's weights instead of loading the model once per stage (the
@@ -120,15 +121,32 @@ public:
     /// every stage that borrowed from it.  A null entry is created; on failure `err` says which stage and why.
     bool build_stages(std::vector<std::unique_ptr<Ds41Dense>> & stage, const std::vector<Ds41DenseConfig> & cfg,
                       std::string & err);
-    /// P5.3b: THE CACHE SPLIT - the lowest layer a stage boundary may sit at.  A layer reads the compressed KV /
+    /// P5.3b: THE CACHE SPLIT - EVERY layer a stage boundary may sit at, ascending.  A layer reads the compressed KV /
     /// index keys of the LATEST source at or below it (Ds41Geometry::kv_src / idx_src), and those rings are persistent
     /// GPU state: the relay hands over x_state / pre_state / the candidate column PER TOKEN and has no way to move a
-    /// cache, so a stage boundary has to be above every layer whose rings a later stage reads.  The layers that read
-    /// them reach back over the whole model (this model's topmost layers still read layer 20's compressed KV and layer
-    /// 36's index keys), so the answer is the model's LAST kv / index source + 1.  The per-token state crosses freely;
-    /// it is only the caches that cannot.  Pure - geometry only, so a caller can check a --layer-split before
-    /// allocating anything, and the witness can name the legal range without a model load.
-    static int64_t split_min_boundary(const strata::v41::Ds41Geometry & g);
+    /// cache, so a RING LIVES ON THE CARD OF THE STAGE THAT RUNS ITS WRITER - and therefore every READER of a ring has
+    /// to sit in that same stage.  K is valid iff for every m >= K with ratio[m] > 0:
+    ///     kv_src(m) >= K  AND  idx_src(m) >= K  AND  (m ranks inside cand_layer's blocks  =>  cand_layer >= K).
+    /// The stage-0 side is free (kv_src(m) <= m < K always), and kv_src / idx_src are monotone, so the scan bites at
+    /// the boundary layer itself: a valid boundary is a layer that is BOTH a kv and an index source (plus, vacuously,
+    /// a boundary above a layer that runs no attention at all).  For the shipped 40-layer build the set is
+    /// {1, 2, 8, 14, 20} - and the CLI's floor of 2 leaves {2, 8, 14, 20}, which INCLUDES the even split at 20.
+    /// (A previous revision of this file derived a FLOOR of 37 from the writers instead of the readers; a boundary at
+    /// 37 puts the tail [37,40) on a card whose layers read layer 20's KV and layer 36's index keys, and build_attn
+    /// aborts on exactly that.  The per-token state crosses freely at any valid boundary; the caches never do.)
+    /// Pure - geometry only, so a caller can check a --layer-split before allocating anything, and the witness can
+    /// name the legal set without a model load.
+    static std::vector<int64_t> split_valid_boundaries(const strata::v41::Ds41Geometry & g);
+    /// One boundary of that set, as the predicate itself (the enumerator and the messages are both written from it).
+    static bool split_boundary_valid(const strata::v41::Ds41Geometry & g, int64_t K);
+    /// The same set as one line of text for a message: "2, 8, 14, 20", or "(none)" for a model that cannot split.
+    static std::string split_valid_set_text(const strata::v41::Ds41Geometry & g);
+    /// Snap a planned boundary list DOWN to the legal set: each planned boundary takes the nearest legal layer at or
+    /// below it that still leaves its stage at least one layer.  `snapped` comes back ascending with positive stage
+    /// widths, or false comes back with `err` naming the legal set (a stage that would collapse to zero layers has
+    /// nowhere to snap to - the plan needs fewer stages, not a different layer).
+    static bool split_snap_to_valid(const strata::v41::Ds41Geometry & g, const std::vector<int64_t> & planned,
+                                    std::vector<int64_t> & snapped, std::string & err);
     /// P5.3b, the CANDIDATE exception (only the engine calls this, and only for a SAME-device split that puts
     /// cand_layer's producer and its readers in different stages).  Point this stage's graphs at ANOTHER stage's
     /// candidate tensor instead of its own: `src` is that stage's instance, its tensor is read in place (one card, so a
@@ -172,11 +190,13 @@ public:
     /// NO Engram rows at all) and every slot when unsplit.
     std::vector<int64_t> engram_slots() const;
     /// P5.3b: CAN a legal stage boundary separate cand_layer from a layer that ranks inside its blocks?  That, and not
-    /// "does the model have candidates", is what decides whether the payload carries the column: the boundary floor is
-    /// split_min_boundary() (the model's last shared-cache layer + 1), and on this model the floor (37) is above the
-    /// last indexer (36), so every reader of layer 20's blocks is in the producer's own stage and the column never
-    /// crosses.  A model with an index source ABOVE its floor can separate them, and its payload carries the 8 KiB a
-    /// token.  Pure - geometry only - because the engine sizes the staging before any stage exists.
+    /// "does the model have candidates", is what decides whether the payload carries the column: it asks whether any
+    /// member of split_valid_boundaries() sits strictly above the producer and at or below a reader.  On this model it
+    /// cannot answer yes, and not by accident: validity already requires cand_layer >= K for every boundary K that
+    /// leaves a reader above it, so producer and readers are in one stage at EVERY legal boundary (20, here: the writer
+    /// and its readers 24/28/32/36 all land in stage 1).  A model whose cache lives OUTSIDE the kv / index source lists
+    /// is the one that could separate them, and its payload carries the 8 KiB a token.  Pure - geometry only - because
+    /// the engine sizes the staging before any stage exists.
     static bool cand_can_cross(const strata::v41::Ds41Geometry & g);
 
     /// Start a pass: tokens tids[0..n) at positions pos0.., n <= max_pass.  Embeddings + Engram rows (the hash

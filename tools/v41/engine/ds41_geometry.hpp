@@ -81,8 +81,10 @@ struct Ds41Geometry {
         return s;
     }
     /// The last layer that runs an indexer, or -1 when the model has none.  Together with cand_layer it says whether the
-    /// candidate column could ever have to cross a stage boundary: only a reader at or above the boundary floor (the
-    /// last cache source + 1, see Ds41Dense::split_min_boundary) can end up in another stage.
+    /// candidate column could ever have to cross a stage boundary: only a boundary that sits STRICTLY ABOVE cand_layer and
+    /// at or below a reader separates them, and no valid boundary does (Ds41Dense::split_boundary_valid requires
+    /// cand_layer >= K for every K that leaves a reader at or above it, so a reader never ends up in another stage).
+    /// For this model the topmost indexer is 36 and the highest valid boundary is the candidate writer 20 itself.
     int64_t last_indexer() const {
         int64_t s = -1;
         for (int64_t k : index_sources) if (k > s) s = k;

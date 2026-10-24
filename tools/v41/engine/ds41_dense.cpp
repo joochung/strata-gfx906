@@ -158,49 +158,47 @@ struct Ds41Dense::Impl {
     int64_t lb = 0, le = 0, wl = 0, wle = 0;
     bool is_first = true, is_last = true;
     /// The layer range the PERSISTENT state was allocated for: [lb, state_end()) == the stage's own range [lb, le).
-    /// THE SHARED-CACHE RULE (Ds41Dense::split_min_boundary) says why it can be that simple: a layer reads the
-    /// compressed KV / index keys of the LATEST source at or below it, those caches are persistent GPU state, and the
-    /// relay moves per-token state only - so a boundary may not sit below the last source, and every read of a ring
-    /// stays inside the stage that runs its producer.  A stage on another card therefore never reaches a ring it does
-    /// not hold, and a ring a stage does not run is simply not allocated (null), which is what makes attn_router(il)
-    /// and build_attn fail loudly for another stage's layer instead of building a graph over NULL.
+    /// THE READER'S RULE (Ds41Dense::split_boundary_valid) says why it can be that simple: a layer reads the compressed
+    /// KV / index keys of the LATEST source at or below it, those rings are persistent GPU state, and the relay moves
+    /// per-token state only - so a boundary has to leave every READER in the stage that runs its ring's writer, and
+    /// every read of a ring stays inside the stage that runs it.  A stage on another card therefore never reaches a ring
+    /// it does not hold, and a ring a stage does not run is simply not allocated (null), which is what makes
+    /// attn_router(il) and build_attn fail loudly for another stage's layer instead of building a graph over NULL.
     int64_t state_end() const { return st_end; }
     /// Compute the state region from the stage's range and cache it (init()'s allocation loops read it many times).
     /// With the boundary rule it is exactly the range the stage runs; see the check inside.
     void compute_state_end() {
-        // With the shared-cache rule (Ds41Dense::split_boundaries_ok) in force, every cache a stage's layers read was
-        // produced by a layer of THIS stage: a boundary may not sit below the model's last source layer, so a
-        // successor never reads across one.  A stage's persistent rings are therefore exactly the layers it runs, and
-        // a config that claims otherwise is a bug in the driver, not a shape to support.
+        // With the reader's rule (Ds41Dense::split_boundaries_ok) in force, every cache a stage's layers read was
+        // produced by a layer of THIS stage: a boundary is a layer of the valid set, so a successor never reads across
+        // one.  A stage's persistent rings are therefore exactly the layers it runs, and a config that claims otherwise
+        // is a bug in the driver, not a shape to support.
         if (cfg_state_le > 0 && cfg_state_le != le) {
             std::fprintf(stderr, "[ds41_dense] stage [%lld,%lld): the run asked for state to layer %lld; a stage's "
                          "persistent rings are exactly the layers it runs\n", (long long) lb, (long long) le,
                          (long long) cfg_state_le);
             std::abort();
         }
-        // A boundary below the last source would need a cache this stage does not run.  init() is where the rings get
-        // allocated, so the rule is re-checked here rather than trusted from the caller - the abort names the layer to
-        // move the cut to, which is the message a user with a hand-built config needs.
-        if (staged && le < nl) {
-            const int64_t min_e = Ds41Dense::split_min_boundary(g);
-            if (le < min_e) {
-                std::fprintf(stderr, "[ds41_dense] stage [%lld,%lld): a boundary at %lld is below this model's last "
-                             "source layer %lld - the next stage would read a cache it does not own\n",
-                             (long long) lb, (long long) le, (long long) le, (long long) (min_e - 1));
-                std::abort();
-            }
+        // A boundary that is not in the valid set would need a cache this stage does not run.  init() is where the rings
+        // get allocated, so the rule is re-checked here rather than trusted from the caller - the abort names the legal
+        // set, which is the message a user with a hand-built config needs.
+        if (staged && le < nl && !Ds41Dense::split_boundary_valid(g, le)) {
+            std::fprintf(stderr, "[ds41_dense] stage [%lld,%lld): a boundary at %lld is not a valid boundary for this "
+                         "model (valid: %s); its layers would read rings the stage below them wrote\n",
+                         (long long) lb, (long long) le, (long long) le,
+                         Ds41Dense::split_valid_set_text(g).c_str());
+            std::abort();
         }
         st_end = le;
     }
     int64_t cfg_state_le = 0; ///< cfg.state_le, kept for the consistency check in compute_state_end()
-    /// The layer one-past-the-last layer that allocates persistent rings.  With the shared-cache rule this is the
+    /// The layer one-past-the-last layer that allocates persistent rings.  With the reader's rule this is the
     /// state region, which is the stage's own range; allocation loops and the weight bounds read it through this name
     /// so a future rule that widens the region has one place to do it.
     int64_t alloc_end() const { return std::max(st_end, le); }
     int64_t st_end = 0;      ///< the cached result of compute_state_end(); set before any allocation loop reads it
     /// P5.3b: does THIS stage run layer `il`?  Every per-layer entry point says so or fails loudly - a layer run
     /// twice would double-advance the state and a layer nobody runs would leave a relayed column unwritten.  The
-    /// stage's run is its range, and the shared-cache rule guarantees no layer of a later stage reads a ring this
+    /// stage's run is its range, and a valid boundary guarantees no layer of a later stage reads a ring this
     /// stage's layers wrote (or the reverse), so range and rings are the same set of layers.
     bool owns_layer(int64_t il) const { return il >= lb && il < alloc_end(); }
     /// P5.3b: true once this instance is part of a staged run (build_stages sets it on every stage).  It is what makes
@@ -362,17 +360,21 @@ struct Ds41Dense::Impl {
     /// tensor in place (relay_cand_from, a same-card option).  The PAYLOAD number stays a function of the GEOMETRY alone
     /// so the two sides of a boundary can never disagree about where a copy ends.
     bool cand_region_owned() const { return Impl::cand_can_cross(g) && cand_src_prev == nullptr; }
-    /// Can a LEGAL boundary (at or above this model's cache floor) separate cand_layer from a layer that ranks inside
-    /// its blocks?  A reader at or below the floor is in the producer's own stage whatever the plan, so only a reader AT
-    /// OR ABOVE it separates - and since the floor is the model's LAST kv / index source + 1 while every such reader IS
-    /// an index source, no model whose caches are those two lists ever answers yes.  DeepSeek-V4.1-Flash: last indexer
-    /// 36, floor 37, no.  Consequence, and it is worth stating where the code is read: under the cache rule a staged run
-    /// always relays the TWO state columns and nothing else; the candidate region below is for a model with a cache
-    /// OUTSIDE these lists (a hybrid SSM state, a cache keyed by something Ds41Geometry does not read yet).
+    /// Can a LEGAL boundary separate cand_layer from a layer that ranks inside its blocks?  The question is now the
+    /// enumerator's: a boundary at K separates them iff K is VALID, K sits strictly above the producer, and some reader
+    /// sits at or above K.  A valid K always leaves the producer with its readers (validity requires cand_layer >= K for
+    /// any K that leaves a reader at or above it), so for a model whose caches are the kv / index source lists this is
+    /// false for EVERY plan - which is why the shipped run's slab line says `cand 0`.  Consequence, and it is worth
+    /// stating where the code is read: under this rule a staged run always relays the TWO state columns and nothing
+    /// else; the candidate region below is for a model with a cache OUTSIDE these lists (a hybrid SSM state, a cache
+    /// keyed by something Ds41Geometry does not read yet), whose valid boundaries can put a reader above the producer.
     static bool cand_can_cross(const strata::v41::Ds41Geometry & g) {
         if (g.cand_layer < 0 || g.cand_layer >= (int64_t) g.ratio.size()) return false;
-        const int64_t floor_e = Ds41Dense::split_min_boundary(g);
-        for (int64_t k : g.index_sources) if (k > g.cand_layer && k >= floor_e) return true;
+        int64_t last_reader = -1;      // a reader = an INDEX source strictly above the producer (L.uses_cand)
+        for (int64_t k : g.index_sources) if (k > g.cand_layer && k > last_reader) last_reader = k;
+        if (last_reader < 0) return false;
+        for (int64_t K : Ds41Dense::split_valid_boundaries(g))
+            if (g.cand_layer < K && K <= last_reader) return true;
         return false;
     }
     /// Does the model's routing consult cand_layer's column at all - is there an INDEXER above the producer?  (This
@@ -651,23 +653,22 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     // A LAYER READS ACROSS STAGES, AND NO BOUNDARY FIXES THAT.  The compressed KV of layer kvl is a persistent cache
     // that lives on the card of the stage which RUNS kvl, and layer `il` reads it by pointer inside its graph; the
     // relay hands over per-token state (x_state / pre_state) and has no way to move a cache.  So a split's stage set has
-    // to be cut where no layer reads across - which for a model with shared caches means a stage set whose boundaries
-    // leave every reader in its producer's stage.  build_stages refuses those plans; reaching this line means a stage
-    // was built by hand or the geometry has a shape the boundary floor does not describe, so it is fatal, not recoverable.
-    // (The GLM engine's layers keep their own caches, so the same code shape there is a legal split; see
-    // docs/gfx906/P5-RELAY-PATTERN.md section 6b for the two engine shapes.)
+    // to be cut where no layer reads across - which means EVERY stage's layers find their sources inside that stage, and
+    // therefore every boundary is a layer of split_valid_boundaries().  build_stages refuses plans that are not; reaching
+    // this line means a stage was built by hand, so it is fatal, not recoverable.  (The GLM engine's layers keep their
+    // own caches, so the same code shape there is a legal split; see docs/gfx906/P5-RELAY-PATTERN.md section 6b.)
     if (L.ratio && !im.owns_layer(L.kvl)) {
         std::fprintf(stderr, "[ds41_dense] build_attn: layer %lld reads the compressed KV of layer %lld, which this "
-                     "stage [%lld,%lld) does not run; a stage boundary must be above the model's last shared-cache "
-                     "layer %lld\n", (long long) il, (long long) L.kvl, (long long) im.lb, (long long) im.le,
-                     (long long) (Ds41Dense::split_min_boundary(im.g) - 1));
+                     "stage [%lld,%lld) does not run; its boundary %lld is not valid for this model (valid: %s)\n",
+                     (long long) il, (long long) L.kvl, (long long) im.lb, (long long) im.le, (long long) im.le,
+                     Ds41Dense::split_valid_set_text(im.g).c_str());
         std::abort();
     }
     if (L.ratio && !im.owns_layer(L.idxl)) {
         std::fprintf(stderr, "[ds41_dense] build_attn: layer %lld reads the index keys of layer %lld, which this "
-                     "stage [%lld,%lld) does not run; a stage boundary must be above the model's last shared-cache "
-                     "layer %lld\n", (long long) il, (long long) L.idxl, (long long) im.lb, (long long) im.le,
-                     (long long) (Ds41Dense::split_min_boundary(im.g) - 1));
+                     "stage [%lld,%lld) does not run; its boundary %lld is not valid for this model (valid: %s)\n",
+                     (long long) il, (long long) L.idxl, (long long) im.lb, (long long) im.le, (long long) im.le,
+                     Ds41Dense::split_valid_set_text(im.g).c_str());
         std::abort();
     }
     const Ds41Geometry & G = im.g;
@@ -946,11 +947,13 @@ static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc,
     const int64_t col0 = pass_col0(im, col0_p);
     using L_t = Ds41Dense::Impl::Layer;
     L_t & L = im.ly[(size_t) il];
-    // P5.3b: as in build_attn - a layer whose KV / index-key source this stage does not own is a bug, said loudly.
+    // P5.3b: as in build_attn - a layer whose KV / index-key source this stage does not own means the stage's boundary
+    // is not one of the model's valid boundaries (Ds41Dense::split_boundary_valid), which build_stages refuses.
     if (L.ratio && (!im.owns_layer(L.kvl) || !im.owns_layer(L.idxl))) {
         std::fprintf(stderr, "[ds41_dense] build_attn_kv_only: layer %lld reads the KV of layer %lld / the index keys "
-                     "of layer %lld, outside this stage [%lld,%lld)\n", (long long) il, (long long) L.kvl,
-                     (long long) L.idxl, (long long) im.lb, (long long) im.le);
+                     "of layer %lld, outside this stage [%lld,%lld) (valid boundaries: %s)\n", (long long) il,
+                     (long long) L.kvl, (long long) L.idxl, (long long) im.lb, (long long) im.le,
+                     Ds41Dense::split_valid_set_text(im.g).c_str());
         std::abort();
     }
     const Ds41Geometry & G = im.g;
@@ -1318,8 +1321,10 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     // BEFORE this init ran (build_stages adopts first, because init builds graphs that look weights up by name).
     if (!im.share_weights && !load_weights(im, err)) return false;
     // P5.3b SHAPE NOTE: the token ring that feeds these reads is filled in upload_pass, i.e. only on the stage that
-    // runs begin() (stage 0).  So engram layers must live in ONE stage - the cache rule gives that for this model's
-    // pair (1, 14), and a boundary between them would leave a stage hashing against a ring it never fed.
+    // runs begin() (stage 0).  So engram layers must live in ONE stage - and the CACHES' RULE does not give that for
+    // free: {8, 14, 20} is a cache-legal plan that cuts between this model's pair (1, 14), which is why ds41_generate
+    // enforces the Engram constraint itself (the first boundary above the last Engram layer).  A boundary between them
+    // would leave a stage hashing against a ring it never fed.
     // The Engram tables are ~GBs of host memory and only the layer range that holds an engram layer reads them, so a
     // stage that owns none does not open them (its graphs never ask: no layer in its range has an eslot).
     const int64_t sen = im.state_end();
@@ -1453,49 +1458,88 @@ bool Ds41Dense::relay_carries_cand() const { return cand_can_cross(p_->g); }
 size_t Ds41Dense::relay_cand_bytes(const strata::v41::Ds41Geometry & g) {
     return cand_can_cross(g) ? (size_t) (g.cand_blocks * 4) : 0;
 }
-/// Can a LEGAL boundary (at or above the model's cache floor) separate cand_layer from a layer that ranks inside its
-/// blocks?  A reader at or below the floor shares the producer's stage whatever the plan, so only a reader ABOVE it -
-/// which needs an index source above every cache source - makes the payload carry the column.  DeepSeek-V4.1-Flash:
-/// last indexer 36, floor 37, so no: a staged run of this model relays the two state columns and nothing else.
+/// Can a LEGAL boundary separate cand_layer from a layer that ranks inside its blocks?  It asks the question the way
+/// the rule now states it: does any member of split_valid_boundaries() sit strictly above the producer and at or below
+/// a reader?  For a model whose caches ARE the kv / index source lists the answer is no by construction - validity at K
+/// already requires cand_layer >= K whenever a reader is left at or above K - so a staged run of this model relays the
+/// two state columns and nothing else (20, the witness's boundary, keeps writer 20 with its readers 24/28/32/36).
+/// A model with a cache OUTSIDE those lists is the one that can separate them, and its payload carries the 8 KiB a token.
 bool Ds41Dense::cand_can_cross(const strata::v41::Ds41Geometry & g) { return Impl::cand_can_cross(g); }
 std::vector<int64_t> Ds41Dense::engram_slots() const { return p_->eng_slots; }
 
-/// "2, 8, 14, 20, 24, 28, 32, 36" - the layers whose rings a successor reads, for build_stages' rejection message.
-static std::string ds41_source_layers_str(const strata::v41::Ds41Geometry & g) {
-    std::string r;
-    for (int64_t l = 0; l < (int64_t) g.ratio.size(); ++l)
-        if (g.is_kv_source(l) || g.is_index_source(l)) { if (!r.empty()) r += ", "; r += std::to_string(l); }
-    return r.empty() ? "none" : r;
-}
-/// P5.3b: THE CACHE SPLIT - why a DeepSeek-V4.1 stage boundary has to sit above the last source layer.
+/// P5.3b: ONE BOUNDARY, TESTED DIRECTLY - the single source of truth for where a DeepSeek-V4.1 stage boundary may sit.
 ///
-/// A layer l reads the compressed KV of kv_src(l) and the index keys of idx_src(l): the LATEST source at or below l.
+/// A layer m reads the compressed KV of kv_src(m) and the index keys of idx_src(m): the LATEST source at or below m.
 /// Those rings are PERSISTENT GPU state, allocated once and written as the run advances - not per-pass activations.
 /// The relay moves x_state, pre_state and the candidate column, all sized PER TOKEN, and there is no mechanism to move
-/// a KV cache: a stage on another card simply cannot read a ring the stage before it wrote, and a stage on the same
-/// card cannot be told to hold a ring a layer it does not run produced.
+/// a cache: a stage reads a ring by POINTER inside its own graphs.  So A RING LIVES ON THE CARD OF THE STAGE THAT RUNS
+/// ITS WRITER, and the constraint is on the READERS:
 ///
-/// Which rings must therefore stay put?  Every ring any later layer reads.  In this model the topmost layers still
-/// read layer 20's compressed KV and layer 36's index keys, so a boundary below 37 would strand a cache.  The rule is
-/// then simply: no boundary below LAST_SOURCE + 1, where LAST_SOURCE is the model's last kv or index source.  The
-/// per-token state crosses at the boundary as usual; the caches never do, which is the difference between this engine
-/// and the GLM one (whose layers all keep their own cache and whose split sits at a layer whose successor recomputes
-/// everything it reads).
-int64_t Ds41Dense::split_min_boundary(const strata::v41::Ds41Geometry & g) {
-    int64_t last = -1;
-    for (int64_t l : g.kv_sources) last = std::max(last, l);
-    for (int64_t l : g.index_sources) last = std::max(last, l);
-    return last + 1;      // -1 + 1 = 0 for a model with no shared caches at all: any boundary is fine
+///     K is valid  iff  for every m in [K, n_layer) with ratio[m] > 0:
+///         kv_src(m) >= K   AND   idx_src(m) >= K
+///         AND (m ranks inside cand_layer's blocks  =>  cand_layer >= K)
+///
+/// i.e. every layer at or above the boundary finds its rings - and the candidate column - at or above the boundary too,
+/// in the stage that runs it.  The stage-0 side is free: kv_src(m) <= m < K always, so stage 0 never reaches over its
+/// own boundary.  A ratio-0 layer runs no attention and reads no ring, so it is exempt (that is why layer 1, sliding-
+/// window like layer 0, is valid by this rule although split_plan refuses to type a boundary below 2).
+///
+/// WHY THE DIRECTION IS THIS WAY ROUND.  A previous revision of this file required the WRITERS to sit below the
+/// boundary and called LAST_SOURCE + 1 = 37 a floor.  That read the constraint upside down: a writer below the boundary
+/// is precisely what strands its ring.  The tail stage [37,40) runs layers 37/38/39, whose kv_src is 20 and idx_src is
+/// 36 - both below 37 - so it would build graphs over rings it never allocated, and build_attn's own check aborts on
+/// exactly that (the abort the floor was written to prevent).  A legal boundary's tail stage contains the WRITERS its
+/// layers read: the even split at 20 puts stage 1 = [20,40) over the writer of ring 20 AND every reader of it (20..39),
+/// the writers and readers of index rings 24/28/32/36, and the candidate writer (20) with all of its readers
+/// (24/28/32/36).
+///
+/// Because kv_src / idx_src are monotone in m ("the latest source at or below m"), the scan can only ever bite at the
+/// boundary layer itself: kv_src(K) >= K means K IS its own kv source.  So a valid boundary is a layer that is BOTH a
+/// kv and an index source - plus the vacuous case of a boundary layer that runs no attention.  That is the same answer
+/// build_stages' cross-card check reaches from the other side, and the host gate re-derives the set by scanning stages
+/// and their layers rather than trusting this function.
+bool Ds41Dense::split_boundary_valid(const strata::v41::Ds41Geometry & g, int64_t K) {
+    const int64_t n_layer = (int64_t) g.ratio.size();
+    if (K <= 0 || K >= n_layer) return false;              // a boundary is inside the model, and never at layer 0
+    for (int64_t m = K; m < n_layer; ++m) {
+        if (g.ratio[(size_t) m] == 0) continue;            // a sliding-window layer runs no attention, reads no ring
+        if (g.kv_src(m) < K) return false;                 // its compressed KV was written below the boundary
+        if (g.idx_src(m) < K) return false;                // ... and so were its index keys
+        // The candidate column: L.uses_cand is "above the producer and runs an indexer" (init()'s layer table).  The
+        // column is per-token state and COULD be relayed, but the rule keeps a producer with its readers, so no legal
+        // boundary separates them and the payload stays at the two state columns (see Impl::cand_can_cross).
+        if (g.cand_layer >= 0 && m > g.cand_layer && g.is_index_source(m) && g.cand_layer < K) return false;
+    }
+    return true;
+}
+
+/// The legal layers, ascending.  For the shipped 40-layer build that is {1, 2, 8, 14, 20}: the four layers that are both
+/// a kv and an index source, plus the vacuous 1 (ratio[1] == 0).  split_plan's floor of 2 leaves {2, 8, 14, 20} as the
+/// set a caller can name - which contains the EVEN split of a 40-layer model in two stages.
+std::vector<int64_t> Ds41Dense::split_valid_boundaries(const strata::v41::Ds41Geometry & g) {
+    std::vector<int64_t> v;
+    for (int64_t K = 1; K < (int64_t) g.ratio.size(); ++K) if (split_boundary_valid(g, K)) v.push_back(K);
+    return v;
+}
+
+std::string Ds41Dense::split_valid_set_text(const strata::v41::Ds41Geometry & g) {
+    const std::vector<int64_t> v = split_valid_boundaries(g);
+    if (v.empty()) return "(none: this model has no boundary a stage split may use)";
+    std::string s;
+    for (size_t i = 0; i < v.size(); ++i) s += (i ? ", " : "") + std::to_string(v[i]);
+    return s;
 }
 
 /// P5.3b: THE BOUNDARY CHECK, as a pure function of the geometry, so a caller can vet a planned --layer-split before
-/// allocating anything (ds41_generate does exactly that) and build_stages can enforce the same thing.  Every boundary
-/// must be at or above split_min_boundary(); anything lower strands a cache (see above), and the message names the
-/// layer to move the cut to.  `ends` = the end of every stage but the last, ascending.
+/// allocating anything (ds41_generate does exactly that) and build_stages can enforce the same thing.  Every boundary is
+/// a member of split_valid_boundaries() and the stage widths are positive and ascending.  That is EQUIVALENT to the
+/// per-stage statement of the rule (a plan is legal iff each stage's layers find their rings inside that stage),
+/// because the stage begins rise: if every boundary is valid, a layer of stage j reads sources at or above stage j's
+/// own begin, since those sources are at or above the boundary that opened its stage.  `ends` = the end of every stage
+/// but the last.
 bool Ds41Dense::split_boundaries_ok(const strata::v41::Ds41Geometry & g, const std::vector<int64_t> & ends,
                                     std::string & err) {
     const int64_t n_layer = (int64_t) g.ratio.size();
-    const int64_t min_e = split_min_boundary(g);
     int64_t prev = 0;
     for (size_t i = 0; i < ends.size(); ++i) {
         const int64_t e = ends[i];
@@ -1504,14 +1548,59 @@ bool Ds41Dense::split_boundaries_ok(const strata::v41::Ds41Geometry & g, const s
                   ") and above the previous boundary " + std::to_string(prev);
             return false;
         }
-        if (e < min_e) {
-            err = "a boundary at layer " + std::to_string(e) + " would leave the next stage reading the compressed KV / "
-                  "index keys of layer " + std::to_string(min_e - 1) + ", which live on the previous stage's card; this "
-                  "model's stages must split at layer " + std::to_string(min_e) + " or above (its last kv / index "
-                  "source is " + std::to_string(min_e - 1) + " and the relay moves per-token state, not caches)";
+        if (!split_boundary_valid(g, e)) {
+            // Name the layer that strands what, so a reader can see WHY their number is not on the list: the first
+            // layer at or above the boundary whose rings reach below it.
+            std::string who;
+            for (int64_t m = e; m < n_layer; ++m) {
+                if (g.ratio[(size_t) m] == 0) continue;
+                if (g.kv_src(m) < e) {
+                    who = "layer " + std::to_string(m) + " reads the compressed KV of layer " + std::to_string(g.kv_src(m));
+                    break;
+                }
+                if (g.idx_src(m) < e) {
+                    who = "layer " + std::to_string(m) + " reads the index keys of layer " + std::to_string(g.idx_src(m));
+                    break;
+                }
+                if (g.cand_layer >= 0 && m > g.cand_layer && g.is_index_source(m) && g.cand_layer < e) {
+                    who = "layer " + std::to_string(m) + " ranks inside layer " + std::to_string(g.cand_layer) +
+                          "'s candidate blocks";
+                    break;
+                }
+            }
+            err = "a boundary at layer " + std::to_string(e) + " leaves the next stage reading state written below it (" +
+                  (who.empty() ? "no layer above it names a source" : who) + "); those rings live on this stage's card "
+                  "and the relay moves per-token state, not caches.  This model's valid boundaries are " +
+                  split_valid_set_text(g);
             return false;
         }
         prev = e;
+    }
+    return true;
+}
+
+/// P5.3b: snap a planned plan DOWN to the legal set, so an EVEN split (--layer-split unset) gets a working answer
+/// instead of a refusal: 40 layers over 3 stages plans 13 and 26, and this turns them into 8 and 20.  A boundary with
+/// nowhere to go (no valid layer at or below it and above the previous boundary) is a refusal, not a stage of zero
+/// layers - such a plan needs fewer stages, not a different layer.
+bool Ds41Dense::split_snap_to_valid(const strata::v41::Ds41Geometry & g, const std::vector<int64_t> & planned,
+                                    std::vector<int64_t> & snapped, std::string & err) {
+    const std::vector<int64_t> valid = split_valid_boundaries(g);
+    snapped.clear();
+    int64_t prev = 0;
+    for (size_t i = 0; i < planned.size(); ++i) {
+        int64_t pick = -1;
+        for (int64_t v : valid) { if (v > planned[i]) break; if (v > prev) pick = v; }
+        if (pick < 0) {
+            err = "boundary " + std::to_string(i + 1) + " (planned at layer " + std::to_string(planned[i]) +
+                  ") has no valid layer at or below it above the previous boundary " + std::to_string(prev) +
+                  "; this model's valid boundaries are " + split_valid_set_text(g) + ", so a plan of " +
+                  std::to_string(planned.size() + 1) + " stages cannot be snapped - it needs fewer stages, or a "
+                  "--layer-split drawn from that set";
+            return false;
+        }
+        snapped.push_back(pick);
+        prev = pick;
     }
     return true;
 }
@@ -1596,13 +1685,13 @@ bool Ds41Dense::build_stages(std::vector<std::unique_ptr<Ds41Dense>> & stage, co
                   " if both sides sized it the same way)";
             return false;
         }
-        // P5.3b THE KV RULE, and the reason the boundary is legal at all: a stage's LAST layer (le-1) must be the
-        // producer of the compressed KV and the index keys its successor's layers read, because that is the only
-        // persistent state a boundary cannot leave in place - the successor runs on another card and reads the
-        // producer's rings by POINTER inside one graph (a per-token KV relay would be a D2H/H2D of the whole visible
-        // cache, every pass).  The geometry's kv_src/idx_src resolve to the latest source <= l, so requiring the
-        // layer BEFORE the boundary to be a kv AND index source makes every successor read only this stage's rings.
-        // A boundary anywhere else is refused here, not discovered as a null tensor mid-graph.
+        // P5.3b THE READER'S RULE, and the reason a boundary is legal at all: a stage's layers may read only rings that
+        // THIS stage's layers write, because a ring is persistent state and the successor runs on another card and reads
+        // it by POINTER inside one graph (a per-token KV relay would be a D2H/H2D of the whole visible cache, every
+        // pass).  Since kv_src / idx_src resolve to the latest source <= l and are monotone, that is the same thing as
+        // requiring the boundary layer itself to be BOTH a kv and an index source - which is what the geometry's valid
+        // set contains ({2, 8, 14, 20} on this model, including the even split at 20).  A boundary whose layers reach
+        // below it is refused here, not discovered as a null tensor mid-graph.
         if (le < n_layer) {
             std::string berr;
             if (!split_boundaries_ok(im.g, { le }, berr)) {
@@ -1613,8 +1702,9 @@ bool Ds41Dense::build_stages(std::vector<std::unique_ptr<Ds41Dense>> & stage, co
         // P5.3b: a stage on a FOREIGN backend cannot be in shape (b) - its successor would read a ring that lives on
         // this stage's card, and there is no way to hand over persistent state (the payload is sized per token and a
         // KV ring is not).  A caller may still describe such a plan; build_stages refuses it here, where the config's
-        // backend is known.  Shape (a) boundaries - the successor starts at its own sources - are the only ones a
-        // cross-card split may use.
+        // backend is known.  Read at the boundary layer, this is the same rule as above (its own sources, nothing below
+        // them), and it is the stricter wording: it also refuses a boundary layer that runs no attention at all, whose
+        // successor would therefore start a stage with no rings of its own.
         if (le < n_layer && cfg[s].backend && cfg[s].backend != im.backend) {
             const int64_t kv = im.g.kv_src(le), ix = im.g.idx_src(le);
             const bool own_sources = im.g.is_kv_source(le) && im.g.is_index_source(le);

@@ -311,9 +311,9 @@ struct StagedRun {
     strata::gfx906::RelayStaging st;                 // the pinned-or-plain staging between them
     size_t slab = 0;                                 // relay_slab_bytes(): the same on every stage
     // The relayed payload's regions, from the geometry: xs / ps = the x_state and pre_state columns, cand / cb =
-    // cand_layer's candidate blocks and their bytes.  Under the cache rule the candidate region is NOT carried (a reader
-    // can never reach the boundary floor - see Ds41Dense::cand_can_cross), so cand_relay starts false and the plan sets it
-    // only for a geometry whose caches are not the KV / index source lists.
+    // cand_layer's candidate blocks and their bytes.  Under the reader's rule the candidate region is NOT carried (no
+    // valid boundary can leave a reader above its producer - see Ds41Dense::cand_can_cross), so cand_relay starts false
+    // and the plan sets it only for a geometry whose caches are not the KV / index source lists.
     bool cand_relay = false;
     size_t xs = 0, ps = 0, cb = 0;
     // True when the candidate column CROSSES a boundary in this split, i.e. some stage after the producer reads it
@@ -359,8 +359,8 @@ struct StagedRun {
     /// position in the callback's signature, would put a value only the run knows into the shared hand-off shape).
     int64_t pos_of = 0;
 
-    /// The stage that RUNS `l`.  run_le is the stage's range end - with the cache rule no layer reads across a
-    /// boundary - but the loop and the refusal messages read run_le rather than repeating `le` everywhere, so one
+    /// The stage that RUNS `l`.  run_le is the stage's range end - with a valid boundary no layer reads across one -
+    /// but the loop and the refusal messages read run_le rather than repeating `le` everywhere, so one
     /// place defines the tiling.
     int owner(int64_t l) const {
         for (size_t s = 0; s < run_le.size(); ++s) if (l < run_le[s]) return (int) s;
@@ -633,47 +633,92 @@ int main(int argc, char ** argv) {
         }
         std::fprintf(stderr, "ds41_generate: %s\n", strata::gfx906::split_describe(a.split).c_str());
         if (a.split.n_stage > 1) {
-            // THE CACHE RULE, checked before anything is allocated, so a bad --layer-split is a message and not a
-            // stage that fails mid-graph (Ds41Dense::split_boundaries_ok enforces the same thing): this model shares a
-            // compressed KV and an index-key cache across layers, those caches are persistent GPU state, and the relay
-            // moves per-token state only - so a boundary must sit above the LAST layer any later stage reads from.
+            // WHY A BOUNDARY IS LEGAL AT ALL - checked before anything is allocated, so a bad --layer-split is a message
+            // and not a stage that fails mid-graph (Ds41Dense::split_boundary_valid is the single source of truth;
+            // build_stages and build_attn enforce the same thing at runtime).  A layer m reads the compressed KV of
+            // kv_src(m) and the index keys of idx_src(m): the LATEST source at or below m.  Those rings are PERSISTENT
+            // GPU state, allocated once and read by pointer inside a graph, and the relay moves per-token state only.
+            // So A RING LIVES ON THE CARD OF THE STAGE THAT RUNS ITS WRITER, and the constraint is on the READERS:
+            //
+            //     every m >= K with ratio[m] > 0 must have kv_src(m) >= K AND idx_src(m) >= K
+            //     (and cand_layer >= K for any layer above K that ranks inside its blocks).
+            //
+            // The stage-0 side is free, because kv_src(m) <= m < K always.  The two predicates are monotone, so they
+            // bite at the boundary layer itself: a valid boundary is a layer that is BOTH a kv and an index source -
+            // for this model {2, 8, 14, 20}.  THAT SET IS NOT A FLOOR, and it contains the even split at 20: stage 1 =
+            // [20,40) holds the writer of ring 20 and every reader of it (20..39), the writers and readers of index rings
+            // 24/28/32/36, and the candidate writer 20 with all of its readers.  An earlier revision demanded the
+            // opposite direction ("above the last shared-cache layer + 1" = 37) and that boundary aborts at graph build:
+            // the tail [37,40) reads layer 20's compressed KV and layer 36's index keys, both written below it.
             std::vector<int64_t> ends(a.split.end);
             ends.pop_back();   // the last stage ends the model; that boundary is not a boundary
-            // An EVEN split (--layer-split unset) is a reasonable thing to type and, on this model, always wrong: the
-            // stages of a 40-layer model land at 13/26 for three cards and 20 for two, all below the floor.  The
-            // geometry's floor is knowable here, so the message offers the number that works.
+            // "(auto)" in every message below: an EVEN split is the natural thing to type, and on a model with a sparse
+            // valid set it usually names a layer that is not one.  Snapping DOWN turns 40 layers over 3 stages from
+            // 13/26 into 8/20 rather than refusing; a boundary with nowhere to snap is a refusal naming the set.
             const bool even_split = a.split.auto_split;
-            // THE MINIMUM BOUNDARY, from the geometry, before anything is allocated: this model's caches (compressed
-            // KV, index keys) are persistent state the per-token relay cannot move, so a stage boundary has to sit
-            // above every layer a later stage reads from - the model's LAST kv / index source.  The message names the
-            // number, because --layer-split is a layer count and the natural guess (the middle of the model) is wrong.
-            const int64_t min_e = Ds41Dense::split_min_boundary(G);
-            for (size_t i = 0; i < ends.size(); ++i) {
-                if (ends[i] < min_e) {
-                    std::fprintf(stderr, "ds41_generate: --layer-split %s: a boundary at layer %lld is below this "
-                                         "model's last shared-cache layer %lld; the next stage would read a compressed "
-                                         "KV / index cache the previous stage owns and the relay cannot move.  Split at "
-                                         "layer %lld or above%s\n",
-                                 even_split ? "(auto)" : a.split.layer_split.c_str(), (long long) ends[i],
-                                 (long long) (min_e - 1), (long long) min_e,
-                                 (min_e < n_layer ? ", e.g. --layer-split " + std::to_string(min_e) : "").c_str());
-                    return 2;
-                }
+            const char * planned = even_split ? "(auto)" : a.split.layer_split.c_str();
+            std::vector<int64_t> snapped;
+            std::string nerr;
+            if (!Ds41Dense::split_snap_to_valid(G, ends, snapped, nerr)) {
+                std::fprintf(stderr, "ds41_generate: --layer-split %s: %s\n", planned, nerr.c_str());
+                return 2;
+            }
+            if (snapped != ends) {
+                std::string moved;   // "13->8, 26->20"
+                for (size_t i = 0; i < ends.size(); ++i)
+                    if (ends[i] != snapped[i])
+                        moved += (moved.empty() ? "" : ", ") + std::to_string(ends[i]) + "->" + std::to_string(snapped[i]);
+                std::fprintf(stderr, "ds41_generate: --layer-split %s: %s - this model's valid boundaries are %s\n",
+                             planned, moved.c_str(), Ds41Dense::split_valid_set_text(G).c_str());
+                ends = snapped;
+                // THE STAGES FOLLOW THE SNAPPED PLAN: end[i] is where stage i stops, and the last stage still ends the
+                // model.  Everything below (ranges, devices, the plan lines, the relay's slab) reads these numbers.
+                for (size_t i = 0; i < ends.size(); ++i) a.split.end[i] = ends[i];
+                std::fprintf(stderr, "ds41_generate: %s\n", strata::gfx906::split_describe(a.split).c_str());
             }
             std::string berr;
-            if (!Ds41Dense::split_boundaries_ok(G, ends, berr)) {
-                std::fprintf(stderr, "ds41_generate: --layer-split %s: %s\n", a.split.layer_split.c_str(), berr.c_str());
+            if (!Ds41Dense::split_boundaries_ok(G, ends, berr)) {   // the snap's own predicate, said again
+                std::fprintf(stderr, "ds41_generate: --layer-split %s: %s\n", planned, berr.c_str());
                 return 2;
+            }
+            // THE ENGRAM RING IS FED BY STAGE 0 ALONE.  The rolling token ring the Engram hash reads is filled inside
+            // upload_inputs, which only the stage that runs begin() executes (begin / begin_batch refuse a later stage by
+            // design), so a stage that runs an Engram layer WITHOUT being the first would hash its own window against a
+            // ring it never fed and read rows it never fetched - quietly, because its i_eng columns hold whatever the last
+            // pass left there.  With --engram given, that makes the FIRST boundary have to sit above the model's last
+            // Engram layer; without it Engram is off and the constraint does not exist.  (This is a second, independent
+            // constraint, not part of the reader's rule: the ring is host state, not a device ring, and the geometry's valid
+            // set says nothing about it - {8, 14, 20} is cache-legal and this rule is what refuses it here.)
+            if (!a.engram.empty() && !G.engram_layers.empty() && !ends.empty()) {
+                int64_t last_eng = -1;
+                for (int64_t l : G.engram_layers) if (l > last_eng) last_eng = l;
+                if (ends[0] <= last_eng) {
+                    std::string ok;   // the valid boundaries that clear the Engram layers, for the message
+                    for (int64_t v : Ds41Dense::split_valid_boundaries(G))
+                        if (v > last_eng) ok += (ok.empty() ? "" : ", ") + std::to_string(v);
+                    std::fprintf(stderr, "ds41_generate: --layer-split %s: the first boundary %lld cuts between this "
+                                         "model's Engram layers (up to %lld) and their successors, and only stage 0 feeds "
+                                         "the token ring the Engram hash reads - the stage above it would read rows it "
+                                         "never fetched.  With --engram the first boundary must be above layer %lld, "
+                                         "which leaves %s of this model's valid boundaries (%s).  Drop --engram to split "
+                                         "anywhere else.\n",
+                                 planned, (long long) ends[0], (long long) last_eng, (long long) last_eng,
+                                 ok.empty() ? "no usable boundary" : ok.c_str(),
+                                 Ds41Dense::split_valid_set_text(G).c_str());
+                    return 2;
+                }
             }
             // THE CANDIDATE COLUMN (P5.3b).  Layer cand_layer writes the blocks the indexers ABOVE it rank inside, so a
             // boundary that separates the writer from a reader has to hand the column over: the payload carries it and
             // each consumer copies it into a column of its own, which works at any height and across cards (a column is
             // per-token state, so it hops stage by stage and no producer is stranded).  Whether this MODEL can ever be
-            // separated that way is Ds41Dense::cand_can_cross: a boundary sits at or above the cache floor, and this
-            // model's last indexer (36) is below its floor (37), so a legal split leaves producer and readers together
-            // and the payload stays at the two state columns.  A model with an indexer above the floor pays 8 KiB a
-            // token and the message below says so.  (relay_cand_from is the extra optimization for the producer's
-            // immediate successor on the same card: read its tensor, no copy at all.)
+            // separated that way is Ds41Dense::cand_can_cross: it asks whether any VALID boundary sits strictly above the
+            // producer and at or below a reader, and validity itself forbids that (a boundary that leaves a reader above
+            // it must sit at or below cand_layer).  Here the writer 20 IS the highest valid boundary, so every split this
+            // model accepts keeps producer and readers (24/28/32/36) in one stage and the payload stays at the two state
+            // columns.  A model whose cache lives outside the kv / index source lists is the one that pays 8 KiB a token,
+            // and the message below says so.  (relay_cand_from is the extra optimization for the producer's immediate
+            // successor on the same card: read its tensor, no copy at all.)
             if (Ds41Dense::cand_can_cross(G)) {
                 int own = 0;
                 for (int64_t e : ends) if ((int64_t) G.cand_layer >= e) ++own;   // the stage that RUNS cand_layer
