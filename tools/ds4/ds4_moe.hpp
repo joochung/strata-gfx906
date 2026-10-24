@@ -210,6 +210,11 @@ struct Ds4MoeConfig {
     double pf_b = 1.43;           ///< predicted prefetch budget, experts per layer
     bool dither = true;           ///< error-diffused rounding for both the PCIe share and the prefetch budget
     bool cpu_only = false;        ///< no CUDA at all: the pool computes every expert
+    /// P5.3 step 2: the CUDA device this tier's VRAM, streams and kernels live on.  The tier does not follow the
+    /// process' ambient device: the engine's ggml backends (and, from step 2 on, a staged run with stages on other
+    /// cards) set the ambient device with every call they make, so the tier names its own at every GPU entry and
+    /// restores what it found on the way out.  0 = the behavior of every run so far (the first enumerated device).
+    int device = 0;
     bool no_cache = false;        ///< GPU tier without a VRAM cache (every miss is CPU or PCIe)
     /// Uniform blobs (DS4): open the VRAM cache at the seed instead of at init, so prompt chunks (run_chunk) can use
     /// that VRAM first (build_arena_from_routes -> chunks -> release_chunk -> seed_from_routes).

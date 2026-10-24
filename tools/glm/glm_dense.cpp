@@ -1192,36 +1192,44 @@ bool GlmDense::build_stages(std::vector<std::unique_ptr<GlmDense>> & stage, cons
               std::to_string(n_layer) + " layers";
         return false;
     }
-    // A stage that shares our weights must not free them, and must not free the buffer they live in either; it also
-    // must not open the GGUF twice per stage for no reason, so its weight load is skipped outright.  Because it loads
-    // no weights it needs no backend of its own and runs on ours (one CUDA context per card - which is also the
-    // same-device rule the split check in glm_generate enforces).
+    // Weight rule, per stage: a stage that runs on OUR card borrows our tensors (no second load, no second copy -
+    // it needs no backend of its own and runs on ours); a stage that runs on ANOTHER card cannot borrow tensors that
+    // live in the first card's memory, so it loads its own range onto its own backend.  That is cfg.backend saying
+    // so: glm_generate hands every stage the backend of the card it planned for it (device 0 = ours).
     for (size_t s = 0; s < stage.size(); ++s) {
         if (!stage[s]) stage[s] = std::make_unique<GlmDense>();   // a caller may pass the vector holding nothing
         GlmDenseConfig sc = cfg[s];
-        sc.share_weights = true;   // init(): geometry, checks and graphs - but no weight tensors of its own
-        sc.backend = im.backend;   // the owner's backend; the stage neither creates nor frees one
-        // Adopt BEFORE init: init ends by building graphs (ensure_n(1) and this stage's predict graphs), and a
-        // graph build looks weights up by name.  Witness #3 (logs/p5.3-run3-20261024-081532.log) saw the stage's
-        // first eager lookup - blk.3.hc_attn_fn.weight, the model's first hyper-connection tensor - hit the still-
-        // empty map and abort loudly, exactly as init's share_weights comment forecasts.  Borrowing the map up
-        // front is safe under the same invariant as the borrow after it: w_owner is set first, so the stage's
-        // destructor frees nothing it borrowed, and init with share_weights never touches w itself.
-        stage[s]->p_->adopt_weights(&im);
+        const bool same_be = !sc.backend || sc.backend == im.backend;
+        if (same_be) {
+            sc.share_weights = true;   // init(): geometry, checks and graphs - but no weight tensors of its own
+            sc.backend = im.backend;   // the owner's backend; the stage neither creates nor frees one
+            // Adopt BEFORE init: init ends by building graphs (ensure_n(1) and this stage's predict graphs), and a
+            // graph build looks weights up by name.  Witness #3 (logs/p5.3-run3-20261024-081532.log) saw the stage's
+            // first eager lookup - blk.3.hc_attn_fn.weight, the model's first hyper-connection tensor - hit the still-
+            // empty map and abort loudly, exactly as init's share_weights comment forecasts.  Borrowing the map up
+            // front is safe under the same invariant as the borrow after it: w_owner is set first, so the stage's
+            // destructor frees nothing it borrowed, and init with share_weights never touches w itself.
+            stage[s]->p_->adopt_weights(&im);
+        }
+        // else: an other-card stage.  share_weights stays false, so init loads the stage's own range (its dense
+        // weights, its embeddings if is_first, its head if is_last) onto the backend the caller set; the stage's
+        // destructor frees exactly what it loaded (w_owner stays null).
         if (!stage[s]->init(im.model_path, sc, err)) {
             err = "build_stages: stage " + std::to_string(s) + ": " + err;
             return false;
         }
         Impl & st = *stage[s]->p_;
         // the GGUF the stage opened is the same model, so its geometry must match: sharing tensors into graphs of
-        // another shape would be a silent corruption, so it is checked rather than assumed
+        // another shape - or computing a relay between shapes - would be a silent corruption, so it is checked
         if (st.g.n_layer != im.g.n_layer || st.g.n_embd != im.g.n_embd || st.g.hc != im.g.hc) {
             err = "build_stages: stage " + std::to_string(s) + "'s geometry does not match the model this instance loaded";
             return false;
         }
-        // idempotent re-adopt: the map cannot have changed while init ran on one thread, but the geometry check
-        // above is only worth its cost if the borrow is stated at both ends of it
-        st.adopt_weights(&im);
+        if (same_be) {
+            // idempotent re-adopt: the map cannot have changed while init ran on one thread, but the geometry check
+            // above is only worth its cost if the borrow is stated at both ends of it
+            st.adopt_weights(&im);
+        }
     }
     return true;
 }

@@ -233,10 +233,11 @@ int sample_p(const float * logits, int n_vocab, float temp, int top_k, float top
 // relay_stage_pass, the seams GlmDense::relay_read_out / relay_write_in).  Without --gpus none of
 // this is allocated: the single dense instance runs every layer, exactly as in the last release.
 //
-// Step 1's scope, stated plainly: this runs the layers in stages with a real relay, and it REFUSES unless every stage
-// is on one device (--gpus 0,0).  The bit-exact hand-off check is what that combination is for; placing stages on
-// different cards is step 2, and until then a split of distinct devices is refused with a clear message rather than
-// computing on the wrong card.
+// Two staged-run shapes (P5.3): stages on ONE device (--gpus 0,0) are the bit-exact hand-off check step 1 was built
+// for; stages on DISTINCT devices (--gpus 0,1, ...) are step 2: each stage on a card other than the owner's loads
+// its OWN weights (tensors do not live on two cards), every stage talks to the next through the same host-pinned
+// relay, and the expert tier stays on its one card - it is host-in/host-out at this engine's seam, so it does not
+// care which cards the layers ran on between its calls.
 struct StagedRun {
     // GlmDense is pimpl'd and non-copyable, so the stages are held as unique_ptrs in a vector of POINTERS: a
     // std::vector<GlmDense> would need a move constructor that GlmDense deliberately does not have.
@@ -246,6 +247,7 @@ struct StagedRun {
     size_t slab = 0;                            // relay_slab_bytes(): the same on every stage
     int cap = 0;                                // tokens per staged pass (min of --relay-chunk and the model's max)
     std::vector<int64_t> lb, le;                // the stage ranges, from the split plan
+    std::vector<int> dev;                       // the card each stage runs on (a.split.dev, from --gpus/--split-device)
     std::string err;
     // what the relay cost, so a staged run can be compared against the same run unsplit
     double ms_relay = 0;
@@ -258,6 +260,27 @@ static std::string same_device_example(int n_stage) {
     std::string r;
     for (int i = 0; i < n_stage; ++i) r += (i ? ",0" : "0");
     return r;
+}
+
+/// GPU devices the ggml build sees, counted in the SAME order --gpus indexes: the owner's dense backend is
+/// init_by_type(GPU), which takes the first GPU of this enumeration, so index 0 here is index 0 there.
+static size_t gpu_backend_count() {
+    size_t n = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i)
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) ++n;
+    return n;
+}
+
+/// A backend on the idx-th GPU device - a SECOND card, since the owner already holds the first.  The run owns the
+/// returned backend and must keep it alive past every stage that runs on it (this tool frees it with the process).
+static ggml_backend_t gpu_backend_at(int idx) {
+    int seen = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        if (seen++ == idx) return ggml_backend_dev_init(d, nullptr);
+    }
+    return nullptr;
 }
 
 // One staged pass of n tokens at positions [pos0, pos0+n): every stage runs its own layers over the same tokens, and at
@@ -412,16 +435,20 @@ int main(int argc, char ** argv) {
         }
         std::fprintf(stderr, "glm_generate: %s\n", strata::gfx906::split_describe(a.split).c_str());
         if (a.split.n_stage > 1 && !a.split.same_device) {
-            // P5.3 step 1 runs the layers in STAGES with a real activation relay, but only where the relay is a host
-            // round trip between two stages on the SAME device (--gpus 0,0): the bit-exact hand-off check.  Stages on
-            // DIFFERENT cards need per-stage weight and KV placement (design 1 and 4 of
-            // docs/gfx906/P5-MULTI-GPU-DESIGN.md), which step 2 lands; until then a split of distinct devices is
-            // refused loudly rather than computing the later layers on a card that does not hold their weights.
-            std::fprintf(stderr, "glm_generate: a %d-stage split across DIFFERENT devices (%s) is not what this build "
-                                 "runs yet: stage placement per device is step 2. Same-device stages (--gpus %s) run "
-                                 "the relayed staged path and are the bit-exact hand-off check.\n",
-                         a.split.n_stage, a.split.gpus.c_str(), same_device_example(a.split.n_stage).c_str());
-            return 2;
+            // P5.3 step 2: stages on different cards run.  What that needs, checked here rather than deep in an
+            // allocation: a CUDA build (the CPU backend has one "device"), and every named device below the GPU
+            // count - ggml would otherwise hand back no backend and the stage would init against NULL.
+            const size_t ngpu = gpu_backend_count();
+            bool ok = a.backend == "cuda";
+            for (int s = 0; ok && s < a.split.n_stage; ++s)
+                ok = a.split.dev[(size_t) s] >= 0 && (size_t) a.split.dev[(size_t) s] < ngpu;
+            if (!ok) {
+                std::fprintf(stderr, "glm_generate: a %d-stage split across devices (%s) needs --backend cuda and every "
+                                     "named device below this build's GPU count (%zu).  Same-device stages (--gpus %s) "
+                                     "run the relayed staged path and are the bit-exact hand-off check.\n",
+                             a.split.n_stage, a.split.gpus.c_str(), ngpu, same_device_example(a.split.n_stage).c_str());
+                return 2;
+            }
         }
         if (a.split.n_stage > 1) {   // the staged run: its stage ranges (the pass cap was set before dense.init)
             staged = true;
@@ -429,10 +456,13 @@ int main(int argc, char ** argv) {
             for (int s = 0; s < a.split.n_stage; ++s) {
                 sr.lb.push_back(a.split.begin(s));
                 sr.le.push_back(a.split.end[(size_t) s]);
+                sr.dev.push_back(a.split.dev[(size_t) s]);
                 sr.stage.push_back(std::make_unique<GlmDense>());
             }
-            std::fprintf(stderr, "relay: staged run, %d stage(s) on one device, pass cap %d tokens (--relay-chunk)\n",
-                         a.split.n_stage, relay_pass_cap);
+            std::string devs;
+            for (size_t s = 0; s < sr.dev.size(); ++s) devs += (s ? "," : "") + std::to_string(sr.dev[s]);
+            std::fprintf(stderr, "relay: staged run, %d stage(s) on device(s) %s, pass cap %d tokens (--relay-chunk)\n",
+                         a.split.n_stage, devs.c_str(), relay_pass_cap);
         }
     }
     // --lora-exps: the adapter's routed-expert (ffn_gate/up/down_exps) deltas, flattened per layer for the tier.
@@ -705,12 +735,28 @@ int main(int argc, char ** argv) {
     if (staged) {
         sr.slab = dense.relay_slab_bytes();
         sr.cfg.resize(sr.stage.size());
+        // One backend per card the run uses.  Device 0 is the owner's (`be`, the first GPU); a stage on another card
+        // gets a backend of its own, and build_stages then loads that stage's weights there instead of adopting -
+        // tensors cannot be shared across cards.  The vector keeps those backends alive for the whole run.
+        std::vector<std::pair<int, ggml_backend_t>> other_be;
+        auto be_for = [&](int dev) -> ggml_backend_t {
+            if (dev == 0) return be;
+            for (auto & p : other_be) if (p.first == dev) return p.second;
+            ggml_backend_t nb = gpu_backend_at(dev);
+            if (nb) other_be.push_back({dev, nb});
+            return nb;
+        };
         for (size_t s = 0; s < sr.stage.size(); ++s) {
             GlmDenseConfig sc = dc;
             sc.lb = sr.lb[s];
             sc.le = sr.le[s];
             sc.is_first = (s == 0);
             sc.is_last = (s + 1 == sr.stage.size());
+            sc.backend = be_for(sr.dev[s]);
+            if (!sc.backend) {
+                std::fprintf(stderr, "glm_generate: stage %zu: cannot open a backend on device %d\n", s, sr.dev[s]);
+                return 2;
+            }
             sr.cfg[s] = sc;
         }
         if (a.relay_copy_weights) {   // the measured alternative: one weight set per stage (more memory than the model)
@@ -748,8 +794,8 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "relay: token slab %zu bytes, %d-token passes, %lld bytes staged (%s)\n", sr.slab, sr.cap,
                      (long long) sr.st.plan.bytes, sr.st.note.c_str());
         for (size_t s = 0; s < sr.stage.size(); ++s)
-            std::fprintf(stderr, "relay:   stage %zu: layers [%lld,%lld)  head %s  weights %s\n",
-                         s, (long long) sr.lb[s], (long long) sr.le[s],
+            std::fprintf(stderr, "relay:   stage %zu: device %d, layers [%lld,%lld)  head %s  weights %s\n",
+                         s, sr.dev[s], (long long) sr.lb[s], (long long) sr.le[s],
                          sr.stage[s]->is_last_stage() ? "here" : "not here",
                          sr.stage[s]->weights_shared() ? "shared" : "own copy");
     }

@@ -137,6 +137,18 @@ struct Arena {
     }
 };
 
+/// The tier's device, named on entry and restored on exit.  Why this exists: every ggml call sets the process'
+/// ambient CUDA device to the device of the backend it runs on, and a P5.3 staged run runs layers on OTHER cards
+/// between tier calls - so a raw cuda* call here must never rely on whatever was set last.  Cheap (one thread-local
+/// read plus a set only when they differ), and the restore keeps the engine's own ggml sequencing untouched.
+struct TierDev {
+    int prev = -1;
+    explicit TierDev(int d) { if (cudaGetDevice(&prev) == cudaSuccess && prev != d) cudaSetDevice(d); }
+    TierDev(const TierDev &) = delete;
+    TierDev & operator=(const TierDev &) = delete;
+    ~TierDev() { if (prev >= 0) cudaSetDevice(prev); }
+};
+
 /// All the device state, so the CPU-only flavour has none of it to leak.
 struct Gpu {
     Arena arena;
@@ -144,6 +156,7 @@ struct Gpu {
     strata::kernels::NativeExpertLayout gl;
     std::vector<strata::kernels::NativeExpertLayout> gll;   ///< per model layer (all == gl for a uniform geometry)
     cudaStream_t s = nullptr;
+    int dev = 0;   ///< the cfg.device this tier was inited on; every entry names it (TierDev) - step 2
     void *d_x = nullptr, *d_xq = nullptr, *d_parts = nullptr, *d_grp_ptr = nullptr, *d_grp_start = nullptr,
          *d_ngroups = nullptr, *d_ent_dst = nullptr, *d_ent_tok = nullptr, *d_scratch = nullptr, *d_stage = nullptr;
     cudaEvent_t ev[4] = {};
@@ -766,6 +779,13 @@ bool Ds4MoeTier::init(const Ds4MoeGeom& geom, Ds4BlobSource* blobs, const Ds4Moe
     return false;
 #else
     Gpu& gp = *(im_->gpu = std::unique_ptr<Gpu>(new Gpu()));
+    // the tier's device is its own from here on: name it BEFORE the first allocation, and say so loudly when the
+    // machine cannot (a cfg.device past the device count is the caller's mistake, not the tier's)
+    gp.dev = cfg.device;
+    if (cudaSetDevice(cfg.device) != cudaSuccess) {
+        err = "tier device " + std::to_string(cfg.device) + ": cudaSetDevice failed - this machine has fewer devices";
+        return false;
+    }
     gp.arena.blob = im_->blob;
     gp.arena.n_layers = geom.n_layers;
     gp.arena.n_experts = geom.n_experts;
@@ -1041,6 +1061,9 @@ std::vector<std::pair<int32_t, int32_t>> drop_excluded(const Ds4MoeImpl& im, con
 
 bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_all, std::string& err) {
     if (im_->cfg.cpu_only) return true;   // a CPU-only tier has neither a cache nor an arena to seed
+#if defined(DS4_MOE_CUDA)
+    const TierDev td(im_->gpu ? im_->gpu->dev : 0);   // step 2: the slot fills below are H2D on the tier's device
+#endif
     const std::vector<std::pair<int32_t, int32_t>> ranked = drop_excluded(*im_, ranked_all);
     if (!build_arena(arena_order(*im_, ranked), err)) return false;
 #if !defined(DS4_MOE_CUDA)
@@ -1141,6 +1164,7 @@ bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
         const int nth = (int) std::min<size_t>(8, fjobs.size());
         for (int k = 0; k < nth; ++k)
             th.emplace_back([&]() {
+                const TierDev td(im_->gpu ? im_->gpu->dev : 0);   // step 2: fresh thread -> name the tier's device before the pinned allocs and stream 0 below
                 uint8_t* buf = nullptr;
                 if (cudaMallocHost((void**) &buf, (size_t) im_->blob) != cudaSuccess) {
                     bad = true;
@@ -1195,6 +1219,7 @@ bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
 void Ds4MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
     im_->pf_n = 0;
 #if defined(DS4_MOE_CUDA)
+    const TierDev td(im_->gpu ? im_->gpu->dev : 0);   // step 2: named entry, like every other GPU seam here
     if (!im_->gpu || im_->cfg.cpu_only || im_->cfg.pf_b <= 0 || im_->cfg.no_cache || !im_->gpu->cache) return;
     if (!top16 || n <= 0 || !im_->g.routed(layer)) return;
     Gpu& gp = *im_->gpu;
@@ -1295,6 +1320,7 @@ const char* const g_prof_name[9] = {"split", "activation", "gpu launch", "cpu po
                                     "sum", "admission", "pcie budget"};
 bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x_host,
              const void* x_dev, float* out) {
+    const TierDev td(im.gpu->dev);   // step 2: the tier names its device on every entry (see TierDev)
     static const bool prof = std::getenv("DS4_TIER_PROF") != nullptr;
     double tp = prof ? now_ms() : 0;
     auto mark = [&](int i) { if (prof) { const double t = now_ms(); g_prof[i] += t - tp; tp = t; } };
@@ -1824,6 +1850,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
 /// in order, exactly as gpu_run does for one token.
 bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const float* w, const float* x_host,
                float* out) {
+    const TierDev td(im.gpu->dev);   // step 2: named entry
     Gpu& gp = *im.gpu;
     const int64_t H = im.g.n_embd;
     const int64_t K = im.g.top_k;
@@ -2068,6 +2095,7 @@ void chunk_prestage(Ds4MoeImpl& im, int64_t layer, int h) {
 
 bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* w, const float* x_host,
                    float* out, void* out_dev = nullptr) {
+    const TierDev td(im.gpu->dev);   // step 2: named entry (chunk_prestage runs inside this scope)
     Gpu& gp = *im.gpu;
     const bool prof = chunk_prof();
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> kev;   // prof: one pair per grouped launch
@@ -2457,6 +2485,7 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         const int nth = (int) std::min<size_t>(8, w1 - w0);
         for (int k = 0; k < nth; ++k)
             readers.emplace_back([&, w1]() {
+                const TierDev td(gp.dev);   // step 2: a fresh thread starts on device 0; the waits and DMAs below are the tier's device's
                 for (size_t q; (q = rnext.fetch_add(1)) < w1;) {
                     im.blobs->read(layer, order[2][q], slot_ptr(q));
                     ready[q].store(1, std::memory_order_release);
@@ -2665,6 +2694,7 @@ void Ds4MoeTier::release_chunk() {
         g_cprof = ChunkProf{};
     }
     Gpu& gp = *im_->gpu;
+    const TierDev td(gp.dev);   // step 2: named entry
     if (gp.s) cudaStreamSynchronize(gp.s);
     if (gp.s_cp) cudaStreamSynchronize(gp.s_cp);
     for (void* p : {gp.c_x, gp.c_xq, gp.c_parts, gp.c_scratch, gp.c_ptr, gp.c_start, gp.c_ng, gp.c_dst, gp.c_tokv,
@@ -2702,6 +2732,7 @@ void Ds4MoeTier::profiler(bool on) {
 
 int64_t Ds4MoeTier::shrink_cache(std::string& err) {
 #if defined(DS4_MOE_CUDA)
+    const TierDev td(im_->gpu ? im_->gpu->dev : 0);   // step 2: cudaDeviceSynchronize and the cache act on the AMBIENT device without this
     if (!im_->gpu || !im_->gpu->cache || !im_->gpu->cache->segmented() || im_->seed_ranked.empty()) return 0;
     strata::core::ExpertCache& c = *im_->gpu->cache;
     const int64_t keep = c.slots_within((int64_t) (im_->cfg.slot_gib * 1073741824.0));
@@ -2719,6 +2750,7 @@ int64_t Ds4MoeTier::shrink_cache(std::string& err) {
 
 int64_t Ds4MoeTier::grow_cache(double keep_free_gib, std::string& err) {
 #if defined(DS4_MOE_CUDA)
+    const TierDev td(im_->gpu ? im_->gpu->dev : 0);   // step 2: cudaMemGetInfo below reads the AMBIENT device's free VRAM
     if (!im_->gpu || !im_->gpu->cache || !im_->gpu->cache->segmented() || im_->seed_ranked.empty()) return 0;
     strata::core::ExpertCache& c = *im_->gpu->cache;
     size_t fr = 0, tot = 0;
@@ -2825,6 +2857,9 @@ void Ds4MoeTier::close() {
     }
 #endif
     if (!im_) return;
+#if defined(DS4_MOE_CUDA)
+    const TierDev td_close(im_->gpu ? im_->gpu->dev : 0);   // step 2: the frees in gpu->close() belong to the tier's device
+#endif
     if (im_->gpu) im_->gpu->close();
     im_->gpu.reset();
     im_->pool.reset();
