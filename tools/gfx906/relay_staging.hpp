@@ -34,6 +34,24 @@ namespace gfx906 {
 /// Slots per boundary: the native prefill relay's two double-buffered hand-off buffers (prefill.cpp:1121).
 constexpr int kRelaySlots = 2;
 
+/// Which x_state column the stage that PRODUCES across `boundary` wrote, and which column the stage that CONSUMES
+/// across it reads.  With no split (n_stage 1) the answer is the unsplit layout: the model's last column, n_layer.
+/// The two are the same column - the producer's last layer's finish output - and the engine checks that they agree
+/// before it copies anything (a split that does not tile the layers contiguously would otherwise read a column
+/// nobody wrote).  The column index times the row stride (D * hc * 4 bytes) is the offset inside a token's slab.
+inline bool relay_boundary_columns(int n_stage, int64_t n_layer, int boundary, int64_t & written_by_producer,
+                                   int64_t & read_by_consumer) {
+    if (n_stage < 2 || boundary < 0 || boundary >= n_stage - 1) return false;
+    if (n_layer < n_stage) return false;   // more stages than layers: a stage would own no layer
+    // Stages are contiguous and cover the model; the k-th stage gets floor/ceil of n_layer/n_stage in order, which
+    // is what device_split's split_plan hands out when the caller does not pass explicit cut points.
+    const int64_t base = n_layer / n_stage, rem = n_layer % n_stage;
+    int64_t lb = 0, le = 0;
+    for (int s = 0; s <= boundary; ++s) { lb = le; le = lb + base + (s < rem ? 1 : 0); }
+    written_by_producer = read_by_consumer = le;   // the producer's last finish output; the successor's input column
+    return true;
+}
+
 /// One byte range of a staging slot: the [a,b) token window of one pass, at its offset in the buffer.
 struct RelayCopy {
     uint64_t src_offset = 0;   ///< the byte offset in the token-major payload the pass already holds

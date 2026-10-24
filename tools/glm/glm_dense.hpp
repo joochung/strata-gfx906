@@ -69,6 +69,15 @@ struct GlmDenseConfig {
     /// type at load (-1 = keep).  Maya-S-v2 -> Q4_K = Maya-S24's layout (its card: +14% decode on a 24 GB card,
     /// 97.7% vs 97.9% of FP8): ~1.9 GB less dense read per token and ~1.9 GB more VRAM for expert slots.
     int dense_requant = -1;
+    /// P5.3 step 1 (opt-in): this instance owns the layer range [lb, le) and nothing else.  Defaults: the whole
+    /// model, which is exactly the single-stage construction of the last release, byte for byte.  With a range that
+    /// does not start at 0 the token embeddings are not needed and are not looked up; with one that does not end at
+    /// n_layer the LM head and output_norm are not loaded, so no stage but the last holds them.  Per-layer state
+    /// (KDA S + conv, the MLA latent cache, the indexer pools) is allocated for this range's layers only, and the
+    /// layer graphs are built over this stage's columns of x_state - the relay of tools/gfx906/relay_staging.hpp
+    /// hands off at the stage's end, so a column this stage does not own is never written by it.
+    int64_t lb = 0, le = 0;   ///< le 0 = n_layer (filled in from the GGUF when not given)
+    bool is_first = true, is_last = true;
 };
 
 class GlmDense {
@@ -81,6 +90,19 @@ public:
     GlmDense & operator=(const GlmDense &) = delete;
 
     bool init(const std::string & model_path, const GlmDenseConfig & cfg, std::string & err);
+
+    /// P5.3 step 1: the stage this instance runs (cfg.lb/cfg.le, or the whole model for the default config), and
+    /// whether it is the one that owns the LM head.  With no range given these answer like a single-stage engine.
+    /// x_state's row stride is the same n_layer+1 columns on every stage, so these byte offsets are comparable
+    /// between stages and match the staging of tools/gfx906/relay_staging.hpp token for token.
+    int64_t stage_begin() const;
+    int64_t stage_end() const;
+    int64_t stage_layers() const;   ///< the layers THIS stage owns (the full model's count when unsplit)
+    int64_t n_layer_total() const;  ///< the model's layer count, whatever the stage
+    bool is_last_stage() const;
+    /// The byte offset in an x_state token slab where this stage reads its input column (0 on stage 0; one column
+    /// past the columns its predecessor ran on a later stage, where the relay puts the state it handed over).
+    size_t state_col0() const;
 
     const GlmGeometry & geom() const;
     int64_t n_layer() const;
@@ -100,12 +122,21 @@ public:
     bool predict(int il, int * top_ids, int n_top);
     /// n_expert_used ids/weights per token (token-major); *ffn_norm_host = n * n_embd floats (token-major).  On a dense
     /// layer (il < n_dense_lead) no ids are written and the caller passes a zero routed sum to finish_layer_n.
+    /// `il` is a GLOBAL layer index: on a stage whose range does not contain it, this fails.
     bool attn_router_n(int il, int pos0, int n, int * routed_ids, float * routed_w, const float ** ffn_norm_host);
     bool finish_layer_n(int il, int n, const float * routed_sum);
     bool logits_n(int n, const float ** out, int * n_vocab);
     /// Logits of rows [r0, r0+nr) of the last pass (nr <= 16) into out[nr * vocab]; works for any pass size (prompt
     /// chunks: their head is never built for all n rows - 2048 x 154880 floats would not fit).
     bool logits_rows(int r0, int nr, float * out);
+    /// P5.3 step 1: run the LAST STAGE's head over rows [r0, r0+nr) of a token slab that is not in this instance's
+    /// x_state - the relay's payload, nr * relay_slab_bytes() bytes, the layout the staging carries.  The stage
+    /// uploads the slab into its own state tensor, runs the same head graph logits_rows runs, and writes the logits.
+    /// Fails on a stage that is not the last one (it holds no output.weight).
+    bool logits_relay(int r0, int nr, const float * x_host, float * out);
+    /// The bytes per token of the relay payload: x_state's row stride = (n_layer + 1) * hc * n_embd * sizeof(float).
+    /// The same number on every stage of a split run, which is what makes a boundary a single whole-slab copy.
+    size_t relay_slab_bytes() const;
     /// Selection-only bias per expert of layer il (cache-aware routing); zeros = the model's routing.
     void set_route_bias(int il, const float * bias);
     /// Forget every position (KDA state, conv state, MLA cache rows are simply overwritten from position 0 on).

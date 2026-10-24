@@ -17,6 +17,7 @@ using strata::gfx906::kRelaySlots;
 using strata::gfx906::RelayCopy;
 using strata::gfx906::RelayPlan;
 using strata::gfx906::RelaySlot;
+using strata::gfx906::relay_boundary_columns;
 using strata::gfx906::relay_plan;
 
 extern int g_checks;   // the shared counters of the single gate binary (test_device_split.cpp defines them)
@@ -242,9 +243,40 @@ static void test_slot_rotation() {
     CHECK_EQ(t.acquire(0, a), true);
 }
 
+// Which column of the slab each side of a boundary uses.  The producer's last layer's finish output is the column the
+// successor's first layer reads: if the two ever disagree, the relay ships a column nobody wrote.
+static void test_boundary_columns() {
+    int64_t w = -1, r = -1;
+    // no split: the model's last column, and both sides agree
+    CHECK_EQ(relay_boundary_columns(1, 45, 0, w, r), false);   // a one-stage run has no boundary
+    CHECK_EQ(relay_boundary_columns(2, 45, 0, w, r), true);
+    CHECK_EQ(w, 23); CHECK_EQ(r, 23);   // 45/2 = 22 with remainder 1: stage 0 gets 23 layers, ends at column 23
+    // 3 stages of 45 layers: 15/15/15 -> boundaries at columns 15 and 30
+    CHECK_EQ(relay_boundary_columns(3, 45, 0, w, r), true);
+    CHECK_EQ(w, 15); CHECK_EQ(r, 15);
+    CHECK_EQ(relay_boundary_columns(3, 45, 1, w, r), true);
+    CHECK_EQ(w, 30); CHECK_EQ(r, 30);
+    // 4 stages of 45 layers: 12/11/11/11 -> 12, 23, 34
+    int64_t cols[3] = { 0, 0, 0 };
+    for (int b = 0; b < 3; ++b) { CHECK_EQ(relay_boundary_columns(4, 45, b, w, r), true); cols[b] = w; }
+    CHECK_EQ(cols[0], 12); CHECK_EQ(cols[1], 23); CHECK_EQ(cols[2], 34);
+    // the last boundary's column is the last layer index of every stage but the last, never the model's n_layer
+    CHECK_EQ(relay_boundary_columns(2, 45, 1, w, r), false);
+    CHECK_EQ(relay_boundary_columns(2, 1, 0, w, r), false);   // more stages than layers
+    CHECK_EQ(relay_boundary_columns(0, 45, 0, w, r), false);
+    // an even split, and the GLM decode size the engine will actually use (45 layers, 2 stages)
+    CHECK_EQ(relay_boundary_columns(2, 44, 0, w, r), true);
+    CHECK_EQ(w, 22); CHECK_EQ(r, 22);
+    // column * row stride is the offset in a token's slab: the largest column is the slab's last one, so a whole-slab
+    // copy of relay_slab_bytes() bytes always contains the column both sides use
+    CHECK_EQ(relay_boundary_columns(5, 45, 3, w, r), true);   // 5 stages: the last boundary is index 3
+    CHECK(w < 45);
+}
+
 int test_relay_staging_run() {
     test_buffer_size();
     test_copy_window();
     test_slot_rotation();
+    test_boundary_columns();
     return 0;
 }

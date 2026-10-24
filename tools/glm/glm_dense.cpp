@@ -152,15 +152,29 @@ bool ends_with(const std::string & s, const char * suf) {
 }
 
 // Not loaded: the routed experts (the tier's), the MTP block.  Off-CPU also token_embd (looked
-// up on the host).
-bool skip_weight(const std::string & n, bool cpu, bool skip_experts, int64_t n_layer) {
+// up on the host).  P5.3 step 1 adds the stage range: on a split run a stage takes the decoder blocks it owns and,
+// when it is not the last one, nothing of the head (output.weight / output_norm.weight), which no earlier stage uses.
+bool skip_weight(const std::string & n, bool cpu, bool skip_experts, int64_t n_layer, int64_t lb = 0, int64_t le = 0,
+                 bool last_stage = true) {
     if (skip_experts && ends_with(n, "_exps.weight")) return true;
-    if (n.rfind("blk.", 0) == 0 && std::atoll(n.c_str() + 4) >= n_layer) return true;
+    if (n.rfind("blk.", 0) == 0) {
+        const int64_t il = std::atoll(n.c_str() + 4);
+        if (il >= n_layer) return true;                              // the MTP block(s) beyond the decoder (as before)
+        // `le` is the caller's weight bound = the range it runs plus the one block its last layer reads ahead into
+        // (see weight_end); a stage loads its own blocks and that one, and nothing of another stage's.
+        if (le > 0 && (il < lb || il >= le)) return true;
+    }
+    if (!last_stage && (n == "output.weight" || n == "output_norm.weight")) return true;
     return !cpu && n == "token_embd.weight";
 }
 
+// The last layer of a stage's range reads the hc_* / ffn_norm weights of the layer AFTER it (build_finish's fused
+// predict at glm_dense.cpp:710 reads BL(il+1, ...)), so the range a stage LOADS extends one block past the range it
+// RUNS, unless that range already ends the model.  weight_end is where its block loading stops.
+static int64_t weight_end(int64_t n_layer, int64_t le) { return le >= n_layer ? n_layer : le + 1; }
+
 bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, bool skip_experts, int64_t n_layer,
-                  std::string & err, int dense_requant = -1) {
+                  std::string & err, int dense_requant = -1, int64_t lb = 0, int64_t le = 0, bool last_stage = true) {
     ggml_init_params ip = { /*mem_size*/ 256ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
     w.ctx = ggml_init(ip);
     if (!w.ctx) { err = "ggml_init(weights) failed"; return false; }
@@ -176,7 +190,7 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
             if (!buf) { err = "cannot wrap " + sh.path(); return false; }
             w.bufs.push_back(buf);
             for (const auto & ti : tensors) {
-                if (skip_weight(ti.name, true, skip_experts, n_layer)) continue;
+                if (skip_weight(ti.name, true, skip_experts, n_layer, lb, le, last_stage)) continue;
                 if (!model.in_bounds(ti, s)) { err = ti.name + " out of bounds"; return false; }
                 int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
                 for (size_t d = 0; d < ti.shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) ti.shape[d];
@@ -195,7 +209,7 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
     // CUDA, whose kernels land in VRAM after the expert cache was sized - tools/ds4/ds4_dense.cpp)
     for (size_t s = 0; s < model.size(); ++s)
         for (const auto & ti : model.shard(s).tensors()) {
-            if (skip_weight(ti.name, false, skip_experts, n_layer)) continue;
+            if (skip_weight(ti.name, false, skip_experts, n_layer, lb, le, last_stage)) continue;
             if (!model.in_bounds(ti, s)) { err = ti.name + " out of bounds"; return false; }
             int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
             for (size_t d = 0; d < ti.shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) ti.shape[d];
@@ -212,7 +226,7 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
     w.bufs.push_back(buf);
     for (size_t s = 0; s < model.size(); ++s)
         for (const auto & ti : model.shard(s).tensors()) {
-            if (skip_weight(ti.name, false, skip_experts, n_layer)) continue;
+            if (skip_weight(ti.name, false, skip_experts, n_layer, lb, le, last_stage)) continue;
             ggml_tensor * t = w.t[ti.name];
             const uint8_t * src = model.shard(s).tensor_data(ti);
             if ((int) t->type == (int) ti.type) { ggml_backend_tensor_set(t, src, 0, ggml_nbytes(t)); continue; }
@@ -257,6 +271,10 @@ struct GlmDense::Impl {
     int64_t D = 0, HC = 0, NH = 0, SK = 0, DI = 0, DC = 0, KVL = 0, KM = 0, VM = 0;
     int64_t NEXP = 0, NUSED = 0, NT = 1, CAPMAX = 0;
     int64_t KP = 4, IDXD = 128, IDXH = 32, PCAP = 0, NNEW = 1, MCAP = 0;   // indexer; MCAP = rows of i_mask per token
+    // P5.3 step 1: the layer range this instance owns ([lb, le), le defaults to the model's n_layer) and the column
+    // of x_state its first layer reads.  Defaults = the whole model, column 0: a single-stage run is unchanged.
+    int64_t lb = 0, le = 0, col0 = 0;
+    bool is_first = true, is_last = true;
 
     ggml_context * sctx = nullptr;   // persistent state (sbuf)
     ggml_backend_buffer_t sbuf = nullptr;
@@ -508,7 +526,11 @@ static ggml_cgraph * build_attn(GlmDense::Impl & im, int il, int64_t cap, int64_
     B b { &im, gc, &im.g };
     const int64_t D = im.D, HC = im.HC, NH = im.NH;
 
-    ggml_tensor * xin = ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2], 0);
+    // The state this layer reads: x_state's column il, the expression of the last release (build_finish writes column
+    // il+1, so layer il reads what layer il-1's finish left; column 0 is the embedding).  x_state keeps every column
+    // on every stage, so this needs no stage adjustment - a later stage simply finds its column filled by the relay.
+    ggml_tensor * xin = ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2],
+                                     (size_t) il * im.x_state->nb[2]);
     ggml_tensor * post_a = nullptr, * comb_a = nullptr;
     ggml_tensor * cur = b.hc_pre(xin, b.BL(il, "hc_attn_fn.weight"), b.BL(il, "hc_attn_scale.weight"),
                                  b.BL(il, "hc_attn_base.weight"), &post_a, &comb_a);
@@ -683,14 +705,20 @@ static ggml_cgraph * build_finish(GlmDense::Impl & im, int il, int64_t n) {
     ggml_tensor * pf = ggml_view_2d(gc, L.post_f, HC, n, L.post_f->nb[1], 0);
     ggml_tensor * cf = ggml_view_3d(gc, L.comb_f, HC, HC, n, L.comb_f->nb[1], L.comb_f->nb[2], 0);
     ggml_tensor * lout = ggml_reshape_3d(gc, b.hc_post(ffo, hap, pf, cf), D, HC, n);
+    // Where this layer's output lands: x_state's column il+1, byte offset (il+1)*nb[2] - the expression of the last
+    // release, on every stage (x_state keeps all n_layer+1 columns, and a stage writes only its own layers' columns;
+    // the last layer of a stage's range writes the column the RELAY then hands to the next stage).
+    const size_t xoff = (size_t) (il + 1) * im.x_state->nb[2];
     ggml_build_forward_expand(gf, ggml_cpy(gc, lout, ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1],
-                                                                  im.x_state->nb[2], 0)));
+                                                                  im.x_state->nb[2], xoff)));
     if (im.gate_taps)
         ggml_build_forward_expand(gf, ggml_cpy(gc, lout, ggml_view_3d(gc, L.t_lout, D, HC, n, L.t_lout->nb[1],
                                                                       L.t_lout->nb[2], 0)));
     // fused predict (s28): the next routed layer's selection scores from this layer's output - build_predict's ops on
-    // the values x_state now receives (lout), so the scores are the same; GlmDense::predict(il+1) only reads them
-    if (n == 1 && im.pred_sel && il + 1 < (int) im.ly.size() && im.ly[(size_t) il + 1].routed) {
+    // the values x_state now receives (lout), so the scores are the same; GlmDense::predict(il+1) only reads them.
+    // A stage may only fuse the predict of a layer it RUNS (il+1 < le): the first layer of the next stage is that
+    // stage's own predict, which reads the relayed column instead.
+    if (n == 1 && im.pred_sel && il + 1 < im.le && im.ly[(size_t) il + 1].routed) {
         const int nl = il + 1;
         ggml_tensor * post = nullptr, * comb = nullptr;
         ggml_tensor * pre = b.hc_pre(lout, b.BL(nl, "hc_attn_fn.weight"), b.BL(nl, "hc_attn_scale.weight"),
@@ -706,13 +734,16 @@ static ggml_cgraph * build_finish(GlmDense::Impl & im, int il, int64_t n) {
     return gf;
 }
 
-// predict: the layer's router on rms_norm(hc_attn_pre) * ffn_norm.weight for token 0 (selection scores)
+// predict: the layer's router on rms_norm(hc_attn_pre) * ffn_norm.weight for token 0 (selection scores).
+// Layer `il` reads x_state's column il, which is where layer il-1's finish put the state (column 0 = the embedding);
+// that is the expression of the last release and it holds on a stage too, because x_state keeps every column.
 static ggml_cgraph * build_predict(GlmDense::Impl & im, int il) {
     GlmDense::Impl::Layer & L = im.ly[(size_t) il];
     ggml_context * gc = im.gctx;
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 256, false);
     B b { &im, gc, &im.g };
-    ggml_tensor * xin = ggml_view_3d(gc, im.x_state, im.D, im.HC, 1, im.x_state->nb[1], im.x_state->nb[2], 0);
+    ggml_tensor * xin = ggml_view_3d(gc, im.x_state, im.D, im.HC, 1, im.x_state->nb[1], im.x_state->nb[2],
+                                     (size_t) il * im.x_state->nb[2]);
     ggml_tensor * post = nullptr, * comb = nullptr;
     ggml_tensor * pre = b.hc_pre(xin, b.BL(il, "hc_attn_fn.weight"), b.BL(il, "hc_attn_scale.weight"),
                                  b.BL(il, "hc_attn_base.weight"), &post, &comb);
@@ -737,12 +768,13 @@ static ggml_cgraph * build_init(GlmDense::Impl & im, int64_t n) {
     return gf;
 }
 
-// head: mean of the hc streams -> output_norm -> output (glm5-next.cpp: build_hc_mean, no hc_head weights)
-static ggml_cgraph * build_head(GlmDense::Impl & im, int64_t n) {
+// head: mean of the hc streams -> output_norm -> output (glm5-next.cpp: build_hc_mean, no hc_head weights).  `x` is
+// the state it reads: x_state's LAST column (column n_layer unsplit - the expression of the last release - or a
+// stage's hand-off column), or the head staging tensor hx when the state arrived through the relay.
+static ggml_cgraph * build_head(GlmDense::Impl & im, int64_t n, ggml_tensor * x) {
     ggml_context * gc = im.gctx;
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     B b { &im, gc, &im.g };
-    ggml_tensor * x = ggml_view_3d(gc, im.x_state, im.D, im.HC, n, im.x_state->nb[1], im.x_state->nb[2], 0);
     ggml_tensor * acc = ggml_view_2d(gc, x, im.D, n, x->nb[2], 0);
     for (int64_t s = 1; s < im.HC; ++s) acc = ggml_add(gc, acc, ggml_view_2d(gc, x, im.D, n, x->nb[2], (size_t) s * x->nb[1]));
     acc = ggml_scale(gc, acc, 1.0f / (float) im.HC);
@@ -755,15 +787,24 @@ static ggml_cgraph * build_head(GlmDense::Impl & im, int64_t n) {
 
 bool GlmDense::Impl::ensure_n(int64_t n) {
     if (n < 1 || n > NT) { err = "pass size " + std::to_string(n) + " out of range 1.." + std::to_string(NT); return false; }
-    if (!gf_init[(size_t) n]) {
-        gf_init[(size_t) n] = build_init(*this, n);
-        allo_init[(size_t) n] = allo_for(n);
-        if (n <= kSmallN) {   // a prompt chunk reads its logits through logits_rows
-            gf_head[(size_t) n] = build_head(*this, n);
+    // The graphs of a pass size, built once.  On a split run only the first stage has token embeddings, so only it
+    // builds the embedding-init graph, and only the last stage has the head weights, so only it builds the head; the
+    // head reads the state from the relay payload instead of x_state (GlmDense::logits_relay).  A stage that builds
+    // neither leaves both slots NULL, which is what its engine loop expects of it.
+    const bool want_init = lb == 0, want_head = is_last && n <= kSmallN;
+    if (!gf_init[(size_t) n] && (!want_init || !gf_head[(size_t) n])) {
+        if (want_init) {
+            gf_init[(size_t) n] = build_init(*this, n);
+            allo_init[(size_t) n] = allo_for(n);
+        }
+        if (want_head && !gf_head[(size_t) n]) {   // a prompt chunk reads its logits through logits_rows
+            ggml_tensor * x = ggml_view_3d(gctx, x_state, D, HC, n, x_state->nb[1], x_state->nb[2],
+                                           (size_t) (x_state->ne[2] - 1) * x_state->nb[2]);
+            gf_head[(size_t) n] = build_head(*this, n, x);
             allo_head[(size_t) n] = new_allo();
         }
     }
-    for (int il = 0; il < (int) ly.size(); ++il)
+    for (int il = (int) lb; il < (int) le; ++il)   // only the layers this stage runs
         if (!ly[(size_t) il].gf_finish[(size_t) n]) build_finish(*this, il, n);
     return true;
 }
@@ -775,6 +816,13 @@ GlmDense::~GlmDense() = default;
 
 const GlmGeometry & GlmDense::geom() const { return p_->g; }
 int64_t GlmDense::n_layer() const { return p_->g.n_layer; }
+int64_t GlmDense::stage_begin() const { return p_->lb; }
+int64_t GlmDense::stage_end() const { return p_->le; }
+int64_t GlmDense::stage_layers() const { return p_->le - p_->lb; }
+int64_t GlmDense::n_layer_total() const { return p_->g.n_layer; }
+bool GlmDense::is_last_stage() const { return p_->is_last; }
+size_t GlmDense::state_col0() const { return (size_t) p_->col0 * (size_t) p_->x_state->nb[2]; }
+size_t GlmDense::relay_slab_bytes() const { return (size_t) p_->x_state->nb[2]; }
 int GlmDense::max_tokens() const { return (int) p_->NT; }
 ggml_backend_t GlmDense::backend() const { return p_->backend; }
 const std::string & GlmDense::last_error() const { return p_->err; }
@@ -797,8 +845,32 @@ bool GlmDense::init(const std::string & model_path, const GlmDenseConfig & cfg, 
     if (im.model->size() == 0) { err = "cannot open " + model_path; return false; }
     if (!(err = read_geometry(im.model->shard(0), im.g)).empty()) return false;
     const GlmGeometry & g = im.g;
-    if (!load_weights(*im.model, im.backend, im.w, cfg.skip_routed_experts, g.n_layer, err, cfg.dense_requant)) return false;
-    {
+    // ---- P5.3 step 1: the layer range this instance owns.  Unset (the default config) = the whole model, and every
+    // range check below passes exactly as it did before, so the single-stage path is untouched.
+    im.lb = cfg.lb;
+    im.le = cfg.le > 0 ? cfg.le : g.n_layer;
+    im.is_first = cfg.is_first;
+    im.is_last = cfg.is_last;
+    if (im.lb < 0 || im.le > g.n_layer || im.lb >= im.le) {
+        err = "stage layer range [" + std::to_string(im.lb) + "," + std::to_string(im.le) + ") is not inside the"
+              " model's [0," + std::to_string(g.n_layer) + ")";
+        return false;
+    }
+    if (!cfg.is_first && im.lb == 0) { err = "stage [" + std::to_string(im.lb) + "," + std::to_string(im.le) +
+                                                ") is not the first stage but starts at layer 0"; return false; }
+    if (!cfg.is_last && im.le == g.n_layer) { err = "stage [" + std::to_string(im.lb) + "," + std::to_string(im.le) +
+                                                   ") is not the last stage but ends at layer " +
+                                                   std::to_string(g.n_layer); return false; }
+    // P5.3 step 1: x_state is [D, HC, n_layer+1] - the hc_* streams after every layer (column 0 = the embedding,
+    // column l+1 = layer l's finish) - on EVERY stage, split or not.  A stage writes only the columns its own layers
+    // produce (see build_finish's xoff), so the slab a boundary hands over is the whole row stride, identical layout
+    // on both sides, and the successor reads the column its predecessor last wrote (im.col0).
+    im.col0 = im.le > 0 ? im.le : 0;   // 0 unsplit; on stage 0 (whose layers start at column 0) build_attn overrides
+                                       // it per layer, so this is the value a LATER stage's first layer reads
+    if (!load_weights(*im.model, im.backend, im.w, cfg.skip_routed_experts, g.n_layer, err, cfg.dense_requant, im.lb,
+                      weight_end(g.n_layer, im.le), im.is_last))
+        return false;
+    if (im.lb == 0) {   // only the first stage looks tokens up; the others receive embeddings or relayed state
         size_t sh = 0;
         const TensorInfo * te = im.model->find("token_embd.weight", &sh);
         if (!te) { err = "no token_embd.weight"; return false; }
@@ -827,11 +899,15 @@ bool GlmDense::init(const std::string & model_path, const GlmDenseConfig & cfg, 
     im.ictx = ggml_init(ip);
     if (!im.sctx || !im.ictx) { err = "ggml_init(state) failed"; return false; }
     const int64_t NT = im.NT;
-    im.x_state = ggml_new_tensor_3d(im.sctx, GGML_TYPE_F32, im.D, im.HC, NT);
+    // x_state is [D, HC, n_layer+1]: the hc_* streams after each layer (column 0 = the embedding, column l+1 = layer
+    // l's finish).  On a stage it holds this range's columns + 1, the last being the relay's hand-off column.
+    im.x_state = ggml_new_tensor_3d(im.sctx, GGML_TYPE_F32, im.D, im.HC, g.n_layer + 1);
     im.routed_sum = ggml_new_tensor_2d(im.sctx, GGML_TYPE_F32, im.D, NT);
     im.i_emb = ggml_new_tensor_2d(im.sctx, GGML_TYPE_F32, im.D, NT);
-    im.ly.resize((size_t) g.n_layer);
-    for (int64_t il = 0; il < g.n_layer; ++il) {
+    // The layer table is indexed by the GLOBAL layer id on every stage, so a stage sizes it to where its own
+    // range ends (an earlier stage simply holds no entries for the layers it does not run).
+    im.ly.resize((size_t) im.le);
+    for (int64_t il = 0; il < (int64_t) im.ly.size(); ++il) {
         Impl::Layer & L = im.ly[(size_t) il];
         L.kda = g.kda(il);
         L.routed = g.routed(il);
@@ -860,7 +936,10 @@ bool GlmDense::init(const std::string & model_path, const GlmDenseConfig & cfg, 
         }
     }
     im.host_fn.resize((size_t) (im.D * NT));
-    im.hx = ggml_new_tensor_3d(im.sctx, GGML_TYPE_F32, im.D, im.HC, Impl::kRowsMax);
+    // hx: the per-token state the head runs over, taken out of x_state by logits_rows (and out of the relay payload
+    // by logits_relay).  A stage's slab is read from column `le`, so hx is sized to hold rows up to that column.
+    const int64_t hx_cols = std::max<int64_t>(Impl::kRowsMax, (im.le > 0 ? im.le : g.n_layer) + 1);
+    im.hx = ggml_new_tensor_3d(im.sctx, GGML_TYPE_F32, im.D, im.HC, hx_cols);
 
     // ---- run-time rank-1 adapter: the dense half's whole-module targets (`attn_output`, `ffn_down_shexp`).  Each
     // pair is a bare linear merge y += B (A x), so it is two tiny mul_mats added in the graph; the A [in,1] / B [1,out]
@@ -875,14 +954,14 @@ bool GlmDense::init(const std::string & model_path, const GlmDenseConfig & cfg, 
             *pa = ggml_new_tensor_2d(im.lctx, GGML_TYPE_F32, (int64_t) p->a.size(), 1);
             *pb = ggml_new_tensor_2d(im.lctx, GGML_TYPE_F32, 1, (int64_t) p->b.size());
         };
-        for (int64_t il = 0; il < g.n_layer; ++il) {
+        for (int64_t il = im.lb; il < im.le; ++il) {
             Impl::Layer & L = im.ly[(size_t) il];
             mk_pair(im.lora->solo(il, strata::glm::LoraAdapter::ATTN_OUT), &L.lo_attn_a, &L.lo_attn_b);
             mk_pair(im.lora->solo(il, strata::glm::LoraAdapter::SHEXP_DOWN), &L.lo_sh_a, &L.lo_sh_b);
         }
         im.lbuf = ggml_backend_alloc_ctx_tensors_from_buft(im.lctx, ggml_backend_get_default_buffer_type(im.backend));
         if (!im.lbuf) { err = "cannot allocate the LoRA tensors"; return false; }
-        for (int64_t il = 0; il < g.n_layer; ++il) {
+        for (int64_t il = im.lb; il < im.le; ++il) {
             Impl::Layer & L = im.ly[(size_t) il];
             const strata::glm::Lora1 * p;
             if ((p = im.lora->solo(il, strata::glm::LoraAdapter::ATTN_OUT))) {
@@ -935,7 +1014,7 @@ bool GlmDense::init(const std::string & model_path, const GlmDenseConfig & cfg, 
     if (!im.obuf) { err = "cannot allocate the router output blocks"; return false; }
     {
         uint8_t * ob = (uint8_t *) ggml_backend_buffer_get_base(im.obuf);
-        for (int64_t il = 0; il < g.n_layer; ++il) {
+        for (int64_t il = im.lb; il < im.le; ++il) {
             Impl::Layer & L = im.ly[(size_t) il];
             uint8_t * b0 = ob;
             L.o_f = ggml_new_tensor_1d(im.ictx, GGML_TYPE_F32, (int64_t) (lblk / 4));
@@ -966,7 +1045,7 @@ bool GlmDense::init(const std::string & model_path, const GlmDenseConfig & cfg, 
     im.allo_head.assign((size_t) NT + 1, nullptr);
     im.logits_t.assign((size_t) NT + 1, nullptr);
     if (!im.ensure_n(1)) { err = im.err; return false; }
-    for (int64_t il = 0; il < g.n_layer; ++il)
+    for (int64_t il = im.lb; il < im.le; ++il)
         if (im.ly[(size_t) il].routed) build_predict(im, (int) il);
     im.host_logits.resize((size_t) (g.vocab * NT));
     return true;
@@ -1019,6 +1098,9 @@ int GlmDense::snapshot_pos() const { return p_->snap_pos; }
 
 bool GlmDense::begin_tokens(const int * tids, int n) {
     Impl & im = *p_;
+    if (im.lb > 0) { im.err = "begin_tokens: stage [" + std::to_string(im.lb) + "," + std::to_string(im.le) +
+                                   ") has no token embeddings; only the first stage takes token ids";
+                     return false; }
     if (!im.ensure_n(n)) return false;
     if (!im.allo_init[(size_t) n]) im.allo_init[(size_t) n] = im.allo_for(n);   // after release_big
     if (!im.alloc(im.allo_init[(size_t) n], im.gf_init[(size_t) n])) { im.err = "gallocr(init) failed"; return false; }
@@ -1042,7 +1124,8 @@ bool GlmDense::begin_tokens(const int * tids, int n) {
 
 bool GlmDense::predict(int il, int * top_ids, int n_top) {
     Impl & im = *p_;
-    if (il < 0 || il >= (int) im.ly.size() || n_top <= 0) { im.err = "predict: bad args"; return false; }
+    if (il < 0 || n_top <= 0) { im.err = "predict: bad args"; return false; }
+    if (il < im.lb || il >= im.le) { im.err = "predict: layer " + std::to_string(il) + " is not this stage's"; return false; }
     Impl::Layer & L = im.ly[(size_t) il];
     for (int i = 0; i < n_top; ++i) top_ids[i] = -1;
     if (!L.routed) return false;
@@ -1093,7 +1176,7 @@ int GlmDense::safe_chunk(int pos0, int want) const {
 
 void GlmDense::set_route_bias(int il, const float * bias) {
     Impl & im = *p_;
-    if (il < 0 || il >= (int) im.ly.size()) return;
+    if (il < im.lb || il >= im.le) return;   // another stage's layer (or none): nothing to bias here
     Impl::Layer & L = im.ly[(size_t) il];
     std::memcpy(im.in_host.data() + ((uint8_t *) L.rbias->data - im.in_base), bias, (size_t) im.NEXP * 4);
     im.in_dirty = true;
@@ -1102,11 +1185,15 @@ void GlmDense::set_route_bias(int il, const float * bias) {
 
 bool GlmDense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * routed_w, const float ** ffn_norm_host) {
     Impl & im = *p_;
-    if (il < 0 || il >= (int) im.ly.size()) { im.err = "attn_router: bad layer"; return false; }
+    if (il < 0) { im.err = "attn_router: bad layer"; return false; }
+    if (il < im.lb || il >= im.le) { im.err = "attn_router: layer " + std::to_string(il) + " is not this stage's"; return false; }
     if (n < 1 || n > im.NT) { im.err = "attn_router: pass size out of range"; return false; }
     Impl::Layer & L = im.ly[(size_t) il];
     const int64_t pos_last = (int64_t) pos0 + n - 1;
-    if (il == 0) {
+    // The pass's first layer owns the position checks (cache bounds, and the ordered-position rule that the KDA state
+    // needs).  On a split run that is this stage's first layer: lb 0 on stage 0, or lb > 0 on a later stage, whose
+    // layer lb reads the state the relay handed in and still has to see the same positions.
+    if (il == im.lb) {
         if (pos0 != im.next_pos) {
             im.err = "attn_router: position " + std::to_string(pos0) + " but the recurrent state is at " +
                      std::to_string(im.next_pos) + " (KDA state cannot rewind; reset() to start over)";
@@ -1183,7 +1270,9 @@ bool GlmDense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
         im.in_pos = pos0; im.in_n = n; im.in_cap = mcap; im.in_dirty = false;
     }
     if (ggml_backend_graph_compute_async(im.backend, var->gf) != GGML_STATUS_SUCCESS) { im.err = "attn graph compute failed"; return false; }
-    if (il == (int) im.ly.size() - 1) im.next_pos = pos0 + n;
+    // The layer that advances the position is the LAST one this instance runs - the model's last layer unsplit, the
+    // last stage's last layer on a split run (an earlier stage leaves next_pos where the pass started).
+    if (il + 1 == im.le) im.next_pos = pos0 + n;
 
     // one readback: n blocks [fn | ids | wts]
     const size_t ob = (size_t) im.o_blk;
@@ -1207,7 +1296,8 @@ bool GlmDense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
 
 bool GlmDense::finish_layer_n(int il, int n, const float * routed_sum) {
     Impl & im = *p_;
-    if (il < 0 || il >= (int) im.ly.size() || n < 1 || n > im.NT) { im.err = "finish_layer: bad args"; return false; }
+    if (il < 0 || n < 1 || n > im.NT) { im.err = "finish_layer: bad args"; return false; }
+    if (il < im.lb || il >= im.le) { im.err = "finish_layer: layer " + std::to_string(il) + " is not this stage's"; return false; }
     Impl::Layer & L = im.ly[(size_t) il];
     if (L.routed) {
         if (!routed_sum) { im.err = "finish_layer: routed sum missing"; return false; }
@@ -1227,6 +1317,12 @@ bool GlmDense::finish_layer_n(int il, int n, const float * routed_sum) {
 bool GlmDense::logits_rows(int r0, int nr, float * out) {
     Impl & im = *p_;
     if (nr < 1 || nr > Impl::kRowsMax || r0 < 0 || r0 + nr > im.NT) { im.err = "logits_rows: bad rows"; return false; }
+    if (!im.is_last) { im.err = "logits_rows: this stage is not the last one (no output head)"; return false; }
+    if (im.le > 0 && r0 + nr > im.le) {   // the columns a stage writes end at its hand-off column im.le
+        im.err = "logits_rows: rows [" + std::to_string(r0) + "," + std::to_string(r0 + nr) +
+                 ") are past this stage's columns (0.." + std::to_string(im.le) + ")";
+        return false;
+    }
     if (im.gf_rows.empty()) {
         im.gf_rows.assign((size_t) Impl::kRowsMax + 1, nullptr);
         im.rows_t.assign((size_t) Impl::kRowsMax + 1, nullptr);
@@ -1259,6 +1355,7 @@ bool GlmDense::logits_rows(int r0, int nr, float * out) {
 
 bool GlmDense::logits_n(int n, const float ** out, int * n_vocab) {
     Impl & im = *p_;
+    if (!im.is_last) { im.err = "logits_n: this stage is not the last one (no output head)"; return false; }
     if (!im.ensure_n(n)) return false;
     if (!im.gf_head[(size_t) n]) { im.err = "logits_n: n > 4 (prompt chunk): use logits_rows"; return false; }
     if (!im.alloc(im.allo_head[(size_t) n], im.gf_head[(size_t) n])) { im.err = "gallocr(head) failed"; return false; }
@@ -1272,6 +1369,49 @@ bool GlmDense::logits_n(int n, const float ** out, int * n_vocab) {
 
 const float * GlmDense::tap_l_out(int il) const {
     const Impl & im = *p_;
-    if (!im.gate_taps || il < 0 || il >= (int) im.ly.size()) return nullptr;
+    if (!im.gate_taps || il < 0) return nullptr;
+    if (il < im.lb || il >= im.le) return nullptr;   // another stage's tap
     return im.ly[(size_t) il].host_lout.data();
 }
+
+// P5.3 step 1: the LAST stage's head over a relayed slab.  The payload is what the staging of
+// tools/gfx906/relay_staging.hpp carries: per token, the stage's full column set (its x_state's nb[2] bytes), so
+// `x_host` is nr * relay_slab_bytes() floats-as-bytes, rows r0..r0+nr-1 of the pass.  This is logits_rows' host leg
+// with the read-out of x_state replaced by a copy from the staging, then the same head graph - which is why the two
+// paths give the same logits for the same state bytes.
+bool GlmDense::logits_relay(int r0, int nr, const float * x_host, float * out) {
+    Impl & im = *p_;
+    if (!im.is_last) { im.err = "logits_relay: this stage is not the last one (no output head)"; return false; }
+    if (!x_host) { im.err = "logits_relay: no payload"; return false; }
+    if (nr < 1 || nr > Impl::kRowsMax || r0 < 0 || r0 + nr > im.le) {   // hx is sized to the stage's columns + 1
+        im.err = "logits_relay: bad rows";
+        return false;
+    }
+    if (im.gf_rows.empty()) {
+        im.gf_rows.assign((size_t) Impl::kRowsMax + 1, nullptr);
+        im.rows_t.assign((size_t) Impl::kRowsMax + 1, nullptr);
+        im.allo_rows = im.new_allo();
+    }
+    if (!im.gf_rows[(size_t) nr]) {   // the same head graph logits_rows builds, over hx's first nr rows
+        ggml_context * gc = im.gctx;
+        ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
+        B b { &im, gc, &im.g };
+        ggml_tensor * x = ggml_view_3d(gc, im.hx, im.D, im.HC, nr, im.hx->nb[1], im.hx->nb[2], 0);
+        ggml_tensor * acc = ggml_view_2d(gc, x, im.D, nr, x->nb[2], 0);
+        for (int64_t s = 1; s < im.HC; ++s) acc = ggml_add(gc, acc, ggml_view_2d(gc, x, im.D, nr, x->nb[2], (size_t) s * x->nb[1]));
+        acc = ggml_scale(gc, acc, 1.0f / (float) im.HC);
+        ggml_tensor * lg = ggml_mul_mat(gc, b.W("output.weight"), b.rms_w(acc, b.W("output_norm.weight")));
+        ggml_set_output(lg);
+        ggml_build_forward_expand(gf, lg);
+        im.gf_rows[(size_t) nr] = gf;
+        im.rows_t[(size_t) nr] = lg;
+    }
+    const size_t slab = im.x_state->nb[2];
+    ggml_backend_synchronize(im.backend);   // nothing may still be reading hx
+    ggml_backend_tensor_set(im.hx, x_host, slab * (size_t) r0, slab * (size_t) nr);
+    if (!im.alloc(im.allo_rows, im.gf_rows[(size_t) nr])) { im.err = "gallocr(relay rows) failed"; return false; }
+    if (ggml_backend_graph_compute(im.backend, im.gf_rows[(size_t) nr]) != GGML_STATUS_SUCCESS) { im.err = "relay head failed"; return false; }
+    ggml_backend_tensor_get(im.rows_t[(size_t) nr], out, 0, (size_t) (im.g.vocab * nr) * 4);
+    return true;
+}
+
