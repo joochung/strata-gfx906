@@ -229,15 +229,28 @@ the index keys of the latest index source at or below it (`Ds41Geometry::kv_src 
 inside a graph.  The relay moves per-token state; it has no way to move a cache, and a per-pass D2H/H2D of a visible
 cache would be gigabytes a token.  Therefore:
 
-> **THE CACHE RULE.**  A stage boundary must be at or above the model's LAST shared-cache layer + 1
-> (`Ds41Dense::split_min_boundary`).  For the shipped 40-layer build: kv sources {2,8,14,20}, index sources
-> {2,8,14,20,24,28,32,36}, so the floor is **37** and the only mid-model split is `--layer-split 37` - layers [0,37) on
-> one card, the tail [37,40) on the other.  Boundaries at 3, 9, 15 or 21 - which a reader who knows the GLM engine
-> would guess, since the layer before each is both a kv and an index source - are REFUSED, with the floor named in the
-> message.  `split_boundaries_ok` enforces it before anything is allocated; `build_attn` aborts if a stage is ever
-> built by hand over a ring it does not own.  The two source lists are not taken on faith: `gate-device-split.sh` step 3
-> asks the engine's own geometry reader (`test_ds41_geometry <file.gguf>`, host-only) for `cand L20 2048x8` and the
-> per-layer map's `39:20/36`, and FAILs the gate if the checkpoint disagrees with the numbers the rule is derived from.
+> **THE READER'S RULE.**  A boundary at `K` is legal **iff every layer at or above `K` finds both of its sources at or
+> above `K`** - the stage that runs a layer must also run the layer whose ring that layer reads
+> (`Ds41Dense::split_boundary_valid`; `split_valid_boundaries()` enumerates the set, `split_boundaries_ok()` vets a whole
+> plan).  The stage-0 side is free: `kv_src(m) <= m < K` always.  Because the sources are monotone in `m`, the scan can
+> only bite at the boundary layer itself, so a valid boundary is a layer that is **both** a kv and an index source (plus
+> the vacuous case of a boundary layer that runs no attention).  For the shipped 40-layer build that set is
+> **{1, 2, 8, 14, 20}**, usable as {2, 8, 14, 20} - and **20 is the even halfway point of the model**: stage 1 =
+> [20,40) runs the writer of ring 20 together with every reader of it, the writers and readers of index rings
+> 24/28/32/36, and the candidate writer (20) with all of its readers (24/28/32/36).  **This is a set, not a floor.**  An
+> out-of-set `--layer-split` **snaps down** to the nearest valid layer below it (21 boots as 20, and the run says so);
+> a plan the set cannot reach is refused before allocation with the set named, rather than silently running with fewer
+> stages.  `build_attn` still aborts if a stage is ever built by hand over a ring it does not own.
+>
+> **THE FIRST REVISION HAD THIS UPSIDE DOWN, AND THE GATE NOW TESTS THE DIRECTION.**  The version committed earlier
+> today required the *writers* to sit below the boundary and called `LAST_SOURCE + 1 = 37` a floor.  A writer below the
+> boundary is precisely what strands its ring: the tail [37,40) reads layer 20's compressed KV and layer 36's index
+> keys, both below 37, so the witness would have died at graph build with the abort the floor claimed to prevent.  The
+> cuts at 3/9/15/**21** are still refused, but for the true reason (`kv_src(21) == 20 < 21`), and the 40-pair source map
+> plus the derived set are now checked three times over: in the engine's C++, in the host gate's C++ **by simulating the
+> stages and their layers** (`split_stages_own_their_reads`, which every 1-, 2- and 3-boundary cut of four geometries
+> must agree with), and in awk in `gate-device-split.sh` step 3, derived from the engine's own geometry reader
+> (`test_ds41_geometry <file.gguf>`, host-only) rather than from this file's transcription.
 
 **The payload - two regions on this model, and the third one is provably unreachable.** GLM hands on `x_state` alone:
 
@@ -248,15 +261,16 @@ cache would be gigabytes a token.  Therefore:
 | candidates | `cand` I32 [CB, NC] | 8 192 | **no** - see below |
 
 The candidate column is per-token state, so it COULD ride along like the other two and the machinery is there
-(`relay_cand_from` for the in-place read, a payload region for the copy).  It never does, and the reason is a THEOREM
-about the two rules rather than a property of this checkpoint: a boundary must sit at or above the model's last kv /
-index source + 1, and every layer that ranks inside the candidate blocks IS an index source - so no reader can ever be
-at or above the floor it must clear, and producer plus readers always share a stage.  `test_split_geometry.cpp` asserts
-exactly that (`split_candidates_cross` is false for every shape it can build, including three-stage plans and models
-whose sources are rearranged), which makes the candidate region code a model with a cache OUTSIDE those two lists would
-need - a hybrid SSM state, or a cache named by a key the geometry does not read yet - at 8 KiB a token.  Kept, sized,
-gated, and honest about not firing here.  The witness therefore gates on `cand 0)` in the slab line: a non-zero value
-means the geometry moved underneath the witness, not that a feature turned on.
+(`relay_cand_from` for the in-place read, a payload region for the copy).  It never does, and the reason follows from
+the reader's rule rather than from this checkpoint: a layer that ranks inside the candidate blocks is an index source,
+and validity at `K` requires `cand_layer >= K` whenever a reader is left at or above `K` - so no legal boundary can sit
+strictly above the producer and at or below a reader, and the producer plus its readers always share a stage.
+`test_split_geometry.cpp` asserts exactly that (`split_candidates_cross` is false for every shape it can build,
+including three-stage plans and models whose sources are rearranged), which makes the candidate region code a model
+with a cache OUTSIDE those two lists would need - a hybrid SSM state, or a cache named by a key the geometry does not
+read yet - at 8 KiB a token.  Kept, sized, gated, and honest about not firing here.  The witness therefore gates on
+`cand 0)` in the slab line: a non-zero value means the geometry moved underneath the witness, not that a feature turned
+on.
 
 Each region starts at byte 0 of its tensor (the pass's columns are the leading columns of a column-major tensor), so
 one boundary is a small number of contiguous copies in a fixed order, and `relay_slab_bytes()` is the ONE number both
@@ -283,20 +297,24 @@ snapshot / park / restore - is per-instance and a staged conversation spans seve
 draft overwrites positions a stage already handed over); a stage that shares weights but lands on a different card
 (ggml hands the host an iGPU device pointer that the dGPU's copy engine cannot read, so use `--relay-copy-weights`);
 a pass that would overrun a stage's rings (the per-stage cap is the LAST stage's - the only range that ever sees the
-whole prefix - because an earlier stage's rings hold only its own range's output); a `--layer-split` the geometry does
-not allow (the cache rule, above); and a config that asks a stage to hold rings it does not run (`cfg.state_le != le`
-aborts - the cache rule made that shape unnecessary, and a stage holding a ring nobody reads is a stage the rule was
+whole prefix - because an earlier stage's rings hold only its own range's output); a `--layer-split` the geometry
+cannot reach (the reader's rule, above - the set it names is the answer); an `--engram` split whose **first** boundary
+cuts above an Engram layer (see below); and a config that asks a stage to hold rings it does not run (`cfg.state_le != le`
+aborts - the reader's rule made that shape unnecessary, and a stage holding a ring nobody reads is a stage the rule was
 not understood by).
 
 **Engram tables follow the range, and the token ring follows the stage.** The Engram tables are GBs of host memory and
 only the range that holds an Engram layer reads them, so a stage opens them only if its own `[lb, le)` holds one
 (`im.eng_slots` = the slots in range, passed to `rows`/`start` so a stage cannot even ask for a row of a layer it does
-not run).  At the witness's boundary (37) the whole Engram pair sits in stage 0, and the tail stage maps none of it.  Note the
-consequence for a split that DID cut between Engram layers: the rolling token ring (`set_token`) is fed inside
+not run).  At the witness's boundary (20) the whole Engram pair sits in stage 0, and stage 1 maps none of it.  Note the
+consequence for a split that DOES cut between Engram layers: the rolling token ring (`set_token`) is fed inside
 `upload_pass`, which only stage 0 runs (`begin()` errors on a later stage by design), so stage 0's ring would be the
-only one - and a stage that hashes its own window against a ring it never fed would read garbage rows.  Engram layers
-therefore have to live in ONE stage; today's geometry (1 and 14) satisfies that under the cache rule, and the shape is
-worth knowing before anyone proposes a boundary at 8.
+only one - and a stage that hashes its own window against a ring it never fed would read garbage rows.  The FIRST
+boundary therefore has to sit above the LAST Engram layer (this model: 14), which `ds41_generate` enforces as its own
+rule on top of the caches' set.  The interaction is worth knowing before anyone proposes a four-card plan: {8, 14, 20}
+is a cache-legal split whose first boundary is 8, so with `--engram` it is refused and 20 is the ONLY boundary this
+checkpoint has - two stages is the ceiling for a staged DS4.1 run that runs the real model.  Dropping `--engram` (an
+ablation, not a serve config) lifts that limit to the four-stage {2, 8, 14, 20}.
 
 **The tier needs no cross-device transport** and that is a design fact, not a simplification: at this engine's seam
 the MoE tier is host-in / host-out (`attn_router` returns `fn` on the host, `finish` takes `routed_sum` on the host),
@@ -305,21 +323,25 @@ on the ambient device, always 0, because the dense half was its only GPU user - 
 `TierDev` RAII guard at every CUDA seam makes it name its own card even while another stage sets the ambient device.
 
 **Where to read it**: the arithmetic gate is `tools/gfx906/test_split_geometry.{hpp,cpp}` (plain g++, no ggml, no GPU:
-the cache rule, the candidate rule, the payload size, stated against a copied geometry), wired into
+the reader's rule, the candidate rule, the payload size, stated against a copied geometry - and re-derived by scanning
+the stages, for every 1-, 2- and 3-boundary cut), wired into
 `tools/gfx906/gate-device-split.sh`; the runtime witness is `tools/gfx906/run-p5.3b-ds41-handoff.sh` (five runs: two
 unsplit controls, one `--gpus 0,0` same-card split, two `--gpus 0,1 --relay-copy-weights` twins, verdict calibrated
 against the twin pairs' own agreement, exactly as GLM's witness does).
 
-**One limitation, stated where it can be seen: a DS4.1 split is a tail split, not an even one.** The GLM engine can put
-half the model on each card; here the cache rule permits only `--layer-split 37` of 40 layers, so the second card runs a
-3-layer tail plus the head and lm_head (about a third of the 3 GB of per-layer weights, and much less of the compute).
-That is enough to witness the hand-off moving a real stage and to prove the bytes survive a card change, and it is what
-the geometry allows.  Making DS4.1 splittable anywhere in the middle means relaying a CACHE, not a token column: the
-successor's rings would have to be fed from the producer's compressed KV / index keys, which is a per-pass copy of a
-growing cache rather than 80 KiB a token - that is P5.4/P5.5 territory (the tier split and the scaling curve), not
-something to fake with a boundary that happens to fall on a source layer.  The gate keeps the boundary floor honest:
-if the checkpoint's source lists change, `split_min_boundary` moves and the witness's constant has to move with it
-(`test_plan_gate` asserts the current pairing).
+**One limitation, stated where it can be seen: the caches allow a four-stage plan, the Engram add allows only two.**
+The caches' set for this checkpoint is {2, 8, 14, 20}, and the even split at **20** puts 20 layers on each card - about
+half the 3 GB of per-layer weights and half the compute, which is a real second stage rather than the 3-layer tail this
+file's first revision believed was the only option.  The plan {8, 14, 20} is equally cache-legal and would drive four
+cards, but its first boundary is 8, below the last Engram layer (14), and only stage 0 feeds the Engram token ring - so
+with `--engram` (every real-model run) **20 is the only boundary there is**, and two stages is the ceiling.  Lifting
+that means carrying the rolling token ring across a boundary (or feeding it on every stage), which is P5.4/P5.5 work
+like the tier split, not a flag.  What is NOT on any roadmap and should stay off it: a boundary that cuts between a
+cache writer and its readers.  The relay moves per-token state; feeding a successor's rings from a producer's compressed
+KV / index keys is a per-pass copy of a growing cache, not 80 KiB a token, and the reader's rule refuses such a
+boundary instead of faking one that happens to fall on a source layer.  The gate keeps the set honest: if a
+checkpoint's source lists move, `split_valid_boundaries()` moves, the awk cross-check in `gate-device-split.sh` step 3
+moves, and `test_plan_gate` fails until the witness's constant moves with them.
 
 ---
 

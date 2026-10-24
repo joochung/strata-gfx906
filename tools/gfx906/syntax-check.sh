@@ -22,12 +22,17 @@ fi
 
 # -x hip + --offload-arch=gfx906: the device-side compile the HIP target really does (the objects are built by the
 # HIP toolchain, so the engine's headers are parsed for the gfx906 profile too).
+# -DDS41_HAVE_DSPARK is part of the REAL ds41_generate compile (tools/v41/engine/v41_engine.cmake:142) and without it the
+# file's DSpark-guarded declarations vanish while an UNGUARDED printf still reads them - so a syntax-check of
+# ds41_generate.cpp without it fails on the baseline tree, on lines this change never touched.  It is inert for the GLM
+# files.  (Discovered 2026-10-24: the failure is pre-existing, not the split rule's; the full ninja build defines it.)
 rc=0
 for f in "${FILES[@]}"; do
     echo "=== syntax-check $f ==="
     "$CXX" --offload-arch=gfx906 -fsyntax-only -x hip -std=c++20 \
         -DGGML_USE_CPU -DGGML_USE_CUDA -DSTRATA_HIP_GFX906=1 -DSTRATA_Q6K_EXPERTS=1 \
         -DSTRATA_NATIVE_EXPERTS=1 -DUSE_PROF_API=1 -D__HIP_PLATFORM_AMD__=1 -DSTRATA_VERSION='"syntax-check"' \
+        -DDS41_HAVE_DSPARK \
         -I/opt/rocm-7.2.0/include \
         -I"$WT/include" -I"$WT/tools/glm" -I"$WT/tools/ds4" -I"$WT/tools/gfx906" \
         -I"$GGML/ggml/src" -I"$GGML/ggml/src/../include" \

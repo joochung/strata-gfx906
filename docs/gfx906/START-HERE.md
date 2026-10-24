@@ -99,36 +99,55 @@ The same capability now exists in the DeepSeek-V4.1 engine (`tools/v41`), built 
 documented in [P5-RELAY-PATTERN.md section 6b](P5-RELAY-PATTERN.md).  What makes this engine different from GLM is
 that **its caches are shared and a cache cannot cross a card**: a layer reads the compressed KV of the latest kv
 source at or below it and the index keys of the latest index source at or below it, those rings are persistent GPU
-state read by pointer inside one graph, and the relay moves only per-token state.  Hence **THE CACHE RULE** - a
-boundary must sit at or above the model's last shared-cache layer + 1.  For the shipped 40-layer build (kv sources
-{2,8,14,20}, index sources {2,8,14,20,24,28,32,36}) the floor is **37**, so the only mid-model split is
-`--layer-split 37`: layers [0,37) on one card, the tail [37,40) on the other.  The cuts a GLM reader would guess
-(3/9/15/21, where the layer before each is both a kv and an index source) are refused with the floor named.
+state read by pointer inside one graph, and the relay moves only per-token state.  Hence **THE READER'S RULE** - a
+boundary at `K` is legal only if **every layer at or above `K` finds both of its sources at or above `K`** (the stage
+that runs a layer must run the layer whose ring it reads).  For the shipped 40-layer build (kv sources {2,8,14,20},
+index sources {2,8,14,20,24,28,32,36}) the valid set is **{1, 2, 8, 14, 20}** - the layers that are both a kv and an
+index source - and `--layer-split 20`, **the even halfway point of the model**, is one of them: stage 1 = [20,40)
+runs the writer of ring 20 with every reader of it, the writers and readers of index rings 24/28/32/36, and the
+candidate writer (20) with all of its readers (24/28/32/36).  **It is a set, not a floor.**  The first revision of
+this code derived a floor of 37 ("last shared-cache layer + 1") by requiring the *writers* to sit below the
+boundary; that direction is backwards, and 37 is a boundary that aborts at graph build - the tail [37,40) reads
+layer 20's compressed KV and layer 36's index keys, both below it.  The cuts a GLM reader would guess (3/9/15/**21**)
+stay refused, for the correct reason: `kv_src(21) == 20 < 21`, so ring 20 would remain on the stage below.
+An out-of-set `--layer-split` **snaps down** to the nearest valid layer (21 boots as 20, and says so); a plan the
+set cannot reach (an even 4-stage split, whose 4th boundary would sit past 20) is refused with the set named, not
+silently run with fewer stages.
 The payload is therefore **two** regions - `x_state` (80 KiB/token) and this model's explicit `pre_state` hc
 pre-mix (16 B).  The third region the machinery implements, the 2048 candidate blocks layer 20 picks (8 KiB), is
-**provably unreachable under the cache rule** on any model whose caches are those two source lists: every reader of
-that column is an index source, hence below the floor a boundary must clear, so producer and readers always share a
-stage.  The gate asserts that (`split_candidates_cross` is false for every shape it can build) and the witness gates
-on the absence of a candidate region rather than its presence.
+**provably unreachable under the reader's rule** on any model whose caches are those two source lists: every reader
+of that column is an index source, and validity at `K` already requires `cand_layer >= K` whenever a reader is left
+at or above `K`, so producer and readers always share a stage.  The gate asserts that (`split_candidates_cross` is
+false for every shape it can build) and the witness gates on the absence of a candidate region rather than its
+presence.
 Refused with a message, not a wrong answer: `--serve`, DSpark, a shared-weight stage on a foreign card, and a
-`--layer-split` the geometry does not allow (including the even split `--layer-split` unset - the refusal suggests
-the number that works).  The expert tier got device pinning
+`--layer-split` the geometry cannot reach.  One constraint the geometry does not carry: with `--engram` (layers 1 and
+14 here) the **first** boundary must sit above the last Engram layer, because only stage 0 feeds the Engram token
+ring - which leaves 20 as the only boundary this checkpoint can use while the Engram add is on.  The deeper legal
+plan {8, 14, 20} (four cards) is a cache-legal split that the Engram rule refuses; it is reachable without
+`--engram`.  The expert tier got device pinning
 (`Ds41MoeConfig::device` + a `TierDev` guard at every CUDA seam); its seam is host-in/host-out so it
 needs no cross-device transport.
 
 Host-side verification on this box: full HIP build of `build-906`, `ctest -j4` at the fork's baseline
-failure set, and the split gate (`tools/gfx906/gate-device-split.sh`, 1154 checks) which now includes
-`tools/gfx906/test_split_geometry.cpp` - the cache rule, the candidate rule, the payload size and the CLI plan gate
-checked against the model's geometry with plain g++, no GPU (1154 checks).  The gate's **third** step then cross-checks
-the source lists that copy against the engine's own reader (`build-906/test_ds41_geometry <V41-GSQ.gguf>`, host-only):
-`cand L20 2048x8` and `39:20/36` - layer 39 reads layer 20's compressed KV and layer 36's index keys, which is the fact
-the boundary floor is derived from.  Skipped, not failed, where no build or no checkpoint exists.  (A hand-rolled GGUF
+failure set, and the split gate (`tools/gfx906/gate-device-split.sh`, 31198 checks) which now includes
+`tools/gfx906/test_split_geometry.cpp` - the reader's rule, the candidate rule, the payload size and the CLI plan gate
+checked against the model's geometry with plain g++, no GPU.  Most of those checks are one invariant: for every 1-,
+2- and 3-boundary cut of four geometries, the predicate must agree with a scan that **plays the runtime** (`split_
+stages_own_their_reads` builds the stages and asks each of its layers whether the stage that runs it also runs the
+layer whose ring it reads).  That scan is what a wrong direction cannot survive, and this code has had one.  The
+gate's **third** step then cross-checks the source lists that copy against the engine's own reader
+(`build-906/test_ds41_geometry <V41-GSQ.gguf>`, host-only): the full 40-pair `kv_src/idx_src` map must match
+literally, and the valid set is re-derived **a third time, in awk, from the oracle's own map** - so a checkpoint that
+moved a boundary cannot agree with a gate that did not.  Skipped, not failed, where no build or no checkpoint exists.
+(A hand-rolled GGUF
 header parse gave a different, plausible, **wrong** answer here - `cand L10`, `kv_src(l)==l`, "any split is valid" - and
 it is the engine's reader that settles it, so the gate calls the reader rather than trusting a transcription.)  **No GPU run has been performed for this change**;
 the witness is `tools/gfx906/run-p5.3b-ds41-handoff.sh` (five runs, operator-launched, same calibrated
-verdict as GLM's) and it has not been run yet.  Its staged runs use `--layer-split 37` (the cache rule's floor,
-a constant the gate keeps honest), and it FAILs if any staged run moves the candidate column across a boundary -
-the cache rule holding is what the witness documents.  Also unported, by decision: the layer-major prompt walk
+verdict as GLM's) and it has not been run yet.  Its staged runs use `--layer-split 20` (the only boundary this
+model's geometry and `--engram` both allow, a constant the gate keeps honest), gate that the stage really begins at
+20, and FAIL if any staged run moves the candidate column across a boundary -
+the reader's rule holding is what the witness documents.  Also unported, by decision: the layer-major prompt walk
 (a staged run uses the sequential chunk path but keeps the batch's STATE columns as its cycling budget)
 and staged serve/conversation reuse.
 
