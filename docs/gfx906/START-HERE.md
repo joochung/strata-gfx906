@@ -69,7 +69,7 @@ engine reported `length` at 55 of 64 tokens after a wrap-up prefill, and the ser
 analysed in [P4.3-serve-stop-analysis.md](P4.3-serve-stop-analysis.md)):
 [XOLOTL-PORT.md](XOLOTL-PORT.md).
 
-### Layer split for the ported engines: phase P5, step 1 hand-off proven (2026-10-24)
+### Layer split for the ported engines: phase P5, steps 1-2 hand-off proven on one card and across two (2026-10-24)
 
 The GLM engine now runs a STAGED pass opt-in (`--gpus 0,0`): the model is split into two stage
 instances over their layer ranges, each owning its KDA/conv/MLA state, and the activation state at
@@ -89,10 +89,21 @@ own agreement, which the staged run matched (64/64 against one control, and part
 exactly where the controls part from each other). Staged on one card costs about 0.78 GiB more
 VRAM (per-stage state and graphs) and is a correctness mode, not a speed mode.
 
-Not proven at this checkpoint: hand-off across DIFFERENT cards (the engine still refuses `--gpus
-0,1`; the expert tier allocates its slots on one device and is the next work item), the DS4.1
-engine under staging, staged serve mode (conversation snapshot/restore is per-instance today), and
-any scaling number - the 1/2/4-card curve is P5.5 and no throughput claim is made here.
+Not proven at this checkpoint: the DS4.1 engine under staging, staged serve mode (conversation
+snapshot/restore is per-instance today), and any scaling number - the 1/2/4-card curve is P5.5 and
+no throughput claim is made here.
+
+Step 2 landed the same day and is witnessed too: `--gpus 0,1` places the second stage - its layer
+range, its KDA/conv/MLA state, and its own copy of its weights - on the SECOND card, and the expert
+tier now pins the device it was given (it ran on the ambient device, always 0, because the dense
+half was its only GPU user; a staged run is not). The expert seam needed no cross-device transport:
+at that boundary the tier is host-in/host-out by design. Witness 20261024-123831:
+[receipt](../../benchmarks/gfx906/receipts/2026-10-24-p5.3-cross-device-handoff-pass.json). A
+cross-device staged run matched an unsplit control byte-identically for all 64 greedy tokens, the
+cross-device twin pair agreed 39/64 - exactly the unsplit twin pair's agreement in the same
+witness - and an earlier FAIL (61/64 against every reference, TS 20261024-110925) is thereby
+settled as knife-edge noise: two identical cross-device runs do not even reproduce each other
+bit-for-bit, so 61/64 is within this engine's own reproducibility and not a placement defect.
 
 ## Checked-in CLI
 

@@ -1,0 +1,59 @@
+{
+  "id": "p5.3-cross-device-handoff-pass-2026-10-24",
+  "date": "2026-10-24",
+  "phase": "P5.3 step 2 (distinct-device staged run, GLM engine)",
+  "verdict": "PASS",
+  "summary": "The staged GLM run with stage 1 on a SECOND MI50 (--gpus 0,1, own weights on that card, host-relayed F32 boundary) reproduces the unsplit greedy token stream to within this engine's own cross-process reproducibility; one cross-device run matched an unsplit control byte-identically for all 64 tokens. Step 1 (--gpus 0,0) re-proven in the same witness.",
+  "engine_build": {
+    "branch": "gfx906/p5.3-relay",
+    "witness_script_commit": "5ac7be6f",
+    "step2_code_commit": "9cae302d",
+    "binary": "build-906/glm_generate (build-906-gate BUILD OK, ctest exactly the four pre-existing baseline failures)",
+    "model": "/ai/models/hf.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/Maya-L/GLM-5.3-Flash-Maya-L-IQ3_S-00001-of-00004.gguf",
+    "prompt": "14 ids (glm4 pre-tokenizer, 'What is a mixture-of-experts model? Answer in two sentences.'), greedy, -n 64",
+    "flags": "--backend cuda --experts gpu --ctx 32768 --arena-gib 60 --arena-skip-resident --prefill-chunk 4096 --chunk-mmq --vram-margin 4.0 --arena-adapt --pcie auto --stop 154820,154827,154829"
+  },
+  "hardware": "4x AMD Instinct MI50 32GB (gfx906), ROCm 7.2.0; HIP device 0 = 0000:43:00.0, device 1 = 0000:46:00.0; no engine else alive (SVM rule), 118 GiB RAM available",
+  "witness_8": {
+    "ts": "20261024-123831",
+    "logs": "logs/p5.3-run{1..5}-20261024-123831.{log,toks} (repo logs/, gitignored by design; numbers embedded here)",
+    "runs": {
+      "run1": "unsplit control, 64 tokens, decode 2.57 tok/s, hit 23.3%, arena swaps 72, VRAM free 3.28 GiB",
+      "run2": "unsplit control, 64 tokens, decode 2.26 tok/s, hit 23.3%, arena swaps 72, VRAM free 3.28 GiB",
+      "run3": "staged --gpus 0,0 weights shared, 64 tokens, decode 2.76 tok/s, VRAM free 2.50 GiB",
+      "run4": "staged --gpus 0,1 stage1 device 1 weights own copy, 64 tokens, decode 2.68 tok/s, VRAM free 3.22 GiB (device 1)",
+      "run5": "staged --gpus 0,1 twin, 64 tokens, decode 2.67 tok/s, VRAM free 3.22 GiB (device 1)"
+    },
+    "agreement_longest_common_prefix_of_64": {
+      "run1_vs_run2_unsplit_twins": 39,
+      "run4_vs_run5_cross_device_twins": 39,
+      "run3_vs_run1": 64,
+      "run3_vs_run2": 39,
+      "run4_vs_run1": 59,
+      "run4_vs_run2": 39,
+      "run5_vs_run1": 39,
+      "run5_vs_run2": 64
+    },
+    "verdict_lines": {
+      "run3": "PASS - byte-identical to run1 for all 64 (step 1 re-proven, third independent witness)",
+      "run4": "PASS (calibrated) - best-vs-controls 59 >= bar 39 (cross-device twin agreement measured in-witness)",
+      "run5": "PASS - byte-identical to run2 for all 64: a CROSS-DEVICE staged run reproduced an unsplit stream exactly"
+    }
+  },
+  "key_findings": [
+    "Cross-device staged runs have the SAME reproducibility distribution as unsplit runs: twin-pair agreement 39/64 for both variants in this witness (unsplit pair measured 64/64 in witness #7, 39/64 in #6 and #8 - it is a distribution, not a property).",
+    "run5 (--gpus 0,1) == run2 (unsplit) byte-identical over all 64 greedy ids: the host-relayed boundary and the second-card placement (own weight load, own state, head on device 1) produce the same computation.",
+    "Witness #7 (TS 20261024-110925) FAIL verdict for run4 (61/64 vs all three references, same divergence token) is settled as knife-edge noise, not a placement bug: the discriminating twin pair shows cross-device runs do not even reproduce EACH OTHER bit-for-bit (39/64), while a cross-device run in #8 reproduced the unsplit stream 64/64.",
+    "Tier device pinning (cfg.device + TierDev guards incl. worker threads) works: run4/run5 tier stats are stable twin-to-twin (hit 15.5%, cpu 56.8%, pcie 27.7%, file reads ~234 ms/pass) and match run3's same-device staged profile; no cross-device expert traffic exists at this seam (tier is host-in/host-out)."
+  ],
+  "costs_measured": {
+    "staged_vram_same_device": "2.50 GiB free vs 3.28 unsplit (~0.78 GiB per-stage state+graphs)",
+    "staged_vram_cross_device": "device 0 as unsplit (tier+stage0); device 1 holds stage1 weights+state, 3.22 GiB free of 32 GiB",
+    "decode_rate": "staged 2.67-2.76 vs unsplit 2.26-2.57 tok/s on one card (NOT a speed mode at 2 stages on same/split cards; no scaling claim - that is P5.5)"
+  },
+  "not_proven": [
+    "DS4.1 engine under staging (step 3, replicate the pattern there)",
+    "staged SERVE mode (conversation snapshot/restore is per-instance today)",
+    "any scaling number: the 1/2/4-card curve is P5.5"
+  ]
+}
