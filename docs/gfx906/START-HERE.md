@@ -119,7 +119,12 @@ needs no cross-device transport.
 Host-side verification on this box: full HIP build of `build-906`, `ctest -j4` at the fork's baseline
 failure set, and the split gate (`tools/gfx906/gate-device-split.sh`, 1154 checks) which now includes
 `tools/gfx906/test_split_geometry.cpp` - the cache rule, the candidate rule, the payload size and the CLI plan gate
-checked against the model's geometry with plain g++, no GPU (1154 checks).  **No GPU run has been performed for this change**;
+checked against the model's geometry with plain g++, no GPU (1154 checks).  The gate's **third** step then cross-checks
+the source lists that copy against the engine's own reader (`build-906/test_ds41_geometry <V41-GSQ.gguf>`, host-only):
+`cand L20 2048x8` and `39:20/36` - layer 39 reads layer 20's compressed KV and layer 36's index keys, which is the fact
+the boundary floor is derived from.  Skipped, not failed, where no build or no checkpoint exists.  (A hand-rolled GGUF
+header parse gave a different, plausible, **wrong** answer here - `cand L10`, `kv_src(l)==l`, "any split is valid" - and
+it is the engine's reader that settles it, so the gate calls the reader rather than trusting a transcription.)  **No GPU run has been performed for this change**;
 the witness is `tools/gfx906/run-p5.3b-ds41-handoff.sh` (five runs, operator-launched, same calibrated
 verdict as GLM's) and it has not been run yet.  Its staged runs use `--layer-split 37` (the cache rule's floor,
 a constant the gate keeps honest), and it FAILs if any staged run moves the candidate column across a boundary -

@@ -12,14 +12,48 @@ set -u
 cd "$(dirname "$0")/../.." || exit 1
 OUT=${TMPDIR:-/tmp}/test_device_split.$$
 
-echo "=== [1/2] compile the standalone gate (plain g++, C++17, warnings are errors) ==="
+echo "=== [1/3] compile the standalone gate (plain g++, C++17, warnings are errors) ==="
 g++ -std=c++17 -O0 -Wall -Wextra -Werror -I tools/gfx906 -o "$OUT" tools/gfx906/test_device_split.cpp || {
     echo "GATE FAIL: compile"; exit 1; }
 
-echo "=== [2/2] run it ==="
+echo "=== [2/3] run it ==="
 "$OUT"; rc=$?
 rm -f "$OUT"
 [ $rc -eq 0 ] || { echo "GATE FAIL: test_device_split (rc=$rc)"; exit 1; }
+
+# ---- [3] the gate's copied geometry vs the ENGINE'S OWN loader, when both are on this box
+# test_split_geometry.cpp works from a HAND-COPY of the checkpoint's source lists, because the standalone gate must not
+# need ggml, a model or a GPU.  That copy can drift from the file - and every boundary rule in this file is derived from
+# those two lists, so a drift is not a typo, it is a wrong split rule.  When the HIP build has been made and the GGUF is
+# present, cross-check the copy against ds41_read_geometry(), the same reader the runtime uses (host-only; it validates
+# the invariants the engine relies on).  Skipped, not failed, when either is missing: the gate still runs on a box with
+# no build and no model.
+GGUF=${GGUF:-/ai/models/hf.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored/V41-GSQ.gguf}
+GEOM_BIN=build-906/test_ds41_geometry
+if [ -x "$GEOM_BIN" ] && [ -r "$GGUF" ]; then
+    echo "=== [3/3] the copied geometry against the engine's own reader ($GGUF) ==="
+    OUT3=${TMPDIR:-/tmp}/geom_oracle.$$
+    if ! "$GEOM_BIN" "$GGUF" > "$OUT3" 2>&1; then
+        echo "GATE FAIL: $GEOM_BIN did not accept the checkpoint (see $OUT3)"; exit 1
+    fi
+    # cand L20 2048x8  and  the per-layer source map ( "39:20/36" = layer 39 reads layer 20's KV, 36's index keys)
+    if ! grep -q "cand L20 2048x8" "$OUT3"; then
+        echo "GATE FAIL: the checkpoint's candidate layer / block count is not L20 2048x8 as test_split_geometry assumes"
+        sed -n 's/^.*\(cand L[0-9]* [0-9]*x[0-9]*\).*/  oracle says: \1/p' "$OUT3" | head -1
+        rm -f "$OUT3"; exit 1
+    fi
+    # the last layer's sources, which set the boundary floor: kv 20, index 36 -> floor 37
+    last=$(grep -o "39:[0-9]*/[0-9]*" "$OUT3" | head -1)
+    if [ "$last" != "39:20/36" ]; then
+        echo "GATE FAIL: layer 39's sources are ${last:-not found}, expected 39:20/36 - the boundary floor (last shared"
+        echo "           cache layer + 1) moved, so split_min_boundary, the gate and the witness's SPLIT must move with it"
+        rm -f "$OUT3"; exit 1
+    fi
+    echo "ok: candidate layer and the source map match the gate's copy (floor 37, witness --layer-split 37)"
+    rm -f "$OUT3"
+else
+    echo "=== [3/3] skipped: the geometry oracle needs $GEOM_BIN (make the HIP build) and $GGUF ==="
+fi
 
 cat <<'TEXT'
 

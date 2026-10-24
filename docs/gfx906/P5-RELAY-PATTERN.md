@@ -235,7 +235,9 @@ cache would be gigabytes a token.  Therefore:
 > one card, the tail [37,40) on the other.  Boundaries at 3, 9, 15 or 21 - which a reader who knows the GLM engine
 > would guess, since the layer before each is both a kv and an index source - are REFUSED, with the floor named in the
 > message.  `split_boundaries_ok` enforces it before anything is allocated; `build_attn` aborts if a stage is ever
-> built by hand over a ring it does not own.
+> built by hand over a ring it does not own.  The two source lists are not taken on faith: `gate-device-split.sh` step 3
+> asks the engine's own geometry reader (`test_ds41_geometry <file.gguf>`, host-only) for `cand L20 2048x8` and the
+> per-layer map's `39:20/36`, and FAILs the gate if the checkpoint disagrees with the numbers the rule is derived from.
 
 **The payload - two regions on this model, and the third one is provably unreachable.** GLM hands on `x_state` alone:
 
