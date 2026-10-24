@@ -816,7 +816,14 @@ int main(int argc, char ** argv) {
                     const bool moe = G.routed(l);
                     const float * x = nullptr;
                     if (!d.attn_router_n((int) l, pos0 + c0, nn, cids.data(), cw.data(), &x)) return false;
-                    if (moe && !tier.run_chunk((int) l, nn, cids32.data(), cw.data(), x, crouted.data())) return false;
+                    if (moe) {
+                        // The router writes its selection into `cids` (the narrow ids the graphs consume) and the
+                        // tier takes int32: the unsplit feed converts every chunk, and a staged pass that skipped
+                        // the conversion fed the tier whatever cids32 last held (witness #5: every token of the
+                        // run differed, 64/64, because every MoE layer of the prefill ran stale experts).
+                        for (int k = 0; k < nn * top_k; ++k) cids32[(size_t) k] = cids[(size_t) k];
+                        if (!tier.run_chunk((int) l, nn, cids32.data(), cw.data(), x, crouted.data())) return false;
+                    }
                     if (!d.finish_layer_n((int) l, nn, moe ? crouted.data() : nullptr)) return false;
                 }
                 return true;
@@ -834,6 +841,7 @@ int main(int argc, char ** argv) {
             }
             c0 += m;
         }
+        tier.release_chunk();   // the unsplit feed's lifecycle, mirrored: the chunk scratch goes back after a prompt
         return true;
     };
     auto step = [&](int tid, int pos) -> bool {
@@ -886,11 +894,12 @@ int main(int argc, char ** argv) {
     // ---- P5.3 step 1 (opt-in): the staged run.  Built ONLY when --gpus named more than one stage; without it
     // `staged` stays false and every line below behaves exactly as it did, on the single `dense` instance.
     //
-    // Each stage is a GlmDense over its own layer range, and the instances are built ONE AT A TIME: the shared WStore
-    // (--relay-share-seq, the default for a staged run) keeps one stage's dense weights loaded and reuses them for the
-    // next stage, so a staged run costs no more dense memory than the unsplit one.  That is what makes the hand-off
-    // check on one card runnable at all: two stage instances loaded at once would be MORE memory than the whole model,
-    // because stage 0 also holds the token embeddings and the last stage also holds the output head.
+    // Each stage is a GlmDense over its own layer range.  Weight memory is shared, not duplicated: build_stages
+    // hands each stage the OWNER's weight map (adopt_weights, before the stage's init builds its graphs) and the
+    // stage loads nothing of its own - so a staged run costs no more dense memory than the unsplit one.  That is what
+    // makes the hand-off check on one card runnable at all: N full loads would be MORE memory than the whole model,
+    // because stage 0 also holds the token embeddings and the last stage also holds the output head.  (--relay-copy-
+    // weights opts into one load per stage, to measure that sharing with numbers.)
     //
     // What a staged pass does: stage 0 runs its layers, its finished columns go to host staging, the next stage
     // uploads them, copies them into its own columns and runs its layers, and so on to the last stage, whose head runs
