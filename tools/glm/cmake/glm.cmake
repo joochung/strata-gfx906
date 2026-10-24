@@ -24,7 +24,9 @@ target_link_libraries(glm_dense PRIVATE ggml ggml-cpu ggml-base)
 if(TARGET ggml-cuda)
   target_link_libraries(glm_dense PRIVATE ggml-cuda)
 endif()
-set(_glm_inc ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools/glm ${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4)
+# P5.2: tools/gfx906 holds device_split.hpp, the header-only --gpus/--layer-split stage math (header-only so
+# tools/gfx906/test_device_split.cpp can compile it with plain g++, no CUDA/HIP).
+set(_glm_inc ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools/glm ${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4 ${CMAKE_CURRENT_SOURCE_DIR}/tools/gfx906)
 if(TARGET ds4_moe_cuda)
   add_executable(glm_generate ${CMAKE_CURRENT_SOURCE_DIR}/tools/glm/glm_generate.cpp)
   target_include_directories(glm_generate PRIVATE ${_glm_inc})

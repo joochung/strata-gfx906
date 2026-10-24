@@ -24,6 +24,7 @@
 // Load the real model only through tools/ds4/memguard.sh (RAM cap + the shared GPU lock).
 #include "ds41_dense.hpp"
 #include "ds41_moe.hpp"
+#include "device_split.hpp"   // P5.2: the opt-in --gpus/--layer-split stage plan (no-op without --gpus)
 #if defined(DS41_HAVE_DSPARK)
 #include "ds41_dspark.hpp"
 #endif
@@ -86,6 +87,9 @@ struct Args {
     int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
     float skip_miss = 0.0f, skip_file = 0.0f;
     double chunk_prefetch_gib = 0.0;
+    // P5.2 (opt-in): the stage plan from --gpus.  The default is today's single-device run, and without --gpus on the
+    // command line nothing below is filled in - see tools/gfx906/device_split.hpp.
+    strata::gfx906::Split split;
 };
 
 std::vector<int> parse_csv(const std::string & s) {
@@ -97,9 +101,26 @@ std::vector<int> parse_csv(const std::string & s) {
 }
 
 bool parse(int argc, char ** argv, Args & a) {
+    // P5.2 (opt-in): the ONLY new code on this path is this branch, and it runs only when --gpus is on the command
+    // line.  Without that flag, the loop below - and every default in Args - is exactly what it was before: the
+    // byte-identical single-device path of the last release (AGENTS.md).  These flags are read here and NOT passed
+    // to the engine's own option loop, which would exit on an unknown argument.
+    bool asked_gpus = false;
+    for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--gpus") asked_gpus = true;
+    if (asked_gpus) {
+        std::string serr;
+        if (!strata::gfx906::split_args(a.split, argc, argv, serr)) {
+            std::fprintf(stderr, "ds41_generate: %s\n", serr.c_str());
+            return false;
+        }
+    }
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : std::string(); };
+        if (asked_gpus && (k == "--gpus" || k == "--layer-split" || k == "--split-device" || k == "--split-skip-if-fits")) {
+            if (k != "--split-skip-if-fits") (void) next();   // consumed by split_args above
+            continue;
+        }
         if (k == "-m" || k == "--model") a.model = next();
         else if (k == "--ids") a.ids_csv = next();
         else if (k == "--ids-file") a.ids_file = next();
@@ -327,6 +348,29 @@ int main(int argc, char ** argv) {
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds41_generate: dense init: %s\n", err.c_str()); return 1; }
     const Ds41Geometry & G = dense.geom();
     const int n_layer = (int) dense.n_layer(), n_embd = (int) G.n_embd, top_k = (int) G.n_used, nv = (int) G.vocab;
+    // P5.2 (opt-in): with --gpus given, now that the model's layer count is known, work out the stage plan and say
+    // what it is.  Without --gpus this block is skipped entirely and everything above and below is the single-device
+    // path of the last release.
+    if (!a.split.gpus.empty()) {
+        std::string serr;
+        if (!strata::gfx906::split_plan(a.split, dense.n_layer(), serr)) {
+            std::fprintf(stderr, "ds41_generate: %s\n", serr.c_str());
+            return 2;
+        }
+        std::fprintf(stderr, "ds41_generate: %s\n", strata::gfx906::split_describe(a.split).c_str());
+        if (a.split.n_stage > 1) {
+            // P5.2 stops here on purpose: this change lands the flag vocabulary and the stage math ONLY.  Nothing yet
+            // places a stage's weights, KV or pinned host mirrors on their own device, and nothing relays the
+            // activations across, so running the split would compute the later layers on the wrong card.  Refused
+            // loudly rather than silently ignored; --gpus naming ONE card is accepted and runs the path above.
+            // Next tasks: per-stage placement (design 1 and 4, incl. the per-device register_host_buffer at
+            // ds41_dense.cpp:1135-1144) and the cross-device relay (design 3 and 5).
+            std::fprintf(stderr, "ds41_generate: a %d-stage split is parsed and planned (P5.2), but the ported engine "
+                                 "cannot run one yet: no per-stage weight placement and no cross-device relay. Run with "
+                                 "--gpus naming one card for today's behaviour.\n", a.split.n_stage);
+            return 2;
+        }
+    }
     // enc-skip's layer 20: the LAST kv source (every compressed-KV / index-key write is owned by a kv source, and the
     // layers above it only read that owner's state, so the cut belongs there).  Also the window reach R = swa *
     // (n_layer - cut_layer) is what --enc-replay defaults to.
@@ -356,6 +400,10 @@ int main(int argc, char ** argv) {
     }
     Ds41MoeTier tier;
     Ds41MoeConfig mc;
+    // P5.2: the stage count the tier will eventually be given per stage.  Without --gpus this is 1 and the lines below
+    // compute the same values they always did; a real split is refused above (P5.2 does not run one).
+    const int n_stage_v41 = a.split.n_stage;   // 1 unless --gpus named stages
+    (void) n_stage_v41;
     mc.cpu_only = a.experts == "cpu" || ggml_backend_is_cpu(be);
     mc.slots = a.slots > 0 ? a.slots : TG.n_layers * TG.n_experts;
     mc.slot_gib = a.slots > 0 ? 0.0 : slot_gib;

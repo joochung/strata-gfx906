@@ -102,6 +102,11 @@ elseif(TARGET ds41_dense AND TARGET ds41_moe_cpu)
     add_executable(ds41_generate ${_v41_dir}/ds41_generate.cpp)
     target_link_libraries(ds41_generate PRIVATE ds41_dense ds41_moe_cpu)
 endif()
+# P5.2: tools/gfx906 holds device_split.hpp, the header-only --gpus/--layer-split stage math (header-only so
+# tools/gfx906/test_device_split.cpp can compile it with plain g++, no CUDA/HIP).
+if(TARGET ds41_generate)
+    target_include_directories(ds41_generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools/gfx906)
+endif()
 # the tier gate on real mixed-tier experts: CPU flavour (no CUDA call) and the CUDA flavour (--gpu)
 if(TARGET ds41_moe_cpu)
     add_executable(test_ds41_moe ${_v41_dir}/test_ds41_moe.cpp)
