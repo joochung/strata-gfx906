@@ -17,8 +17,10 @@ using strata::gfx906::kRelaySlots;
 using strata::gfx906::RelayCopy;
 using strata::gfx906::RelayPlan;
 using strata::gfx906::RelaySlot;
+using strata::gfx906::RelayStaging;
 using strata::gfx906::relay_boundary_columns;
 using strata::gfx906::relay_plan;
+using strata::gfx906::relay_stage_pass;
 
 extern int g_checks;   // the shared counters of the single gate binary (test_device_split.cpp defines them)
 extern int g_fail;
@@ -144,7 +146,17 @@ static void test_copy_window() {
     CHECK_EQ(c.dst_offset, 2ull * t.stride);
     CHECK_EQ(c.bytes, 3ull * kGlmSlab);
     CHECK_EQ(c.slot, 1);
-    CHECK_EQ(t.slot_base(1, 0) - (const uint8_t *) t.base, (ptrdiff_t) t.stride);
+    // slot_base is nullptr for a plan that was never attached to a buffer (an arithmetic-only plan owns no memory)
+    CHECK(t.slot_base(1, 0) == nullptr);
+    CHECK(t.slot_base_w(1, 0) == nullptr);
+    {
+        std::vector<uint8_t> buf((size_t) t.bytes);
+        t.base = buf.data();
+        CHECK(t.slot_base(1, 0) != nullptr);
+        CHECK_EQ(t.slot_base(1, 0) - (const uint8_t *) t.base, (ptrdiff_t) t.stride);
+        CHECK_EQ(t.slot_base(0, 1) - (const uint8_t *) t.base, (ptrdiff_t)(2 * t.stride));  // slot-major
+        t.base = nullptr;
+    }
     err.clear();
     CHECK_EQ(t.window(0, 0, 3, c, err, 2), false);   // slot 2 does not exist (two slots per boundary)
     CHECK(err.find("slots") != std::string::npos);
@@ -273,10 +285,122 @@ static void test_boundary_columns() {
     CHECK(w < 45);
 }
 
+// The pass driver: the order the stages are run and the boundaries crossed in, and what a slot handed to a
+// successor actually contains.  The stages are stand-ins (no engine, no device): what is under test is the driver's
+// sequencing and its slot bookkeeping, which is what decides whether a successor reads the bytes its producer wrote.
+static void test_pass_driver() {
+    std::string err;
+    // a real staging with a real buffer, 3 stages of a 4-token capacity, a tiny slab so the payload is readable
+    const uint64_t slab = 64;
+    RelayStaging st;
+    CHECK_EQ(st.init(3, 4, slab, err), true);
+    CHECK(st.mem != nullptr);
+    CHECK_EQ(st.plan.n_boundaries, 2);
+    CHECK_EQ(st.plan.bytes, 2ull * kRelaySlots * 4ull * slab);
+
+    std::vector<int> order;          // every callback, in the order it happened
+    std::vector<int> ran, injected;  // which stages ran / received a payload
+    auto run = [&](int s, std::string & e) { order.push_back(100 + s); ran.push_back(s); (void) e; return true; };
+    // The producer stamps the payload with a value the test controls: a slot the driver rotated wrongly, or released
+    // too early, hands the consumer the PREVIOUS pass's bytes, and this is what catches it.
+    int stamp = 0;
+    auto out = [&](int s, uint8_t * p, size_t bytes, std::string & e) {
+        order.push_back(200 + s);
+        for (size_t i = 0; i < bytes; ++i) p[i] = (uint8_t) (stamp + i);
+        (void) e;
+        return true;
+    };
+    auto in = [&](int s, const uint8_t * p, size_t bytes, std::string & e) {
+        order.push_back(300 + s);
+        injected.push_back(s);
+        // the payload came from stage s-1, and every byte of it is what the producer of THIS pass wrote
+        for (size_t i = 0; i < bytes; ++i)
+            if (p[i] != (uint8_t) (stamp + i)) { e = "payload is not the producer's current bytes"; return false; }
+        return true;
+    };
+    auto advance = [&](int s, std::string & e) { order.push_back(400 + s); (void) e; return true; };
+
+    CHECK_EQ(relay_stage_pass(4, st, run, out, in, advance, err), true);
+    // stage 0 runs, hands on, stage 1 receives, runs, hands on, stage 2 receives, runs, and the pass ends there
+    const int want[] = { 100, 200, 301, 101, 201, 302, 102, 402 };
+    CHECK_EQ(order.size(), 8);
+    for (size_t i = 0; i < 8; ++i) CHECK_EQ(order[i], want[i]);
+    CHECK_EQ(ran.size(), 3);
+    CHECK_EQ(injected.size(), 2);
+    CHECK_EQ(injected[0], 1);
+    CHECK_EQ(injected[1], 2);
+    CHECK_EQ(st.plan.in_flight(0), 0);   // nothing left in flight after a clean pass
+    CHECK_EQ(st.plan.in_flight(1), 0);
+
+    // a second pass works the same way (the slots were released, so the driver never starves)
+    order.clear(); ran.clear(); injected.clear();
+    CHECK_EQ(relay_stage_pass(1, st, run, out, in, advance, err), true);
+    CHECK_EQ(order.size(), 8);
+    CHECK_EQ(order[0], 100);
+    CHECK_EQ(order[7], 402);
+
+    // a pass longer than the staging is refused before any stage runs (the caller must split it, never overflow)
+    order.clear();
+    CHECK_EQ(relay_stage_pass(5, st, run, out, in, advance, err), false);
+    CHECK(err.find("capacity") != std::string::npos);
+    CHECK_EQ(order.size(), 0);
+    CHECK_EQ(st.plan.in_flight(0), 0);
+
+    // a stage that fails stops the pass, and its successor never sees a payload
+    auto run_fails = [&](int s, std::string & e) { if (s == 1) { e = "stage 1 died"; return false; } return true; };
+    injected.clear();
+    CHECK_EQ(relay_stage_pass(2, st, run_fails, out, in, advance, err), false);
+    CHECK(err.find("stage 1 died") != std::string::npos);
+    CHECK_EQ(injected.size(), 1);   // boundary 0 crossed, boundary 1 never reached
+    CHECK_EQ(st.plan.in_flight(0), 0);
+
+    // a producer that fails leaves the slot unreleased to nobody: it is released, and the consumer is not called
+    auto out_fails = [&](int, uint8_t *, size_t, std::string & e) { e = "read-out failed"; return false; };
+    injected.clear();
+    CHECK_EQ(relay_stage_pass(2, st, run, out_fails, in, advance, err), false);
+    CHECK(err.find("read-out failed") != std::string::npos);
+    CHECK_EQ(injected.size(), 0);
+    CHECK_EQ(st.plan.in_flight(0), 0);
+    CHECK_EQ(st.plan.in_flight(1), 0);
+
+    // one stage has nothing to relay: the driver says so rather than running the only stage twice
+    RelayStaging solo;
+    CHECK_EQ(solo.init(1, 4, slab, err), true);
+    CHECK_EQ(relay_stage_pass(1, solo, run, out, in, advance, err), false);
+    CHECK(err.find("one stage") != std::string::npos);
+
+    // records what EACH boundary received, so a payload that skipped a boundary or arrived stale is visible
+    std::vector<std::vector<uint8_t>> got;
+    auto record = [&](int s, const uint8_t * p, size_t bytes, std::string & e) {
+        (void) s;
+        got.emplace_back(p, p + bytes);
+        (void) e;
+        return true;
+    };
+    // THE BYTE-IDENTITY CHECK across a rotation: three passes in a row, each producer writing a different pattern,
+    // each consumer receiving exactly the bytes the producer of ITS pass wrote.  A slot released too early, or handed
+    // out in the wrong order, shows up here as the previous pass's bytes.
+    for (int pass = 0; pass < 3; ++pass) {
+        stamp = 100 * (pass + 1);
+        got.clear();
+        CHECK_EQ(relay_stage_pass(2, st, run, out, record, advance, err), true);
+        // 2 tokens x slab bytes, relayed into each of the two boundaries this 3-stage run crosses
+        CHECK_EQ(got.size(), 2ull);
+        for (size_t b = 0; b < got.size(); ++b) {
+            // the callback is handed the WHOLE slot; the pass copies the first n tokens' worth of it
+            CHECK_EQ(got[b].size(), 4ull * slab);   // the staging capacity, so a slot always holds a full pass
+            for (size_t i = 0; i < 2ull * slab; ++i) CHECK_EQ(got[b][i], (uint8_t) (stamp + i));
+        }
+        CHECK_EQ(st.plan.in_flight(0), 0);
+        CHECK_EQ(st.plan.in_flight(1), 0);
+    }
+}
+
 int test_relay_staging_run() {
     test_buffer_size();
     test_copy_window();
     test_slot_rotation();
     test_boundary_columns();
+    test_pass_driver();
     return 0;
 }
