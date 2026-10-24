@@ -295,7 +295,9 @@ static bool staged_pass(StagedRun & sr, int n, int pos0,
         const bool okc = sr.stage[(size_t) s]->relay_read_out(n, sr.stage[(size_t) s]->state_col0(), slot, slot_bytes);
         sr.ms_relay += now_ms() - tr;
         if (!okc) { e = "stage " + std::to_string(s) + ": " + sr.stage[(size_t) s]->last_error(); return false; }
-        std::memcpy(sr.rx.data(), slot, payload);   // readable after the slot is released (the head runs later)
+        // Keep a readable copy: the slot is released as soon as the successor has uploaded it, and the LAST stage's
+        // head runs after that, so the payload it reads must live somewhere of its own.
+        std::memcpy(sr.rx.data(), slot, payload);
         sr.n_boundary++;
         sr.bytes_relayed += payload;
         return true;
@@ -307,7 +309,6 @@ static bool staged_pass(StagedRun & sr, int n, int pos0,
         if (okc) okc = sr.stage[(size_t) s]->stage_relay_inject(n);
         sr.ms_relay += now_ms() - tr;
         if (!okc) { e = "stage " + std::to_string(s) + ": " + sr.stage[(size_t) s]->last_error(); return false; }
-        std::memcpy(sr.rx.data(), slot, payload);
         return true;
     };
     // one call per pass, on the LAST stage: every stage after the first owns no token ids, so it is told where the next
