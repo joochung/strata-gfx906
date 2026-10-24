@@ -19,7 +19,9 @@ using strata::gfx906::split_args;
 using strata::gfx906::split_describe;
 using strata::gfx906::split_plan;
 
-static int g_fail = 0, g_checks = 0;
+// The counters the CHECK macros below use; test_relay_staging.cpp (included at the end of this file) shares them
+// through the g_checks/g_fail declarations it makes there, so ONE binary reports both headers' checks.
+int g_fail = 0, g_checks = 0;
 
 #define CHECK(cond)                                                                                              \
     do {                                                                                                         \
@@ -279,6 +281,10 @@ static void test_describe() {
     CHECK(split_describe(u).find("bit-exact") == std::string::npos);
 }
 
+// P5.3 step 1: the stage-boundary relay's arithmetic (tools/gfx906/relay_staging.hpp).  Included rather than linked
+// so the gate stays one g++ command with no objects and no makefile.
+#include "test_relay_staging.cpp"
+
 int main() {
     test_default_is_single_device();
     test_default_equal_chunks();
@@ -288,6 +294,7 @@ int main() {
     test_validation_errors();
     test_more_stages_than_layers();
     test_describe();
+    test_relay_staging_run();
     std::printf("%s: %d checks, %d failed\n", g_fail ? "FAILED" : "ok", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

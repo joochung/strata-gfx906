@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# gate-device-split.sh - P5.2 gate: the opt-in --gpus/--layer-split stage math of the PORTED engines
-# (tools/gfx906/device_split.hpp), compiled and run with plain g++ so it needs no CUDA, no HIP, no GPU, no model and
-# no RAM headroom.  It makes no runtime claim: it checks parsing and arithmetic only.
+# gate-device-split.sh - P5.2/P5.3 gate: the opt-in --gpus/--layer-split stage math (tools/gfx906/device_split.hpp)
+# and the stage-boundary relay's staging arithmetic (tools/gfx906/relay_staging.hpp) of the PORTED engines, compiled
+# and run with plain g++ so it needs no CUDA, no HIP, no GPU, no model and no RAM headroom.  It makes no runtime
+# claim: it checks parsing and arithmetic only.
 #
 # The full HIP build + ctest gate that this change still needs (it is NOT run here - the build takes ~8 min at high
 # memory and this box may have its RAM committed elsewhere) is printed at the end.
@@ -22,14 +23,18 @@ rm -f "$OUT"
 
 cat <<'TEXT'
 
---- Syntax-only check of the two engine files this change touches (no link, no GPU; needs ROCm + the ggml checkout):
+--- Syntax-only check of the engine files (no link, no GPU; needs ROCm + the ggml checkout).  The flags below are
+    the real ones, harvested from a configured gfx906 build tree's build.ninja (tools/gfx906/syntax-check.sh runs
+    them and prints its exit code for each file):
     WT=$(pwd)
-    hipcc --offload-arch=gfx906 -fsyntax-only -std=c++20 -DDS41_HAVE_DSPARK -DGGML_USE_CPU -DGGML_USE_CUDA \
-        -DSTRATA_HIP_GFX906=1 -DSTRATA_NATIVE_EXPERTS=1 -DSTRATA_Q6K_EXPERTS=1 -D__HIP_PLATFORM_AMD__=1 \
-        -I$WT/include -I$WT/tools/v41/engine -I$WT/tools/gfx906 -I<ggml>/ggml/src/../include \
-        -isystem $WT/include/strata/platform/hip_compat -isystem /opt/rocm/include \
-        tools/v41/engine/ds41_generate.cpp
-    (same, without -DDS41_HAVE_DSPARK and with -I$WT/tools/glm -I$WT/tools/ds4 for tools/glm/glm_generate.cpp)
+    /opt/rocm-7.2.0/lib/llvm/bin/clang++ --offload-arch=gfx906 -fsyntax-only -x hip -std=c++20 \
+        -DGGML_USE_CPU -DGGML_USE_CUDA -DSTRATA_HIP_GFX906=1 -DSTRATA_Q6K_EXPERTS=1 -DSTRATA_VERSION='"gate"' \
+        -D__HIP_PLATFORM_AMD__=1 -DUSE_PROF_API=1 -DSTRATA_NATIVE_EXPERTS=1 \
+        -I/opt/rocm-7.2.0/include -I$WT/include -I$WT/tools/glm -I$WT/tools/ds4 -I$WT/tools/gfx906 \
+        -I/ai/engines/gfx906/llama.cpp-xolotl/ggml/src \
+        -I/ai/engines/gfx906/llama.cpp-xolotl/ggml/src/../include \
+        -isystem $WT/include/strata/platform/hip_compat \
+        tools/glm/glm_dense.cpp tools/glm/glm_generate.cpp
 
 --- Full HIP build gate + ctest vs the baseline fail-set (MEMORY PRECONDITION: this box has no swap; keep at least
     2 GiB MemAvailable - the -j4 here is what tools/gfx906/gate-route-census.sh watches for that.  ~8 minutes):
