@@ -25,6 +25,14 @@
 #include "ds41_dense.hpp"
 #include "ds41_moe.hpp"
 #include "device_split.hpp"   // P5.2: the opt-in --gpus/--layer-split stage plan (no-op without --gpus)
+// P5.3b: the stage-boundary relay.  RELAY_STAGING_IMPL is defined BEFORE the include only in the CUDA build, where
+// the CUDA runtime is reachable and the staging can be mapped + portable host memory (what the native relay uses);
+// the CPU build includes the same header without it and gets ordinary host memory, which relay_staging.hpp documents
+// as correct and merely slower.  Either way a staged run's hand-off goes through this one staging.
+#if defined(DS41_RELAY_PINNED)
+#define RELAY_STAGING_IMPL 1
+#endif
+#include "relay_staging.hpp"   // the staging plan, the pinned-or-plain buffer, and the per-pass copy windows
 #if defined(DS41_HAVE_DSPARK)
 #include "ds41_dspark.hpp"
 #endif
@@ -50,6 +58,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace strata;
@@ -90,6 +99,13 @@ struct Args {
     // P5.2 (opt-in): the stage plan from --gpus.  The default is today's single-device run, and without --gpus on the
     // command line nothing below is filled in - see tools/gfx906/device_split.hpp.
     strata::gfx906::Split split;
+    // P5.3b (opt-in, only meaningful with --gpus naming stages): a staged pass is capped by the staging's capacity,
+    // because one pass's whole payload goes through one slot.  --relay-chunk 0 = the default 64 tokens.
+    int relay_chunk = 0;
+    // --relay-copy-weights: give every stage its OWN copy of the dense weights instead of sharing the one load.  On a
+    // split across cards the stages on other cards load their own range either way (tensors do not live on two cards);
+    // this flag opts the SAME-card stages out of the sharing, to measure what the sharing costs and buys.
+    bool relay_copy_weights = false;
 };
 
 std::vector<int> parse_csv(const std::string & s) {
@@ -121,6 +137,15 @@ bool parse(int argc, char ** argv, Args & a) {
             if (k != "--split-skip-if-fits") (void) next();   // consumed by split_args above
             continue;
         }
+        // P5.3b: the relay's own caps belong to a staged run.  Without --gpus there is one stage, no boundary and
+        // nothing to cap, so naming these flags alone is a mistake worth reporting rather than silently ignoring.
+        if (!asked_gpus && (k == "--relay-chunk" || k == "--relay-copy-weights")) {
+            std::fprintf(stderr, "ds41_generate: --relay-chunk/--relay-copy-weights only mean something with --gpus "
+                                 "naming more than one stage (--gpus 0,1 [--layer-split 21]).\n");
+            return false;
+        }
+        if (k == "--relay-chunk") { a.relay_chunk = std::atoi(next().c_str()); continue; }
+        if (k == "--relay-copy-weights") { a.relay_copy_weights = true; continue; }
         if (k == "-m" || k == "--model") a.model = next();
         else if (k == "--ids") a.ids_csv = next();
         else if (k == "--ids-file") a.ids_file = next();
@@ -258,6 +283,211 @@ double log_softmax_at(const float * lg, int nv, int tok) {
     return (double) lg[tok] - mx - std::log(z);
 }
 
+// ============================================================================ P5.3b: the staged run
+//
+// With --gpus naming more than one stage, the model's layers are split into ranges and every pass runs the stages in
+// order with ONE host-synchronized hand-off per boundary: the producer's finished state columns (x_state + pre_state,
+// plus layer 20's candidate blocks once the boundary is past them) go to host staging, the successor uploads them into
+// the region its first layer reads.  That is tools/gfx906/relay_staging.hpp's staging, driven by relay_stage_pass(),
+// with Ds41Dense::relay_read_out / relay_write_in as the seams.  Without --gpus none of this is allocated: one dense
+// instance runs every layer, byte-identical to the last release.
+//
+// Two staged-run shapes, as in GLM (P5.3): stages on ONE device (--gpus 0,0) are the BIT-EXACT hand-off check - same
+// card, same weights, the only difference being that the state crosses a boundary through the host instead of staying
+// in a tensor.  Stages on DISTINCT devices (--gpus 0,1) are the capability: each stage on a card other than the owner's
+// loads its OWN range of weights, every stage talks to the next through the same host relay, and the expert tier stays
+// on its one card - at this engine's seam it is host-in/host-out, so it does not care which cards the layers ran on
+// between its calls.
+//
+// WHY THE BOUNDARY IS LEGAL AT ALL (Ds41Dense::split_boundaries_ok, enforced by build_stages): a stage's last layer
+// must be the producer of the compressed KV and the index keys its successor's layers read.  Those rings are the only
+// persistent state a boundary cannot carry (relaying them per token would be a copy of the whole visible cache every
+// pass), and the rule makes it so a successor only ever reads the rings of the stage BEFORE it - which on a split
+// across cards means the producer's rings are never read by a stage that does not hold them.
+struct StagedRun {
+    // Ds41Dense is pimpl'd and non-copyable, so the stages live as unique_ptrs in a vector of POINTERS.
+    std::vector<std::unique_ptr<Ds41Dense>> stage;   // one instance per stage, in layer order
+    std::vector<Ds41DenseConfig> cfg;                // the config each stage was built with (kept for the startup line)
+    strata::gfx906::RelayStaging st;                 // the pinned-or-plain staging between them
+    size_t slab = 0;                                 // relay_slab_bytes(): the same on every stage
+    // The relayed payload's regions, from the geometry: cand = cand_layer's candidate blocks ride along, xs / ps =
+    // the x_state and pre_state columns, cb = their cand bytes.  A staged run that puts layer 20's producer and its
+    // readers on ONE card relays the state only (cb 0) and reads the producer's candidate tensor in place.
+    bool cand_relay = true;
+    size_t xs = 0, ps = 0, cb = 0;
+    // True when the candidate column CROSSES a boundary in this split, i.e. some stage after the producer reads it
+    // (by relay or in place).  -1 = the producer and every reader are in ONE stage and nothing crosses at all, which
+    // is what makes the slab the same number on every stage.
+    std::vector<int> cols_of;                      // [stage] the columns THAT stage was sized for (see ::cols)
+    std::vector<std::vector<int>> forced;          // STRATA_FORCE_IDS per stage: stage s decodes the same stream
+    int cand_owner = -1;                             // the stage that RUNS cand_layer (the producer the readers follow)
+    int cap = 0;                                     // tokens per staged pass (min of --relay-chunk and the pass size)
+    // The state columns a staged run cycles: a pass of S tokens runs at column (pos / S) % (NC / S), so a prompt of
+    // any length fits NC columns and the position-indexed rings evict only rows behind the pass's reach.  Read back
+    // from the first stage after init (the run cannot know it before the instance sized it).
+    int64_t cols = 0;
+    std::vector<int64_t> lb, le;                     // the stage ranges, from the split plan
+    std::vector<int> dev;                            // the card each stage runs on (a.split.dev, from --gpus)
+    // The pass cap a STAGE may run, by ratio: the compressed rows a stage of THIS range ranks over are the visible
+    // rows MINUS the rows its own range has not produced (a stage's rings hold only [lb, state_end)'s output, so the
+    // rows it lacks are exactly floor(lb/r)).  One engine-wide cap - the last stage's, the only range that ever sees
+    // the whole prefix - makes an EARLIER stage's rings overrun the columns it allocated while the prefix is short and
+    // trip a spurious assert once the prefix is long.  The first bug this port found, on a split run only.
+    std::vector<std::array<int64_t, 3>> cap_of;      // [stage][ratio]
+    std::vector<int> pcap;                           // [stage] the cap actually set (set_pass_cap)
+    // THE UNIT THE RELAY SEES.  Every stage runs the pass piecewise inside its own window, so the producer's columns
+    // for a unit are at a FIXED column (unit index * its stage's cap) - but the consumer's offset inside the relayed
+    // block is its own unit index * ITS cap, and the two agree token-for-token only if the pieces line up.  They do
+    // when the pass is one unit for every stage, which is what this is: the whole run - prefill chunks and decode
+    // steps alike - is driven in units of `unit`, and a larger prompt is a sequence of units (see staged_feed).
+    // min of the per-stage caps, so no stage ever subdivides a unit.
+    int unit = 0;
+    std::vector<ggml_backend_t> extra_be;            // backends of the cards other than the owner's (kept alive here)
+    std::string err;
+    // what the relay cost, so a staged run can be compared against the same run unsplit
+    double ms_relay = 0;
+    uint64_t n_pass = 0, n_boundary = 0, bytes_relayed = 0;
+    /// The absolute position of the unit the pass loop is running, set by the caller right before staged_pass.  The
+    /// staging callback is the engine's seam and has no position of its own, so it travels here (the alternative, a
+    /// position in the callback's signature, would put a value only the run knows into the shared hand-off shape).
+    int64_t pos_of = 0;
+
+    /// The stage that owns `l` (the run's layer loop asks this every layer).
+    int owner(int64_t l) const {
+        for (size_t s = 0; s < le.size(); ++s) if (l < le[s]) return (int) s;
+        return (int) le.size() - 1;
+    }
+};
+
+// One stage's pass: every layer it owns, over the pass's n tokens.  This is the ONE shape a staged run uses (the
+// sequential chunk pass, n = 1 for a decode step), for a prompt and for a decode alike - the layer-major batch is not
+// relayed (see the note where PB is dropped).  Predict-based prefetching and the fused finish+predict are deliberately
+// left out, as in GLM's staged pass: both are hints, so leaving them out cannot change a token, and keeping the staged
+// loop to attn_router -> experts -> finish is what makes it auditable against the unsplit path.
+//
+//   ids / wts   the stage's host buffers for its own pass (n * n_used each) - the run's, sized for the pass cap
+//   routed      n * n_embd, the experts' weighted sum for one layer (the run's, sized for the pass cap)
+//   experts(l, ids, wts, fn, n, routed)
+//               fill routed with layer l's routed experts' weighted sum.  The tier is the CALLER's and stays on its own
+//               card: at this engine's seam it is host-in / host-out, so which card the layers ran on does not matter.
+static bool staged_stage_layers(StagedRun & sr, int s, int n, int * ids, float * wts, float * routed,
+                                const std::function<bool(int l, const int * ids, const float * wts, const float * fn,
+                                                          int n, float * out)> & experts,
+                                std::string & err) {
+    Ds41Dense & d = *sr.stage[(size_t) s];
+    for (int64_t l = sr.lb[(size_t) s]; l < sr.le[(size_t) s]; ++l) {
+        const float * fn = nullptr;
+        if (!d.attn_router((int) l, ids, wts, &fn)) { err = d.last_error(); return false; }
+        if (!experts((int) l, ids, wts, fn, n, routed)) { err = "tier refused at layer " + std::to_string(l); return false; }
+        if (!d.finish((int) l, routed)) { err = d.last_error(); return false; }
+    }
+    return true;
+}
+
+/// The ggml GPU devices this build sees, counted in the SAME order --gpus indexes: the owner's dense backend is
+/// init_by_type(GPU), which takes the first GPU of this enumeration, so index 0 here is index 0 there.
+static size_t gpu_backend_count() {
+    size_t n = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i)
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) ++n;
+    return n;
+}
+
+/// A backend on the idx-th GPU device - a SECOND card, since the owner already holds the first.  The run owns the
+/// returned backend and must keep it alive past every stage that runs on it (StagedRun::extra_be).
+static ggml_backend_t gpu_backend_at(int idx) {
+    int seen = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        if (seen++ == idx) return ggml_backend_dev_init(d, nullptr);
+    }
+    return nullptr;
+}
+
+/// How the user would name a same-device split of n_stage stages on the first card ("0,0", "0,0,0", ...), for the
+/// refusal message of a split across cards: the example has to match the stage count the user actually asked for.
+static std::string same_device_example(int n_stage) {
+    std::string r;
+    for (int i = 0; i < n_stage; ++i) r += (i ? ",0" : "0");
+    return r;
+}
+
+// One staged pass of n tokens at positions [pos0, pos0+n): every stage runs its own layers over the same tokens, and at
+// each boundary the producer's finished columns go through one staging slot to the stage after it.  The staging is the
+// caller's (StagedRun::st), so a sequence of passes shares the double-buffered slots and the driver's rotation.
+//
+//   run_stage(s, n)   the CALLER's layer loop for stage s over this pass's tokens.  The MoE tier is the caller's, so the
+//                     routed half stays with the engine (splitting it is P5.4).
+//   finish_head(n)    the last stage's head over this pass's rows (its own state, as unsplit).
+//
+// The pass's whole payload (n * slab bytes) must fit the staging: relay_stage_pass says so before any stage runs, and
+// the caller splits a longer prompt into passes (see --relay-chunk).
+static bool staged_pass(StagedRun & sr, int n, int pos0,
+                        const std::function<bool(int stage, int n, int pos)> & run_stage,
+                        const std::function<bool(int n)> & finish_head, std::string & err) {
+    // pos0 is the UNIT INDEX, which is also the column the unit runs in for stage 0 (see StagedRun::unit): the later
+    // stages get the absolute position from relay_write_in, so the value a stage's graphs use is the run's business.
+    // n is at most one UNIT (staged_pass's callers chunk by sr.unit) and sr.unit is the NARROWEST stage window, so
+    // every stage runs the pass in one piece at column 0 of its own window: the boundary's payload offset is 0 on both
+    // sides and a token's column is the same index in the producer and in the consumer.  A per-stage subdivision here
+    // would make the two sides' column maps disagree (a piece at producer column k lands at consumer column k *
+    // cap_consumer / cap_producer), which is the bug the unit is designed out of.
+    const auto run = [&](int stage, std::string & e) -> bool {
+        if (n > sr.pcap[(size_t) stage]) {
+            e = "stage " + std::to_string(stage) + ": a pass of " + std::to_string(n) + " tokens exceeds its window of " +
+                std::to_string(sr.pcap[(size_t) stage]);
+            return false;
+        }
+        if (!run_stage(stage, n, pos0)) {
+            e = "stage " + std::to_string(stage) + ": " + sr.stage[(size_t) stage]->last_error();
+            return false;
+        }
+        return true;
+    };
+    // the producer's state region into the slot: one D2H of n token slabs, host-synchronized inside Ds41Dense
+    // The producer writes the state regions and, when the candidates cross a card, its candidate column too.  The
+    // WHOLE pass's columns go over in one slot: the pieces above all landed inside the producer's window, and the
+    // consumer sub-divides them the same way on its side.
+    const auto stage_out = [&](int s, uint8_t * slot, size_t slot_bytes, std::string & e) -> bool {
+        const double tr = now_ms();
+        // The producer writes the state regions and, when the candidates cross a card, its candidate column too.
+        // That is the SLAB minus cand_owner's candidate bytes: the instance itself was told which regions it owns.
+        const bool with_cand = sr.cand_owner < 0 || sr.cand_relay || s != sr.cand_owner;
+        const size_t bytes = with_cand ? sr.slab : sr.slab - sr.cb;
+        (void) slot_bytes;   // the instance sizes the copy by its OWN slab (see relay_read_out's comment)
+        const bool okc = sr.stage[(size_t) s]->relay_read_out(n, slot, bytes);
+        sr.ms_relay += now_ms() - tr;
+        if (!okc) { e = "stage " + std::to_string(s) + ": " + sr.stage[(size_t) s]->last_error(); return false; }
+        sr.n_boundary++;
+        sr.bytes_relayed += bytes;
+        return true;
+    };
+    // the slot straight into the consumer's state region - the region its first layer reads (no landing pad)
+    const auto stage_in = [&](int s, const uint8_t * slot, size_t slot_bytes, std::string & e) -> bool {
+        const double tr = now_ms();
+        const bool with_cand = sr.cand_owner < 0 || sr.cand_relay || s != sr.cand_owner + 1;
+        const size_t bytes = with_cand ? sr.slab : sr.slab - sr.cb;
+        (void) slot_bytes;   // the instance sizes the copy by its OWN slab (see relay_write_in's comment)
+        // pos0 is the unit index; the position the payload lands at is the run's, and the caller passes it in via
+        // sr.pos_of (set by staged_feed / staged_step just before the pass).
+        const bool okc = sr.stage[(size_t) s]->relay_write_in(n, slot, bytes, sr.pos_of);
+        sr.ms_relay += now_ms() - tr;
+        if (!okc) { e = "stage " + std::to_string(s) + ": " + sr.stage[(size_t) s]->last_error(); return false; }
+        return true;
+    };
+    // called ONCE per pass, on the LAST stage, after its layers ran: the head, and nothing else.  Each stage's own
+    // position bookkeeping is the last release's, unchanged (GLM's witness #4 saw a per-pass advance layered on top
+    // of that double the count and refuse the second pass).
+    const auto advance = [&](int s, std::string & e) -> bool {
+        // The head reads this pass's rows, which are the whole unit (see above).
+        if (!finish_head(n)) { e = "head: " + sr.stage[(size_t) s]->last_error(); return false; }
+        ++sr.n_pass;
+        return true;
+    };
+    return strata::gfx906::relay_stage_pass(n, sr.st, run, stage_out, stage_in, advance, err);
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -310,13 +540,42 @@ int main(int argc, char ** argv) {
     dc.backend = be;
     dc.n_threads = a.threads > 0 ? a.threads : 8;
     dc.ctx_max = ctx;
+    // ---- P5.3b (opt-in): the pass the STAGES are sized for, decided before the instance is built because init() is
+    // what sizes the state columns.  A staged pass carries the whole pass's payload through one staging slot, so the
+    // staging's capacity (--relay-chunk, default 64 tokens) caps the pass and with it every per-token buffer of every
+    // stage.  One named device is one stage whatever the layer points say, and that is not a staged run.  Without
+    // --gpus these lines change nothing and dc.max_pass is S, exactly as in the last release.
+    int relay_pass_cap = 0;   // the staged run's pass cap (0 = not staged); set below from --gpus alone
     // the layer-major batch B: --prompt-batch, capped to the prompt length for a one-shot run (the state tensors hold
     // B columns, so a short prompt must not pay for the flag's full size; --serve sizes for the largest request)
-    const int PB = a.prompt_batch > 0 ? (a.serve ? a.prompt_batch : (int) std::min<int64_t>(a.prompt_batch, (int64_t) prompt.size())) : 0;
+    int PB = a.prompt_batch > 0 ? (a.serve ? a.prompt_batch : (int) std::min<int64_t>(a.prompt_batch, (int64_t) prompt.size())) : 0;
+    // A staged run cannot relay a layer-major batch (see the note below): it runs the sequential chunk path, so the
+    // batch's state columns and their ~2.6 GiB at 8192 columns are not allocated at all.  Decided from --gpus alone,
+    // because PB is what dc.prompt_batch (and thus the state's column count) is sized from.
+    if (!a.split.gpus.empty()) {
+        std::vector<int> gpus_named;
+        if (strata::gfx906::split_ints(a.split.gpus, gpus_named) && gpus_named.size() > 1) {
+            // The STATE columns stay at the prompt batch (a staged pass cycles them; see the note where sr.cols is
+            // read back); what a staged run cannot relay is the layer-major WALK, so the engine never calls
+            // begin_batch / attn_router_span / finish_span.  dc.prompt_batch therefore keeps its value - and if the
+            // caller turned the batch off entirely (--prompt-batch 0), the state would be sized to ONE window and a
+            // pass could never cycle, so a staged run takes its column budget from the relay unit instead.
+            const int cap_hint = std::min(a.relay_chunk > 0 ? a.relay_chunk : 64, std::max(1, a.prefill_chunk));
+            const int cols_hint = std::max(PB, 32 * cap_hint);   // the number dc.prompt_batch gets below
+            std::fprintf(stderr, "relay: the layer-major prompt path is not relayed; running the sequential chunk path "
+                                 "in %d-column passes (state columns %d)\n",
+                         a.relay_chunk > 0 ? a.relay_chunk : 64, cols_hint);
+            relay_pass_cap = std::min(a.relay_chunk > 0 ? a.relay_chunk : 64, std::max(1, a.prefill_chunk));
+        }
+    }
     // the dense sub-batch size S: --prefill-chunk, or 512 with a layer-major prompt batch and no chunk size given
     const int S = a.prefill_chunk > 0 ? a.prefill_chunk : (a.prompt_batch > 0 ? 512 : 1);
-    dc.max_pass = S;
-    dc.prompt_batch = PB;
+    // A staged pass is the unit the relay moves, so S is the pass cap; every stage gets the same max_pass (build_stages
+    // refuses a mismatch: a relayed column is only the same tensor on both sides if both sides sized it the same way).
+    dc.max_pass = relay_pass_cap > 0 ? relay_pass_cap : S;
+    // A staged run needs MORE columns than one pass (the passes cycle through them; see StagedRun::cols), and it never
+    // runs the layer-major walk that would otherwise have grown them, so --prompt-batch doubles as its column budget.
+    dc.prompt_batch = relay_pass_cap > 0 ? std::max(PB, 32 * relay_pass_cap) : PB;
     // --serve: elastic state columns (STRATA_ELASTIC_COLS=0 = the fixed prompt_batch columns): decode keeps S columns and
     // the ~0.31 MiB a column of a big prompt batch (2.6 GiB at 8192) goes to VRAM expert slots; a layer-major batch
     // grows them (the VRAM cache is released for it anyway) and gives them back.  s11: 2.6 GiB of slots = 10-20% of a
@@ -336,6 +595,11 @@ int main(int argc, char ** argv) {
         enc_skip = false;
     }
     if (enc_skip && PB <= 1) { std::fprintf(stderr, "ds41_generate: --enc-skip needs the layer-major prompt path (--prompt-batch >= 2)\n"); return 2; }
+    // ---- P5.3b (opt-in): a STAGED run is a chunk-path run, because the layer-major batch walks ONE instance's state
+    // columns sub-batch by sub-batch (begin_batch / attn_router_span / finish_span) and the relay has no seam for that
+    // shape - the producer's columns would be written by another stage's graphs.  A staged run therefore takes the
+    // sequential chunk path (a pass of at most --relay-chunk tokens through every stage, which is what the relay was
+    // built for): PB was zeroed above, which turns enc-skip off through the PB > 1 default and the check just above.
     int64_t ER = enc_skip ? (int64_t) a.enc_replay : 0;
     dc.engram_dirs = a.engram;
     dc.act_quant = a.act_quant;
@@ -348,9 +612,11 @@ int main(int argc, char ** argv) {
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds41_generate: dense init: %s\n", err.c_str()); return 1; }
     const Ds41Geometry & G = dense.geom();
     const int n_layer = (int) dense.n_layer(), n_embd = (int) G.n_embd, top_k = (int) G.n_used, nv = (int) G.vocab;
-    // P5.2 (opt-in): with --gpus given, now that the model's layer count is known, work out the stage plan and say
-    // what it is.  Without --gpus this block is skipped entirely and everything above and below is the single-device
-    // path of the last release.
+    // P5.2 planned the stage; P5.3b RUNS it.  With --gpus given, now that the model's layer count is known, work out
+    // the plan, check it against what this engine can actually relay, and say what it is.  Without --gpus this block is
+    // skipped entirely and everything above and below is the single-device path of the last release.
+    bool staged = false;
+    StagedRun sr;
     if (!a.split.gpus.empty()) {
         std::string serr;
         if (!strata::gfx906::split_plan(a.split, dense.n_layer(), serr)) {
@@ -359,16 +625,83 @@ int main(int argc, char ** argv) {
         }
         std::fprintf(stderr, "ds41_generate: %s\n", strata::gfx906::split_describe(a.split).c_str());
         if (a.split.n_stage > 1) {
-            // P5.2 stops here on purpose: this change lands the flag vocabulary and the stage math ONLY.  Nothing yet
-            // places a stage's weights, KV or pinned host mirrors on their own device, and nothing relays the
-            // activations across, so running the split would compute the later layers on the wrong card.  Refused
-            // loudly rather than silently ignored; --gpus naming ONE card is accepted and runs the path above.
-            // Next tasks: per-stage placement (design 1 and 4, incl. the per-device register_host_buffer at
-            // ds41_dense.cpp:1135-1144) and the cross-device relay (design 3 and 5).
-            std::fprintf(stderr, "ds41_generate: a %d-stage split is parsed and planned (P5.2), but the ported engine "
-                                 "cannot run one yet: no per-stage weight placement and no cross-device relay. Run with "
-                                 "--gpus naming one card for today's behaviour.\n", a.split.n_stage);
-            return 2;
+            // THE KV RULE, checked before anything is allocated, so a bad --layer-split is a message and not a stage
+            // that fails mid-graph.  This model's boundaries are its kv AND index source layers: 2, 8, 14, 20, 24, 28,
+            // 32, 36 (for a 40-layer build), so --layer-split 21 is refused and --layer-split 20 is not.
+            std::vector<int64_t> ends(a.split.end);
+            ends.pop_back();   // the last stage ends the model; that boundary is not a boundary
+            std::string berr;
+            if (!Ds41Dense::split_boundaries_ok(G, ends, berr)) {
+                std::fprintf(stderr, "ds41_generate: --layer-split %s: %s\n", a.split.layer_split.c_str(), berr.c_str());
+                return 2;
+            }
+            // the candidate-blocks rule (P5.3b).  cand_layer's layer picks the 2048 blocks the later indexers rank
+            // inside, and its writer and readers cannot share a graph once a boundary separates them.  Two ways to run
+            // anyway: on ONE card the readers point at the producer's own tensor (no copy, the producer's bits), and
+            // across cards the candidate column rides in the relay payload - Ds41Dense moves it as the third region of
+            // the same contiguous copy as x_state and pre_state, so it costs CB ints a token (8 KiB) and one memcpy.
+            // What is NOT allowed is a same-device split that leaves the candidates to nobody (a reader would use a
+            // column that was never written) or a stage range that skips the producer entirely.
+            {
+                std::string cerr;
+                // The real question is whether the CANDIDATE column crosses a card: a same-card boundary may borrow the
+                // producer's tensor in place, a cross-card one must relay it.  Passing cross_card = false for a same-card
+                // split lets the rule below choose the in-place read; a split that strands the producer (its readers two
+                // or more stages away) is refused by the function itself, whichever way the cards fall.
+                const bool crosses_card = !a.split.same_device;
+                std::vector<int64_t> ends_for_cand = ends;
+                ends_for_cand.push_back((int64_t) G.ratio.size());   // the last stage's end, so stage_of() sees every stage
+                if (!Ds41Dense::stages_keep_candidates_local(G, ends_for_cand, /* cross_card = */ crosses_card, cerr)) {
+                    // cand_layer and its readers are in different stages: decide who produces the column.
+                    int own = -1;
+                    for (size_t s = 0; s < sr.le.size(); ++s)
+                        if (sr.lb[s] <= G.cand_layer && G.cand_layer < sr.le[s]) own = (int) s;
+                    if (own < 0) {
+                        std::fprintf(stderr, "ds41_generate: --layer-split %s: no stage owns layer %lld, which picks the "
+                                             "candidate blocks the later indexers rank inside\n",
+                                     a.split.layer_split.c_str(), (long long) G.cand_layer);
+                        return 2;
+                    }
+                    // RELAY ACROSS CARDS ONLY WHEN THE COLUMN ACTUALLY CROSSES ONE.  A boundary inside the producer's
+                    // own stage has nothing to hand over, and a payload that carries the candidates anyway would move
+                    // bytes no stage reads (and change the slab on the wrong side of the split).
+                    const bool crosses_boundary = (int64_t) G.cand_layer + 1 < G.ratio.size() &&
+                                                  ends_for_cand[(size_t) own] > (int64_t) G.cand_layer + 1;
+                    sr.cand_owner = crosses_boundary ? own : -1;
+                    sr.cand_relay = crosses_boundary && crosses_card;   // one card: read the producer's tensor in place
+                    if (sr.cand_owner >= 0)
+                        std::fprintf(stderr, "relay: layer %lld's candidate blocks (stage %d) %s the stages after it\n",
+                                     (long long) G.cand_layer, own,
+                                     sr.cand_relay ? "are relayed to" : "are read in place by");
+                }
+            }
+            // A split across cards needs a CUDA build (the CPU backend has one "device") and every named device below
+            // this build's GPU count - ggml would otherwise hand back no backend and the stage would init against NULL.
+            if (!a.split.same_device) {
+                const size_t ngpu = gpu_backend_count();
+                bool ok = a.backend == "cuda";
+                for (int s = 0; ok && s < a.split.n_stage; ++s)
+                    ok = a.split.dev[(size_t) s] >= 0 && (size_t) a.split.dev[(size_t) s] < ngpu;
+                if (!ok) {
+                    std::fprintf(stderr, "ds41_generate: a %d-stage split across devices (%s) needs --backend cuda and every "
+                                         "named device below this build's GPU count (%zu).  Same-device stages (--gpus %s) "
+                                         "run the relayed staged path and are the bit-exact hand-off check.\n",
+                                 a.split.n_stage, a.split.gpus.c_str(), ngpu, same_device_example(a.split.n_stage).c_str());
+                    return 2;
+                }
+            }
+            staged = true;
+            sr.cap = relay_pass_cap;
+            for (int s = 0; s < a.split.n_stage; ++s) {
+                sr.lb.push_back(a.split.begin(s));
+                sr.le.push_back(a.split.end[(size_t) s]);
+                sr.dev.push_back(a.split.dev[(size_t) s]);
+                sr.stage.push_back(std::make_unique<Ds41Dense>());
+            }
+            std::string devs;
+            for (size_t s = 0; s < sr.dev.size(); ++s) devs += (s ? "," : "") + std::to_string(sr.dev[s]);
+            std::fprintf(stderr, "relay: staged run, %d stage(s) on device(s) %s, pass cap %d tokens (--relay-chunk)\n",
+                         a.split.n_stage, devs.c_str(), sr.cap);
         }
     }
     // enc-skip's layer 20: the LAST kv source (every compressed-KV / index-key write is owned by a kv source, and the
@@ -400,10 +733,29 @@ int main(int argc, char ** argv) {
     }
     Ds41MoeTier tier;
     Ds41MoeConfig mc;
-    // P5.2: the stage count the tier will eventually be given per stage.  Without --gpus this is 1 and the lines below
-    // compute the same values they always did; a real split is refused above (P5.2 does not run one).
+    // P5.3b: SPECULATIVE DECODE (DSpark) and a STAGED RUN DO NOT COMBINE, and the reason is worth spelling out because
+    // it is the KV rule again.  DSpark drafts k tokens and verifies them in ONE dense pass: the draft tokens' positions
+    // are written to the caches and then REJECTED, and the next pass overwrites those positions.  That is safe in one
+    // instance because every layer reads the same caches it wrote, but a stage boundary sits between two instances with
+    // their own rings: the producer's successors read positions the producer's own verification already superseded, and
+    // a relay hands over a column whose layer 20 candidates were chosen against a state that has since moved.  So a
+    // staged run decodes one accepted token per pass.  (The native relay has the same shape: the split drives prefill
+    // chunks, not draft trees.)
+    //
+    // The tier stays on ONE card, the card the dense owner (device 0 of --gpus) runs on.  It is host-in /
+    // host-out at this engine's seam (attn_router hands back fn on the host, finish takes routed_sum on the host), so
+    // it does not care which cards the layers ran on between its calls - and Ds41MoeConfig::device makes it name its
+    // own device at every CUDA seam, so a stage setting the ambient device on another card cannot move it.
+    // Without --gpus this is 1 and the lines below compute the same values they always did.
     const int n_stage_v41 = a.split.n_stage;   // 1 unless --gpus named stages
     (void) n_stage_v41;
+    mc.device = a.split.gpus.empty() ? 0 : sr.dev.empty() ? 0 : 0;   // the owner's card; --gpus[0] is stage 0's
+    if (staged && sr.dev[0] != 0) {
+        std::fprintf(stderr, "ds41_generate: --gpus %s names device %d first; the expert tier and the dense owner stay on "
+                             "device 0 (stage 0 must be on the owner's card). Use --gpus 0,...\n",
+                     a.split.gpus.c_str(), sr.dev[0]);
+        return 2;
+    }
     mc.cpu_only = a.experts == "cpu" || ggml_backend_is_cpu(be);
     mc.slots = a.slots > 0 ? a.slots : TG.n_layers * TG.n_experts;
     mc.slot_gib = a.slots > 0 ? 0.0 : slot_gib;
@@ -496,7 +848,176 @@ int main(int argc, char ** argv) {
         }
     };
     apply_bias();   // the prune part now (the prompt routes with it); route_bias again once the VRAM cache is seeded
-    std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, experts %s, %zu classes\n",
+    // ---- P5.3b (opt-in): build the STAGE INSTANCES and the staging.  Nothing here runs when --gpus named one stage;
+    // without --gpus `staged` is false and `dense` runs every layer, as in the last release.
+    //
+    // Order matters: the stages are built from `dense`, which owns the dense weight tensors the same-card stages share;
+    // the route bias then goes to whichever instance owns each layer (a stage owns its own layers, so a staged run sets
+    // the bias on the stage rather than on `dense`, which runs none); and the staging is sized by the pass cap decided
+    // with the split plan.
+    if (staged) {
+        sr.cfg.resize(sr.stage.size());
+        // One backend per card the run uses.  Device 0 is the owner's (`be`, the first GPU); a stage on another card
+        // gets a backend of its own, and build_stages then loads that stage's weights there instead of adopting -
+        // tensors cannot be shared across cards.  The vector keeps those backends alive for the whole run.
+        // The card a backend belongs to, as the index --gpus uses (gpu_backend_at's enumeration).
+        auto be_index = [](ggml_backend_t b) -> int {
+            ggml_backend_dev_t d = ggml_backend_get_device(b);
+            size_t seen = 0;
+            for (size_t k = 0; k < ggml_backend_dev_count(); ++k) {
+                if (ggml_backend_dev_type(ggml_backend_dev_get(k)) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+                if (ggml_backend_dev_get(k) == d) return (int) seen;
+                ++seen;
+            }
+            return -1;
+        };
+        auto be_for = [&](int dev) -> ggml_backend_t {
+            if (dev == 0) return be;
+            for (ggml_backend_t b : sr.extra_be) if (be_index(b) == dev) return b;
+            ggml_backend_t nb = gpu_backend_at(dev);
+            if (nb) sr.extra_be.push_back(nb);
+            return nb;
+        };
+        for (size_t s = 0; s < sr.stage.size(); ++s) {
+            Ds41DenseConfig sc = dc;
+            sc.lb = sr.lb[s];
+            sc.le = sr.le[s];
+            sc.is_first = (s == 0);
+            sc.is_last = (s + 1 == sr.stage.size());
+            sc.backend = be_for(sr.dev[s]);
+            if (!sc.backend) {
+                std::fprintf(stderr, "ds41_generate: stage %zu: cannot open a backend on device %d\n", s, sr.dev[s]);
+                return 2;
+            }
+            // WEIGHTS ARE PER CARD: ggml_backend_cuda_buffer_get_memory gives the host an iGPU device pointer, which
+            // the dGPU's copy engine cannot read (cuMemcpyDtoDAsync between these two devices returns invalid value).
+            // A stage that SHARES a weight store therefore has to run on the card that owns it, and a stage on another
+            // card must load its own tensors (--relay-copy-weights).  Checked against the resolved backends rather than
+            // --gpus, because the owner's card is stage 0's device.
+            if (!a.relay_copy_weights) {
+                static std::unordered_map<const void *, int> be_dev;   // backend -> its index (be_index is a scan)
+                auto dev_of_be = [&](ggml_backend_t b) {
+                    auto it = be_dev.find((const void *) b);
+                    if (it == be_dev.end()) it = be_dev.emplace((const void *) b, be_index(b)).first;
+                    return it->second;
+                };
+                const int owner_dev = dev_of_be(be_for(sr.dev[0]));
+                if (dev_of_be(sc.backend) != owner_dev) {
+                    std::fprintf(stderr, "ds41_generate: stage %zu is on device %d but shares its weights with stage 0 "
+                                         "on device %d, and these two cards cannot read each other's memory; run with "
+                                         "--relay-copy-weights (one weight set per card) or put the stages on one card\n",
+                                 s, sr.dev[s], owner_dev);
+                    return 2;
+                }
+            }
+            sr.cfg[s] = sc;
+        }
+        if (a.relay_copy_weights) {   // the measured alternative: one weight set per stage (more memory than the model)
+            for (size_t s = 0; s < sr.stage.size(); ++s)
+                if (!sr.stage[s]->init(a.model, sr.cfg[s], err)) {
+                    std::fprintf(stderr, "ds41_generate: stage %zu: %s\n", s, sr.stage[s]->last_error().c_str());
+                    return 2;
+                }
+        } else if (!dense.build_stages(sr.stage, sr.cfg, err)) {
+            std::fprintf(stderr, "ds41_generate: staged run: %s\n", err.c_str());
+            return 2;
+        }
+        // The candidate-block decision (see the split check above): on one card, every stage AFTER the producer reads
+        // the producer's column in place and so holds no candidate region of its own; across cards (or when this stage
+        // IS the producer or the first reader) the region rides in the payload.  Setting it changes a stage's
+        // relay_slab_bytes(), so it happens before the staging is sized and before the slabs are compared.
+        //
+        // A borrowed column is read at THIS stage's pass offset while the producer wrote it at ITS OWN, so the two
+        // stages must run the same pass width - which is why a same-card split that borrows keeps every stage at the
+        // single cap sr.cap (the pre-build check above refused any split where that would overrun a stage's rings).
+        if (sr.cand_owner >= 0) {
+            for (size_t s = 0; s < sr.stage.size(); ++s) {
+                const bool borrow = !sr.cand_relay && (int) s > sr.cand_owner;
+                sr.stage[s]->relay_cand_from(borrow ? sr.stage[(size_t) sr.cand_owner].get() : nullptr);
+            }
+        }
+        sr.slab = sr.stage[0]->relay_slab_bytes();
+        for (size_t s = 0; s < sr.stage.size(); ++s)
+            if (sr.stage[s]->relay_slab_bytes() != sr.slab) {   // init's geometry check makes this a formality
+                std::fprintf(stderr, "ds41_generate: stage %zu's token slab is %zu bytes, the model's is %zu - the "
+                                     "staging cannot line them up\n", s, sr.stage[s]->relay_slab_bytes(), sr.slab);
+                return 2;
+            }
+        // Every stage was built at dc.max_pass = sr.cap (build_stages requires the configs to agree), so every stage's
+        // pass window is sr.cap and the unit is sr.cap: one piece per stage per pass, column for column.
+        for (size_t s = 0; s < sr.stage.size(); ++s) sr.pcap.push_back(sr.cap);
+        sr.unit = sr.cap;
+        sr.cols = (int64_t) 1 << 60;   // the passes cycle through the NARROWEST stage's columns (see below)
+        for (size_t s = 0; s < sr.stage.size(); ++s) {
+            const int c = sr.stage[s]->columns();
+            sr.cols_of.push_back(c);
+            // A column belongs to a stage only if that stage ALLOCATED it.  A --relay-copy-weights stage on another
+            // card sizes its own state (its own config, its own VRAM), and a smaller one bounds the whole run: a pass
+            // the producer ran at column 192 would land past a consumer with 128 columns.
+            if ((int64_t) c < sr.cols) sr.cols = c;
+        }
+        // THE PROMPT BATCH IS A STAGED RUN'S COLUMN BUDGET.  A staged run drops the layer-major batch (PB = 0), so
+        // without this the state would be sized to ONE window and a pass could never cycle: the run would either stop
+        // at the first window or overwrite its own state.  A staged run therefore always allocates the prompt batch's
+        // columns (--prompt-batch, the same number an unsplit run sizes its layer-major batch from), and says so.
+        // The layer-major WALKS (begin_batch / attn_router_span / finish_span) still never run: the relay has no seam
+        // for a sub-batch another stage's graphs wrote.
+        if (a.prompt_batch > 0)
+            std::fprintf(stderr, "relay: %lld state columns for the run (the narrowest stage of %zu; --prompt-batch %d): "
+                                 "the staged pass cycles them, a pass at column (pos / %d) %% %lld\n",
+                         (long long) sr.cols, sr.stage.size(), a.prompt_batch, sr.unit,
+                         (long long) std::max<int64_t>(1, sr.cols / sr.unit));
+        for (size_t s = 0; s < sr.cols_of.size(); ++s)
+            if ((int64_t) sr.cols_of[s] != sr.cols)
+                std::fprintf(stderr, "relay: note: stage %zu was sized for %d columns; the run cycles %lld\n",
+                             s, sr.cols_of[s], (long long) sr.cols);
+        sr.xs = (size_t) (G.n_embd * G.hc * 4);   // a token's x_state column
+        sr.ps = (size_t) (G.hc * 4);              // ... and its pre_state column
+        sr.cb = sr.slab - sr.xs - sr.ps;          // 0 unless the candidates ride along
+        if ((int64_t) sr.cb != (int64_t) (sr.cand_relay ? G.cand_blocks * 4 : 0)) {
+            std::fprintf(stderr, "ds41_generate: the token slab is %zu bytes = x %zu + pre %zu + %zu; expected %lld of "
+                                 "candidate bytes (%s): the relay's layout and the model's do not agree\n",
+                         sr.slab, sr.xs, sr.ps, sr.cb, (long long) (sr.cand_relay ? G.cand_blocks * 4 : 0),
+                         sr.cand_relay ? "carried" : "not carried");
+            return 2;
+        }
+        // The route bias is per layer, and on a staged run each layer belongs to a stage: hand it there.  (`dense`
+        // still holds the weights the stages share, but it runs no layers, so a bias set only on it would be lost.)
+        {
+            std::vector<float> rb((size_t) TG.n_experts, 0.0f);
+            for (int64_t l = 0; l < TG.n_layers; ++l) {
+                for (int64_t e = 0; e < TG.n_experts; ++e)
+                    rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)])
+                                         ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f) : 0.0f;
+                sr.stage[(size_t) sr.owner(l)]->set_route_bias((int) l, rb.data());
+            }
+        }
+        // The staging is sized by the UNIT (see StagedRun::unit): one unit's slab bytes per slot.  A prompt longer than
+        // a unit is a sequence of units, so a payload never exceeds its slot and no stage subdivides mid-pass - the only
+        // way the producer's columns and the consumer's offset stay the SAME token's columns.
+        std::string rerr;
+        if (!sr.st.init((int) sr.stage.size(), (uint64_t) sr.unit, (uint64_t) sr.slab, rerr)) {
+            std::fprintf(stderr, "ds41_generate: %s\n", rerr.c_str());
+            return 2;
+        }
+        if ((int64_t) sr.st.plan.capacity < sr.unit) {   // relay_plan halves a capacity the byte budget will not hold
+            std::fprintf(stderr, "ds41_generate: the staging fits %lld-token units, less than the %d-token unit the "
+                                 "narrowest stage's pass window needs (lower --relay-chunk)\n",
+                         (long long) sr.st.plan.capacity, sr.unit);
+            return 2;
+        }
+        sr.cap = sr.unit;   // the pass the engine runs IS a unit; --relay-chunk asked for at most this
+        std::fprintf(stderr, "relay: token slab %zu bytes (x_state %zu + pre_state %zu + cand %zu), %d-token units, "
+                             "%lld bytes staged (%s)\n", sr.slab, sr.xs, sr.ps, sr.cb, sr.unit,
+                     (long long) sr.st.plan.bytes, sr.st.note.c_str());
+        for (size_t s = 0; s < sr.stage.size(); ++s)
+            std::fprintf(stderr, "relay:   stage %zu: device %d, layers [%lld,%lld)  head %s  weights %s  engram %zd/%zd\n",
+                         s, sr.dev[s], (long long) sr.lb[s], (long long) sr.le[s],
+                         sr.stage[s]->is_last_stage() ? "here" : "not here",
+                         sr.stage[s]->weights_shared() ? "shared" : "own copy",
+                         sr.stage[s]->engram_slots().size(), G.engram_layers.size());
+    }
+std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, experts %s, %zu classes\n",
                  (now_ms() - t_load) / 1000.0, n_layer, (long long) ctx, a.prefill_chunk, tier.mode(), TG.cls_gu.size());
 
     // ---- the forward pieces
@@ -543,10 +1064,125 @@ int main(int argc, char ** argv) {
     // decode: the tier sums the routed experts on the card straight into the dense half's routed tensor (same bits as
     // the host sum; no parts readback / routed upload per layer).  STRATA_DEC_HOSTSUM=1 = the host round trip
     // the routed tensor's device address: re-read after every dense.set_columns (elastic columns reallocate it)
-    float * rdev1 = (!mc.cpu_only && !std::getenv("STRATA_DEC_HOSTSUM")) ? dense.routed_dev() : nullptr;
+    // P5.3b: the routed-sum device shortcut is the single instance's; a staged run always hands the sums through the
+    // host (finish takes routed_host), which is also the bit-identical path of STRATA_DEC_HOSTSUM=1.
+    float * rdev1 = (staged || mc.cpu_only || std::getenv("STRATA_DEC_HOSTSUM"))
+                        ? nullptr : dense.routed_dev();
     double dp[6] = {0, 0, 0, 0, 0, 0};
     long dp_n = 0;
+    // The prompt's last row (and, for a staged run, each decode pass's logits too - the staged engine's head seam
+    // writes them there, which is what the decode loop reads).  Declared here because the staged feed's head seam and
+    // the tail capture below both use it.
+    std::vector<float> last_logits((size_t) nv);
+    // tail capture (STRATA_SERVE_DUMP_TAIL, the quality scorer): the last `tail_keep` rows of a feed's logits into
+    // tail_logits (row n - tail_keep first) - a teacher-forced continuation's rows without the whole prompt's (a 23K-token
+    // prompt's full logits would be 12 GB).  0 = off.  Declared with capture_tail below; the staged feed uses both.
+    int tail_keep = 0;
+    std::vector<float> tail_logits;
+    auto capture_tail = [&](int n, int row0, int nrows, int dense_row0) -> bool {   // rows [row0, row0+nrows) of a feed
+        if (tail_keep <= 0) return true;
+        const int t0 = n - tail_keep, lo = std::max(row0, t0), hi = row0 + nrows;
+        if (lo >= hi) return true;
+        if (tail_logits.size() != (size_t) tail_keep * (size_t) nv) tail_logits.assign((size_t) tail_keep * (size_t) nv, 0.0f);
+        // P5.3b: on a staged run the head lives on the last stage, which is the only instance with an output head.
+        Ds41Dense & head = staged ? *sr.stage.back() : dense;
+        if (!head.logits(dense_row0 + (lo - row0), hi - lo, tail_logits.data() + (size_t) (lo - t0) * nv)) {
+            ferr = head.last_error();
+            return false;
+        }
+        return true;
+    };
+    // ---- P5.3b (opt-in): the staged pass shapes.  A run feeds passes of at most sr.unit tokens (every stage's pass
+    // window - build_stages requires one max_pass for all stages, so the unit is the same number everywhere).  Each
+    // pass carries its ABSOLUTE first position, and the column it runs in follows from that position inside every
+    // instance (Impl::stage_col0): the producer's columns and the consumer's are the same columns, the payload's
+    // offset is 0 on both sides, and a borrowed candidate column is read where it was written.
+    // ---- P5.3b (opt-in): the staged pass shapes.  A staged pass is the unit the relay sees: every stage runs its own
+    // layers over the pass's tokens, and at each boundary the producer's finished columns go through one staging slot
+    // to the next stage.  The MoE tier is NOT split - every stage's layers call the same `tier`, which holds the whole
+    // routed set (splitting it is P5.4, docs/gfx906/P5-MULTI-GPU-DESIGN.md).  The head runs on the LAST stage only,
+    // over its OWN state, so the logits are the same rows the unsplit path reads - no payload round trip for the head.
+    // Scratch sized for the staged pass cap (the unsplit prefill chunk's buffers stay unallocated for a staged run).
+    const int SP = staged ? std::max(1, sr.cap) : 1;
+    std::vector<int> sids((size_t) SP * top_k);
+    std::vector<int32_t> sids32((size_t) SP * top_k);
+    std::vector<float> swts((size_t) SP * top_k), srouted((size_t) SP * n_embd);
+    // The tier call for one staged layer: the same tier, the same host-in/host-out seam as the unsplit engine, for
+    // either one token (a decode step) or the whole staged pass (a prompt chunk).
+    auto staged_experts = [&](int l, const int * ids, const float * wts, const float * fn, int n, float * out) -> bool {
+        for (int i = 0; i < n * top_k; ++i) sids32[(size_t) i] = ids[i];
+        return n == 1 ? tier.run(l, sids32.data(), wts, fn, out)
+                      : tier.run_chunk(l, n, sids32.data(), wts, fn, out);
+    };
+    // The staged pass's layer loop, for stage `s` over the pass's n tokens.  The FIRST stage takes the token ids (the
+    // only one with embeddings); the others were handed their state by the relay before their first layer ran.
+    // `toks` points at this piece's first token, `pos` its absolute position, `col_off` its offset inside the pass
+    // (which is where the relay landed it in this stage's window).
+    auto staged_run_stage = [&](int s, int n, const int * toks, int pos) -> bool {
+        if (s == 0 && !sr.stage[0]->begin(toks, n, pos)) { ferr = sr.stage[0]->last_error(); return false; }
+        return staged_stage_layers(sr, s, n, sids.data(), swts.data(), srouted.data(), staged_experts, ferr);
+    };
+    // one decode token through every stage; `logits_out` = the last stage's head over this pass's single row
+    auto staged_step = [&](int tid, int pos, float * logits_out) -> bool {
+        // A decode step is a unit of ONE token at column 0 of every stage (see the unit note above), so stage 0's
+        // begin() gets the unit index = the position, and the window check pos % unit == 0 holds by construction.
+        const auto run_stage = [&](int s, int n, int p) -> bool { return staged_run_stage(s, n, &tid, p); };
+        const auto head = [&](int) -> bool { return sr.stage.back()->logits(0, 1, logits_out); };
+        sr.pos_of = pos;   // the decode step's absolute position, for the stages after the first
+        std::string perr;
+        if (!staged_pass(sr, 1, pos, run_stage, head, perr)) {
+            ferr = perr.empty() ? "staged pass failed" : perr;
+            return false;
+        }
+        return true;
+    };
+    // A staged prompt: passes of at most sr.cap tokens (the staging's capacity) through every stage; `out` keeps the
+    // FINAL pass's last row, which is what a prompt's next-token distribution is.  `all` (optional) gets every row's
+    // logits, read from the last stage's head a pass at a time.
+    auto staged_feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
+                           std::vector<float> * all) -> bool {
+        // The run feeds passes of at most the window (sr.unit = every stage's max_pass).  A pass carries the ABSOLUTE
+        // position of its first token; the column it runs in is derived from that position inside each instance
+        // (Ds41Dense::Impl::stage_col0), identically on both sides of a boundary - the producer's columns and the
+        // consumer's are the same columns, so the payload's offset is 0 on both sides and a borrowed candidate column
+        // is read where it was written.
+        for (int c0 = 0; c0 < n; ) {
+            const int m = std::min(sr.unit, n - c0);
+            const auto run_stage = [&](int s, int nn, int p) -> bool { return staged_run_stage(s, nn, ids + c0, p); };
+            // The head runs on every pass (a pass is a full forward through the stages); `out` keeps the FINAL pass's
+            // last row.  Rows are the pass's own token positions, read from the last stage's state region.
+            const bool last = c0 + m == n;
+            sr.pos_of = pos0 + c0;   // this pass's first position, for the stages after the first
+            const auto head = [&](int nn) -> bool {
+                if (all) {
+                    all->resize((size_t) (c0 + nn) * (size_t) nv);
+                    if (!sr.stage.back()->logits(0, nn, all->data() + (size_t) c0 * nv)) return false;
+                    if (last) std::copy(all->end() - nv, all->end(), last_logits.begin());
+                    return true;
+                }
+                return !last || sr.stage.back()->logits(nn - 1, 1, last_logits.data());
+            };
+            std::string perr;
+            if (!staged_pass(sr, m, pos0 + c0, run_stage, head, perr)) {
+                ferr = perr.empty() ? "staged chunk failed" : perr;
+                return false;
+            }
+            if (!capture_tail(n, c0, m, 0)) return false;
+            c0 += m;
+            progress(c0);
+        }
+        tier.release_chunk();   // the unsplit feed's lifecycle, mirrored: the chunk scratch goes back after a prompt
+        return true;
+    };
     auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via dense.logits
+        if (staged) {
+            // The staged engine runs the same pass; the logits come back from the last stage's head.  `dense` runs no
+            // layers on a staged run, so its logits are never read (the head lives on the last stage).
+            if (!staged_step(tok, pos, last_logits.data())) return false;
+            // the per-step decode profile, measured on the staged pass as a whole
+            if (dprof) { dp[0] += now_ms() - dp[1]; dp[1] = now_ms(); ++dp_n; }
+            return true;
+        }
         double ta = dprof ? now_ms() : 0;
         if (dump_main) {
             dm_tok = tok;
@@ -647,6 +1283,23 @@ int main(int argc, char ** argv) {
     std::vector<int> mids;
     std::vector<float> mw;
     auto pass_m = [&](const int * toks, int m, int pos) -> bool {
+        if (staged) {
+            // A staged serve pass is the same relayed pass, capped by the staging: a run whose STRATA_SERVE_PASS_M is
+            // bigger than --relay-chunk takes several passes, which is the same math as the unsplit loop above.
+            for (int i = 0; i < m; ) {
+                const int n = std::min(sr.unit, m - i);
+                const auto run_stage = [&](int s, int nn, int p) -> bool { return staged_run_stage(s, nn, toks + i, p); };
+                const auto head = [&](int) -> bool { return true; };   // the caller reads the logits after the last pass
+                sr.pos_of = pos + i;
+                std::string perr;
+                if (!staged_pass(sr, n, pos + i, run_stage, head, perr)) {
+                    ferr = perr.empty() ? "staged pass failed" : perr;
+                    return false;
+                }
+                i += n;
+            }
+            return true;
+        }
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);
         if (!dense.begin(toks, m, pos)) { ferr = dense.last_error(); return false; }
@@ -793,7 +1446,7 @@ int main(int argc, char ** argv) {
     const double chunk_budget = std::getenv("STRATA_CHUNK_BUDGET_GB") ? std::atof(std::getenv("STRATA_CHUNK_BUDGET_GB")) * 1e9 : 3.0e9;
     const int piece = (int) std::max<int64_t>(1, (int64_t) chunk_budget / std::max<int64_t>(1, (int64_t) n_embd * 4 * (top_k + 3)));
     // the prompt ids[0, n) at positions pos0..: last_logits = the last row; all_logits (if given) every row
-    std::vector<float> last_logits((size_t) nv);
+    // (last_logits itself was declared above, next to the staged pass shapes.)
     // the deferred VRAM seed after a prompt: the prompt's buffers go back, the cache opens into the free space, and the
     // decode biases (route bias + file penalty) switch on.  Returns the free GiB measured (for the log).
     double seed_free = 0, seed_gib = 0, seed_s = 0;
@@ -872,16 +1525,6 @@ int main(int argc, char ** argv) {
     // tail capture (STRATA_SERVE_DUMP_TAIL, the quality scorer): the last `tail_keep` rows of a feed's logits into
     // tail_logits (row n - tail_keep first) - a teacher-forced continuation's rows without the whole prompt's (a 23K-token
     // prompt's full logits would be 12 GB).  0 = off.
-    int tail_keep = 0;
-    std::vector<float> tail_logits;
-    auto capture_tail = [&](int n, int row0, int nrows, int dense_row0) -> bool {   // rows [row0, row0+nrows) of this feed
-        if (tail_keep <= 0) return true;
-        const int t0 = n - tail_keep, lo = std::max(row0, t0), hi = row0 + nrows;
-        if (lo >= hi) return true;
-        if (tail_logits.size() != (size_t) tail_keep * (size_t) nv) tail_logits.assign((size_t) tail_keep * (size_t) nv, 0.0f);
-        if (!dense.logits(dense_row0 + (lo - row0), hi - lo, tail_logits.data() + (size_t) (lo - t0) * nv)) { ferr = dense.last_error(); return false; }
-        return true;
-    };
     int bcap_n = 0, bcap_got = 0;  // serve DSpark seed captured from a layer-major batch (see the layer loop below)
     std::vector<float> bcap_vh;    // [bcap_n][3 * n_embd], as pass_v's vh
     // the layer-major batch width for THIS turn: PB, clamped per request by the VRAM actually free (the --serve loop
@@ -897,6 +1540,8 @@ int main(int argc, char ** argv) {
     };
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
+        if (staged)   // the relayed chunk path: passes of at most the staging's capacity through every stage
+            return staged_feed(ids, n, pos0, progress, all_logits);
         for (int c0 = 0; c0 < n; ) {
             if (PB > 1 && n - c0 >= 2) {
                 // ---- layer-major: up to B tokens of every layer, the experts run once per layer over the whole batch
@@ -1071,6 +1716,18 @@ int main(int argc, char ** argv) {
         tier.release_chunk();
         return true;
     };
+
+    // ---- P5.3b (opt-in): the staged run is one-shot only, for now.  --serve's conversation reuse is per-instance
+    // bookkeeping (snapshot / restore / park / unpark) and a staged conversation spans several instances; each stage's
+    // own rings snapshot fine, but park() moves one instance's caches and the engine would have to drive the whole set
+    // and keep their positions in step.  Say so at the flag rather than serve a request that resumes half a
+    // conversation.  (The decode/prompt path above is fully staged; this is only the serve loop's reuse layer.)
+    if (staged && a.serve) {
+        std::fprintf(stderr, "ds41_generate: --serve's conversation reuse (snapshot / park / restore) is per-instance and "
+                             "a staged run spans %zu instances; that layer is not ported yet. Run one-shot (--ids / "
+                             "--ids-file), or drop --gpus.\n", sr.stage.size());
+        return 2;
+    }
 
     // ---- serve
     if (a.serve) {
@@ -1361,7 +2018,10 @@ int main(int argc, char ** argv) {
                     last_rows = m;
                     if (i / 64 != before / 64 && i < dh) pp(i);
                 }
-                if (!dense.logits(last_rows - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+                // P5.3b: on a staged run the head is the last stage's (and a multi-token pass_m pass left its rows
+                // there, not in `dense`, which ran no layers).
+                Ds41Dense & head = staged ? *sr.stage.back() : dense;
+                if (!head.logits(last_rows - 1, 1, last_logits.data())) { ferr = head.last_error(); return false; }
                 pp(dh);
                 return true;
             };
@@ -1683,7 +2343,7 @@ int main(int argc, char ** argv) {
                 ++gen;
                 if (is_stop(tok)) { finish = "stop"; break; }
                 if ((max_new > 0 && gen >= max_new) || pos + 1 >= ctxv) break;
-                if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { finish = "error"; break; }
+                if (!step(tok, pos) || !(staged ? *sr.stage.back() : dense).logits(0, 1, lg.data())) { finish = "error"; break; }
                 hist.push_back(tok);
                 ++pos;
                 tier.rebalance_tick();
@@ -1734,6 +2394,13 @@ int main(int argc, char ** argv) {
         return 2;
     }
     if (spec && a.temp > 0) std::fprintf(stderr, "note: STRATA_DSPARK decodes greedily (temp ignored)\n");
+    // P5.3b: DSpark verifies with a multi-token dense pass on ONE instance (pass_v) and its own head; a staged run has
+    // neither.  Refuse the combination rather than run the draft stack against the wrong state.
+    if (spec && staged) {
+        std::fprintf(stderr, "ds41_generate: STRATA_DSPARK verifies drafts with single-instance dense passes (pass_v); a "
+                             "staged run relays every pass. Run one-shot unsplit, or without STRATA_DSPARK.\n");
+        return 2;
+    }
     // the DSpark window needs per-position main_hidden, which the layer-major prompt does not produce: the last
     // min(128, L-1) prompt tokens run through pass_v (chunks of <= 16) after the VRAM cache opens
     const int sp_tail = spec ? std::min<int>(128, (int) prompt.size() - 1) : 0;
@@ -1743,7 +2410,7 @@ int main(int argc, char ** argv) {
     if (!ok) { std::fprintf(stderr, "\nds41_generate: prefill: %s\n", ferr.c_str()); return 1; }
     if (dm_tail > 0 && defer_vram && !open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
     for (int i = (int) prompt.size() - dm_tail; i < (int) prompt.size(); ++i)
-        if (!step(prompt[(size_t) i], i) || !dense.logits(0, 1, last_logits.data())) {
+        if (!step(prompt[(size_t) i], i) || !(staged ? *sr.stage.back() : dense).logits(0, 1, last_logits.data())) {
             std::fprintf(stderr, "ds41_generate: dump-main prompt step: %s\n", ferr.c_str());
             return 1;
         }
@@ -1940,7 +2607,10 @@ int main(int argc, char ** argv) {
         std::fflush(stdout);
         if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end() || tok == (int) G.eos) { ++gen; break; }
         if (gen + 1 == a.n_predict) { ++gen; break; }
-        if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
+        if (!step(tok, pos) || !(staged ? *sr.stage.back() : dense).logits(0, 1, lg.data())) {
+            std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str());
+            return 1;
+        }
         ++pos;
     }
     const double dec_ms = now_ms() - td0;
@@ -1954,6 +2624,12 @@ int main(int argc, char ** argv) {
                  100.0 * st.hits / std::max<int64_t>(1, st.lookups()), st.cpu_ms, st.file_ms,
                  (long long) st.spec_issued, (long long) st.spec_hits, (long long) st.prefetch_issued,
                  (long long) st.prefetch_dummy, (long long) st.prefetched_useful);
+    if (staged)
+        std::fprintf(stderr, "relay: %llu passes, %llu boundary hand-offs, %llu bytes staged (%.1f MiB), relay %.0f ms "
+                             "(%.2f ms/pass)\n",
+                     (unsigned long long) sr.n_pass, (unsigned long long) sr.n_boundary,
+                     (unsigned long long) sr.bytes_relayed, sr.bytes_relayed / 1048576.0, sr.ms_relay,
+                     sr.ms_relay / std::max<uint64_t>(1, sr.n_pass));
     if (spec)
         std::fprintf(stderr, "DSpark: %ld verify passes, %.3f accepted drafts/pass = %.3f tokens/pass, %.1f%% full, %ld re-fed; "
                      "verify %.1f ms/pass, draft %.2f ms/pass (depth %d)\n", sp_pass, (double) sp_acc / std::max(1L, sp_pass),

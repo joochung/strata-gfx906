@@ -285,6 +285,10 @@ static void test_describe() {
 // so the gate stays one g++ command with no objects and no makefile.
 #include "test_relay_staging.cpp"
 
+// P5.3b: the stage-boundary RULES of a staged run, stated against a model geometry (tools/gfx906/test_split_geometry.hpp).
+void test_split_geometry_run();
+#include "test_split_geometry.cpp"
+
 int main() {
     test_default_is_single_device();
     test_default_equal_chunks();
@@ -295,6 +299,7 @@ int main() {
     test_more_stages_than_layers();
     test_describe();
     test_relay_staging_run();
+    test_split_geometry_run();
     std::printf("%s: %d checks, %d failed\n", g_fail ? "FAILED" : "ok", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

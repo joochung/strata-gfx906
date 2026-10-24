@@ -93,6 +93,29 @@ Not proven at this checkpoint: the DS4.1 engine under staging, staged serve mode
 snapshot/restore is per-instance today), and any scaling number - the 1/2/4-card curve is P5.5 and
 no throughput claim is made here.
 
+#### DS4.1 staged run implemented (2026-10-24, P5.3b); awaiting a hardware witness
+
+The same capability now exists in the DeepSeek-V4.1 engine (`tools/v41`), built from the GLM pattern and
+documented in [P5-RELAY-PATTERN.md section 6b](P5-RELAY-PATTERN.md).  It is not one payload but three -
+`x_state` (80 KiB/token), the model's explicit `pre_state` hc pre-mix (16 B), and the 2048 candidate
+blocks layer 20 picks for the indexers above it (8 KiB) - and the candidate column is either borrowed
+in place (stages on one card) or relayed (stages on two), never recomputed.  Boundaries are constrained
+by the model's geometry: the layer before a boundary must produce BOTH the compressed KV and the index
+keys the successor reads, which for the shipped 40-layer build admits a split after layers 2, 8, 14, 20.
+Refused with a message, not a wrong answer: `--serve`, DSpark, a shared-weight stage on a foreign card,
+and a `--layer-split` the geometry does not allow.  The expert tier got device pinning
+(`Ds41MoeConfig::device` + a `TierDev` guard at every CUDA seam); its seam is host-in/host-out so it
+needs no cross-device transport.
+
+Host-side verification on this box: full HIP build of `build-906`, `ctest -j4` at the fork's baseline
+failure set, and the split gate (`tools/gfx906/gate-device-split.sh`, 1102 checks) which now includes
+`tools/gfx906/test_split_geometry.cpp` - the KV rule, the candidate rule and the payload size checked
+against the model's geometry with plain g++, no GPU.  **No GPU run has been performed for this change**;
+the witness is `tools/gfx906/run-p5.3b-ds41-handoff.sh` (five runs, operator-launched, same calibrated
+verdict as GLM's) and it has not been run yet.  Also unported, by decision: the layer-major prompt walk
+(a staged run uses the sequential chunk path but keeps the batch's STATE columns as its cycling budget)
+and staged serve/conversation reuse.
+
 Step 2 landed the same day and is witnessed too: `--gpus 0,1` places the second stage - its layer
 range, its KDA/conv/MLA state, and its own copy of its weights - on the SECOND card, and the expert
 tier now pins the device it was given (it ran on the ambient device, always 0, because the dense

@@ -342,9 +342,22 @@ void Ds41Engram::drop_cache() {
     }
 }
 
-std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err) {
-    const int64_t nel = (int64_t) tables_.size();
-    if (nel == 0) { err = "engram: no tables"; return nullptr; }
+std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::vector<std::vector<float>> & out,
+                                                     std::string & err, const std::vector<int64_t> & slots) {
+    // P5.3b: `want` = the Engram slots to read, in the order the caller wants them back.  Empty = every table (the
+    // whole model, byte-identical to before).  A STAGED run passes the slots its own layer range holds: stage 1
+    // (layers 22-39) reads no Engram rows at all, so it neither pays for nor holds a GB of rows for layer 1 / 14.
+    std::vector<int> want;
+    const int64_t ntab = (int64_t) tables_.size();
+    if (slots.empty()) { want.resize((size_t) ntab); for (size_t i = 0; i < want.size(); ++i) want[i] = (int) i; }
+    else {
+        for (int64_t e : slots) {
+            if (e < 0 || e >= ntab) { err = "engram: slot " + std::to_string(e) + " is not a table"; return nullptr; }
+            want.push_back((int) e);
+        }
+    }
+    const int64_t nel = (int64_t) want.size();
+    if (ntab == 0) { err = "engram: no tables"; return nullptr; }
     if (n <= 0) { err = "engram: empty batch"; return nullptr; }
     auto b = std::make_shared<Batch>();
     b->n = n;
@@ -353,12 +366,12 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
 
     std::vector<int64_t> ids((size_t) (nel * m));
     for (int64_t e = 0; e < nel; ++e)
-        for (int64_t t = 0; t < n; ++t) hash(pos0 + t, (int) e, &ids[(size_t) ((e * n + t) * cols)]);
+        for (int64_t t = 0; t < n; ++t) hash(pos0 + t, want[(size_t) e], &ids[(size_t) ((e * n + t) * cols)]);
 
     out.resize((size_t) nel);
     b->uniq.resize((size_t) nel); b->packed.resize((size_t) nel); b->run_begin.resize((size_t) nel);
     for (int64_t e = 0; e < nel; ++e) {
-        const Table & T = tables_[(size_t) e];
+        const Table & T = tables_[(size_t) want[(size_t) e]];
         out[(size_t) e].assign((size_t) (m * dim), 0.0f);   // reuses the caller's capacity - no per-pass allocation
         // pack (row_id << 32 | slot) so the sort is a plain integer sort - no comparator, no indirection
         auto & pk = b->packed[(size_t) e];
@@ -481,8 +494,9 @@ bool Ds41Engram::wait(const std::shared_ptr<Batch> & b, std::string & err) {
     return true;
 }
 
-bool Ds41Engram::rows(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err) {
-    auto b = start(pos0, n, out, err);
+bool Ds41Engram::rows(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err,
+                      const std::vector<int64_t> & slots) {
+    auto b = start(pos0, n, out, err, slots);
     if (!b) return false;
     return wait(b, err);
 }

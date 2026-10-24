@@ -311,8 +311,22 @@ struct SpecStash {
     }
 };
 
+/// The tier's device, named on entry and restored on exit (P5.3b step 2, mirror of tools/ds4/ds4_moe.cpp's TierDev).
+/// Why this exists: every ggml call sets the process' ambient CUDA device to the device of the backend it runs on,
+/// and a P5.3b staged run (--gpus) runs layers on OTHER cards between tier calls - so a raw cuda* call here must
+/// never rely on whatever was set last.  Cheap (one thread-local read plus a set only when they differ), and the
+/// restore keeps the engine's own ggml sequencing untouched.
+struct TierDev {
+    int prev = -1;
+    explicit TierDev(int d) { if (cudaGetDevice(&prev) == cudaSuccess && prev != d) cudaSetDevice(d); }
+    TierDev(const TierDev &) = delete;
+    TierDev & operator=(const TierDev &) = delete;
+    ~TierDev() { if (prev >= 0) cudaSetDevice(prev); }
+};
+
 /// All the device state, so the CPU-only flavour has none of it to leak.
 struct Gpu {
+    int dev = 0;   ///< the cfg.device this tier was inited on; every entry names it (TierDev) - P5.3b step 2
     Arena arena;
     std::unique_ptr<SpecStash> spec;   ///< spec_read's stash (opened on first use)
     std::unique_ptr<ReadPool> rpool;   ///< D3's file-tier readers (persistent; created on first use)
@@ -412,6 +426,15 @@ struct Gpu {
     }
 
     void close() {
+#if defined(DS4_MOE_CUDA)
+        // P5.3b: everything freed below was allocated on `dev`, and the caller may have left the ambient device on
+        // another card (a staged run runs layers elsewhere between calls).  cudaFree of a foreign pointer is
+        // undefined; free on the owning card and restore afterwards.
+        const int d = dev;
+        dev = 0;   // the reset at the end must not carry the pin
+        int prev = -1;
+        if (cudaGetDevice(&prev) == cudaSuccess && prev != d) cudaSetDevice(d);
+#endif
         for (auto& e : ev)
             if (e) cudaEventDestroy(e);
         for (cudaGraphExec_t g : tier_g)
@@ -444,6 +467,8 @@ struct Gpu {
         spec.reset();
         cache.reset();
         arena.close();
+        // P5.3b: the reset frees nothing (the pointers above already went), but keep the pin out of the copy.
+        dev = 0;
         *this = Gpu();
     }
 };
@@ -672,6 +697,7 @@ int64_t chunk_next_routed(const Ds41MoeImpl& im, int64_t layer) {
 /// The bytes `layer`'s file-tier experts occupy (the slab a prefetch of it would need).
 int64_t chunk_stage_want(Ds41MoeImpl& im, int64_t layer) {
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     int64_t at = 0;
     for (int64_t e = 0; e < im.g.n_experts; ++e) {
         if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
@@ -692,6 +718,7 @@ int64_t chunk_stage_build(Ds41MoeImpl& im, int s, int64_t layer) {
     if (cs.idx[s].size() != (size_t) im.g.n_experts) cs.idx[s].assign((size_t) im.g.n_experts, -1);
     else std::fill(cs.idx[s].begin(), cs.idx[s].end(), -1);
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     int64_t at = 0;
     for (int64_t e = 0; e < im.g.n_experts; ++e) {
         if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
@@ -1320,6 +1347,17 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     return false;
 #else
     Gpu& gp = *(im_->gpu = std::unique_ptr<Gpu>(new Gpu()));
+    // P5.3b step 2 (mirrors tools/ds4/ds4_moe.cpp's init): name cfg.device BEFORE the first allocation, so every
+    // pointer this init produces (arena registration, cache, streams, events, pinned pools) belongs to it.  Without
+    // this, a tier asked for device 1 allocated its cache and streams on the process' ambient device (what the
+    // dense backend set last) while cudaStreamSynchronize and the kernels later ran on 1 - a cross-device sync -
+    // and every P5.3b host-relay registration in the same process was registered for the wrong card.
+    if (cudaSetDevice(cfg.device) != cudaSuccess) {
+        (void) cudaGetLastError();
+        err = "ds4_moe: cannot use CUDA device " + std::to_string(cfg.device);
+        return false;
+    }
+    gp.dev = cfg.device;
     gp.arena.blob = im_->blob;
     gp.arena.n_layers = geom.n_layers;
     gp.arena.n_experts = geom.n_experts;
@@ -1428,6 +1466,10 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
 #else
     if (!im_->gpu || im_->cfg.cpu_only) return true;
     Gpu& gp = *im_->gpu;
+    // P5.3b: this function ALLOCATES (the arena's pin, its registration) and build_arena_from_routes can call it
+    // from an arbitrary point in a staged run, so it names the tier's device itself instead of inheriting the
+    // ambient one (init's cudaSetDevice only covers the init-time build).  TierDev restores the caller's device.
+    const TierDev td(gp.dev);
     const int64_t total = im_->g.n_layers * im_->g.n_experts;
     // An arena that already holds every expert has nothing to gain from another ordering, and a rebuild would
     // re-read up to 72 GiB of the model for no change in behaviour.  Neither has a re-seed with a ranking when the
@@ -1485,6 +1527,10 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
         return false;
     }
     if (im_->cfg.pin) {
+        // P5.3b: PinnedArena already cudaHostRegister(PORTABLE)s the range it owns (sycl/src/core/pinned.dp.cpp,
+        // "cudaHostRegister PORTABLE ok" in every arena note) - PORTABLE covers every device, so the arena's DMAs
+        // reach the tier's card from any thread at any point in a staged run.  Nothing to add here beyond keeping
+        // the failure explicit: a refused registration leaves the arena pageable (reported, never hidden).
         gp.arena.owner.reset(new strata::core::PinnedArena(gp.arena.bytes));
         if (!gp.arena.owner->valid()) {
             err = "pinned arena allocation of " + std::to_string(gib) + " GiB failed";
@@ -1597,6 +1643,7 @@ void Ds41MoeTier::set_slot_gib(double gib) { im_->cfg.slot_gib = gib; }
 void Ds41MoeTier::set_cache_enabled(bool on) {
     if (!im_) return;
 #if defined(DS4_MOE_CUDA)
+    const TierDev td(im_->gpu ? im_->gpu->dev : 0);   // P5.3b: named entry - the CUDA calls below act on the TIER card (see TierDev)
     // an open cache is release_cache()'s to drop, not a config flip's.  UNION (xolotl): the CPU flavour's stub Gpu
     // has no cache member, so this has to be guarded - the fork never hit it because its configure has no ggml-cpu
     // target and v41_engine.cmake only creates ds41_moe_cpu under `if(TARGET strata_kernels_cpu AND TARGET ggml-cpu)`;
@@ -1653,6 +1700,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
     const int64_t want = std::min<int64_t>(im_->cfg.slots, im_->gpu->cache->full_slots());
     // the order the slots fill in.  A per-layer-sized cache (MiMo) keeps the rank: its sizes list above pairs slot
     // i with ranked[i].  Everywhere else a preceding release_cache() supplies the warm set.
+    const TierDev td(im_->gpu ? im_->gpu->dev : 0);   // P5.3b: the slot fills below are H2D on the tier's device
     const std::vector<std::pair<int32_t, int32_t>> fill_order = im_->mixed_sizes ? ranked : warm_first(*im_, ranked, want);
     int64_t filled = 0;
     // vram_lru: the LRU's starting order = the fill order: the last-seeded expert goes out first
@@ -1791,6 +1839,7 @@ void Ds41MoeTier::spec_read(int64_t layer, const int32_t* ids, int n, bool d3) {
     if (!im.inited || !im.gpu || !im.blobs || im.cfg.cpu_only || (im.cfg.arena_adapt && !d3) || !ids || n <= 0) return;
     if (layer <= im.run_layer || layer >= im.g.n_layers || !im.g.routed(layer)) return;
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     if (!gp.spec) {
         gp.spec = std::make_unique<SpecStash>();
         if (!gp.spec->open(im.blobs, im.blob)) { gp.spec.reset(); return; }
@@ -1812,6 +1861,7 @@ void Ds41MoeTier::prefetch_multi(int64_t layer, const int32_t* ids, int n, int m
     if (!im_->gpu || im_->cfg.cpu_only || im_->cfg.no_cache || !im_->gpu->cache) return;
     if (!ids || n <= 0 || max_slots <= 0 || !im_->g.routed(layer)) return;
     Gpu& gp = *im_->gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     if (!gp.s_pf || !gp.d_pf) return;   // allocated with pf_b > 0 (the decode default)
     const int nb = std::min(max_slots, (int) Ds41MoeConfig::kMaxPf);
     for (int i = 0; i < n && im_->pf_n < nb; ++i) {
@@ -1840,6 +1890,7 @@ void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
     if (!im_->gpu || im_->cfg.cpu_only || im_->cfg.pf_b <= 0 || im_->cfg.no_cache || !im_->gpu->cache) return;
     if (!top16 || n <= 0 || !im_->g.routed(layer)) return;
     Gpu& gp = *im_->gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     n = std::min(n, (int) Ds41MoeConfig::kPredW);
     int nb;
     if (im_->cfg.dither) {
@@ -2059,6 +2110,7 @@ const char* const g_prof_name[9] = {"split", "activation", "gpu launch", "cpu po
 /// make the neighbour check read the second one's NEW bytes against its old owner - a false BAD.
 int32_t arena_publish_swap(Ds41MoeImpl& im, int64_t layer, int32_t e, int32_t victim) {
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     const int64_t NX = im.g.n_experts;
     const int32_t slot = gp.arena.slot_of[(size_t) (layer * NX + victim)];
     gp.arena.slot_of[(size_t) (layer * NX + victim)] = -1;
@@ -2069,6 +2121,7 @@ int32_t arena_publish_swap(Ds41MoeImpl& im, int64_t layer, int32_t e, int32_t vi
 
 void arena_check_swap(Ds41MoeImpl& im, int64_t layer, int32_t e, int32_t slot) {
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     const int64_t NX = im.g.n_experts;
     static const bool check_arena = std::getenv("DS41_CHECK_ARENA") != nullptr;
     if (!check_arena) return;
@@ -2098,6 +2151,7 @@ void arena_check_swap(Ds41MoeImpl& im, int64_t layer, int32_t e, int32_t slot) {
 /// (last_use < tick) and not in `taken` - or -1.
 int32_t arena_victim(Ds41MoeImpl& im, int64_t layer, uint64_t need, const int32_t* taken, int ntaken) {
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     const int64_t NX = im.g.n_experts;
     int32_t victim = -1;
     int64_t best = INT64_MAX;
@@ -2121,6 +2175,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     double tp = prof ? now_ms() : 0;
     auto mark = [&](int i) { if (prof) { const double t = now_ms(); g_prof[i] += t - tp; tp = t; } };
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     const int64_t H = im.g.n_embd;
     const int64_t K = im.g.top_k;
     const int64_t B = im.blob;                        // staging STRIDE (the largest blob)
@@ -2856,6 +2911,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
 bool gpu_run_n(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const float* w, const float* x_host,
                float* out) {
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     const int64_t H = im.g.n_embd;
     const int64_t K = im.g.top_k;
     const int64_t B = im.blob;                        // staging stride
@@ -3045,6 +3101,7 @@ bool gpu_run_n(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const
 bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const float* w,
                   const float* x_host, float* out, void* out_dev) {
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     const int64_t H = im.g.n_embd;
     const int64_t K = im.g.top_k;
     const int64_t B = im.blob;                        // staging stride
@@ -3645,6 +3702,7 @@ int64_t chunk_stride(Ds41MoeImpl& im, int64_t layer) {
     const int64_t BL = im.bl[(size_t) layer];
 #if defined(DS4_MOE_MMQ)
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     namespace mmq = strata::prefill::mmq;
     if (!im.cfg.chunk_mmq || !mmq::built()) return BL;
     const MmqPlan P = mmq_plan(gp.gll[(size_t) layer], BL);
@@ -3658,6 +3716,7 @@ int64_t chunk_stride(Ds41MoeImpl& im, int64_t layer) {
 // run_chunk stride; run_chunk(layer) then only waits for c_copied[h].  The half must hold them all (else: skip).
 void chunk_prestage(Ds41MoeImpl& im, int64_t layer, int h) {
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     gp.c_pre_layer = -1;
     if (!im.g.routed(layer) || !gp.s_cp) return;
     const int64_t BL = im.bl[(size_t) layer], SL = chunk_stride(im, layer), NX = im.g.n_experts;
@@ -3690,6 +3749,7 @@ int chunk_pstage_min() {
 /// The prestage region, allocated once (false = prestage off for good: STRATA_PRESTAGE_GIB=0 or no room).
 bool chunk_pstage_alloc(Ds41MoeImpl& im) {
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     if (gp.p_off) return false;
     if (!gp.p_buf) {
         const char* env = std::getenv("STRATA_PRESTAGE_GIB");
@@ -3721,6 +3781,7 @@ bool chunk_pstage_alloc(Ds41MoeImpl& im) {
 /// (MMVQ from the region, MMQ when streamed) - never depends on which of the two filled it.
 int chunk_pstage_fill(Ds41MoeImpl& im, int64_t layer, const int32_t* routed) {
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     if (gp.p_used_rec) ck(cudaStreamWaitEvent(gp.s_cp, gp.p_used, 0), "pstage wait used");
     const int64_t NX = im.g.n_experts;
     gp.p_ptr.assign((size_t) NX, 0ull);
@@ -3757,6 +3818,7 @@ int chunk_pstage_fill(Ds41MoeImpl& im, int64_t layer, const int32_t* routed) {
 
 void chunk_pstage_issue(Ds41MoeImpl& im, int64_t layer) {
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     gp.p_layer = -1;
     gp.p_lazy_layer = -1;
     if (gp.p_off || !gp.s_cp || !gp.arena.base || !im.g.routed(layer)) return;
@@ -3769,6 +3831,7 @@ void chunk_pstage_issue(Ds41MoeImpl& im, int64_t layer) {
 bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* w, const float* x_host,
                    float* out, void* out_dev = nullptr, int cf = -1, bool first_pass = true, bool last_pass = true) {
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     const bool prof = chunk_prof();
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> kev;   // prof: one pair per grouped launch
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> tcev;  // prof: one pair per MMQ sub-run's PTQ1_0 transcode (inside kev)
@@ -4564,6 +4627,10 @@ bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, co
 
 bool Ds41MoeTier::build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err) {
     if (im_->cfg.cpu_only) return true;
+#if defined(DS4_MOE_CUDA)
+    // P5.3b: the arena build's own first act is cudaSetDevice(cfg.device) inside build_arena (see init's note there).
+    const TierDev td_build(im_->gpu ? im_->gpu->dev : 0);
+#endif
     std::string e;
     const std::vector<std::pair<int32_t, int32_t>> ranked =
         rank_routes(routes_bin, im_->g.n_routed(), im_->g.top_k, e, batch_tokens);
@@ -4579,6 +4646,7 @@ const std::vector<int64_t>& Ds41MoeTier::saliency_count() const { return im_->sa
 
 void Ds41MoeTier::release_cache() {
 #if defined(DS4_MOE_CUDA)
+    const TierDev td(im_->gpu ? im_->gpu->dev : 0);   // P5.3b: named entry - the CUDA calls below act on the TIER card (see TierDev)
     if (!im_->gpu || !im_->gpu->cache) return;
     cudaDeviceSynchronize();   // no copy or kernel may still read a slot
     // warm_reseed (STRATA_WARM_RESEED=1 = on; OFF by default until it shows an effect): before the slots go, record
@@ -4619,6 +4687,7 @@ bool Ds41MoeTier::keep_cache_mode() {
 
 int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
 #if defined(DS4_MOE_CUDA)
+    const TierDev td(im_->gpu ? im_->gpu->dev : 0);   // P5.3b: cudaDeviceSynchronize / cudaMemGetInfo read the TIER card
     // every refusal says why (s6: the first A/B never kept the cache and logged nothing)
     if (!im_->gpu || !im_->gpu->cache) { err = "no VRAM cache"; return -1; }
     if (!im_->gpu->cache->segmented()) { err = "the cache is not segmented"; return -1; }
@@ -4659,6 +4728,7 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
 
 int64_t Ds41MoeTier::regrow_cache(std::string& err) {
 #if defined(DS4_MOE_CUDA)
+    const TierDev td(im_->gpu ? im_->gpu->dev : 0);   // P5.3b: named entry - the CUDA calls below act on the TIER card (see TierDev)
     if (im_->shrunk.empty() || !im_->gpu || !im_->gpu->cache) { im_->shrunk.clear(); return 0; }
     strata::core::ExpertCache& c = *im_->gpu->cache;
     const double t0 = now_ms();
@@ -4717,6 +4787,7 @@ bool Ds41MoeTier::release_prestage() {
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu || !im_->gpu->p_buf) return false;
     Gpu& gp = *im_->gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     cudaDeviceSynchronize();   // no DMA into it and no expert kernel reading from it is still in flight
     cudaFree(gp.p_buf);
     if (gp.p_copied) cudaEventDestroy(gp.p_copied);
@@ -4762,6 +4833,7 @@ void Ds41MoeTier::release_chunk() {
         g_pf = ChunkPfProf{};
     }
     Gpu& gp = *im_->gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     if (gp.s) cudaStreamSynchronize(gp.s);
     if (gp.s_cp) cudaStreamSynchronize(gp.s_cp);
     // The DEVICE buffers go back (the deferred VRAM seed wants the memory).  The PINNED landing pads (c_bounce,
@@ -4907,6 +4979,7 @@ void rebal_count(Ds41MoeImpl& im, int64_t layer, const int32_t* ids, int64_t n) 
 static void rebal_publish(Ds41MoeImpl& im) {
     Rebal& r = *im.rebal;
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     const int64_t NX = im.g.n_experts;
     size_t k = 0;
     for (size_t i = 0; i < r.inflight.size(); ++i) {
@@ -4934,6 +5007,7 @@ static void rebal_publish(Ds41MoeImpl& im) {
 static void rebal_retire(Ds41MoeImpl& im, int max_n) {
     Rebal& r = *im.rebal;
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     const int64_t NX = im.g.n_experts;
     const bool cache = gp.cache && !im.cfg.no_cache;
     int n = 0;
@@ -4985,6 +5059,7 @@ static void rebal_retire(Ds41MoeImpl& im, int max_n) {
 static void rebal_cancel(Ds41MoeImpl& im) {
     Rebal& r = *im.rebal;
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     const int64_t NX = im.g.n_experts;
     std::deque<Rebal::Job*> undo;
     {
@@ -5043,6 +5118,7 @@ void Ds41MoeTier::rebalance_begin_prompt() {
         r0.th = std::thread([imp] {   // the reader: retired slots <- the candidate's blob, outside stream order
             Rebal& r = *imp->rebal;
             Gpu& gp = *imp->gpu;
+            const TierDev td(gp.dev);   // P5.3b: a fresh thread starts on device 0; its waits and DMAs are the tier's card's
             for (;;) {
                 Rebal::Job* j = nullptr;
                 {
@@ -5074,6 +5150,7 @@ void Ds41MoeTier::rebalance_plan() {
     Ds41MoeImpl& im = *im_;
     Rebal& r = *im.rebal;
     Gpu& gp = *im.gpu;
+    const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     const int64_t NX = im.g.n_experts;
     const bool cache = gp.cache && !im.cfg.no_cache;
     r.queue.clear();
@@ -5143,6 +5220,10 @@ void Ds41MoeTier::rebalance_tick(bool request_end) {
 }
 
 void Ds41MoeTier::close() {
+#if defined(DS4_MOE_CUDA)
+    // P5.3b: gpu->close() frees the tier's device resources; name the card before the close seam below.
+    const TierDev td_close(im_ && im_->gpu ? im_->gpu->dev : 0);
+#endif
     if (im_ && im_->rebal) {   // the reader first: it writes arena memory
         Rebal& r = *im_->rebal;
         {

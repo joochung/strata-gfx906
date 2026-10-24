@@ -207,6 +207,78 @@ Used at peer_experts.cpp:57, :113, :229, :261, :305, :324 (close, open, and ever
 
 ---
 
+## 6b. WHAT THE DS4.1 PORT ACTUALLY SHIPS (P5.3b, 2026-10-24)
+
+Section 6 above is the survey of what the engines had BEFORE the split.  This is what tools/v41 does now, in the
+terms that section asks about - the payload, the seam, and the three decisions that are DS4.1's own rather than GLM's.
+
+**The seam.** `ds41_generate.cpp`'s `staged_pass()` drives one pass of at most `sr.unit` tokens: stage 0 takes the
+token ids (`begin`), each stage runs its own `[lb, le)` layer loop against the SAME tier (the routed half is not split;
+that is P5.4), and at every boundary the producer's finished columns go through one staging slot to the stage after
+it.  The head runs on the LAST stage only, over its own state - so the logits are the same rows the unsplit path
+reads, with no payload round trip.  `relay_staging.hpp` sizes the slots and hands out the double-buffered windows;
+`Ds41Dense::relay_read_out` / `relay_write_in` are the two copies.  The sync is the native relay's rule, unchanged:
+the producer's stream completion observed by the HOST before the successor is launched; there is no cross-device
+CUDA event anywhere in this engine.
+
+**The payload is THREE regions, not one.** GLM hands on `x_state` alone.  DS4.1 hands on:
+
+| region | tensor | bytes / token (this model) | why it is there |
+|---|---|---|---|
+| residual | `x_state` F32 [D, HC, NC] | 5120 x 4 x 4 = 81 920 | the successor's first layer reads it |
+| hc pre-mix | `pre_state` F32 [HC, NC] | 16 | this model's layer l hands layer l+1 an explicit pre-mix; GLM folds that into x_state |
+| candidates | `cand` I32 [CB, NC] | 8 192 | layer `cand_layer` = 20 picks the 2048 blocks the indexers of 24/28/32/36 rank INSIDE |
+
+Each region starts at byte 0 of its tensor (the pass's columns are the leading columns of a column-major tensor), so
+one boundary is a small number of contiguous copies in that fixed order, and `relay_slab_bytes()` is the one number
+both sides size their staging from.
+
+**Decision 1 - the candidate column is either borrowed or relayed, never recomputed.** A boundary that separates layer
+20 from the indexers above it (the witness splits at 21) has two legal resolutions and the engine picks by card:
+on ONE card the successor's graphs point at the producer's own `cand` tensor (`relay_cand_from`) - zero copies and
+bit-exact by construction, because the ids are the producer's bits, not a re-selection; ACROSS cards nothing may read
+another card's tensor, so the column rides in the payload (8 KiB a token, one memcpy).  Both are bit-exact; neither
+re-runs the top-k.  What is refused outright is a split that STRANDS the producer - stage s can only reach stage s-1,
+so a reader two or more stages behind the producer has nobody to take the column from.
+
+**Decision 2 - the KV rule, enforced at the geometry rather than discovered in a graph.** A stage's LAST layer must be
+the producer of both the compressed KV and the index keys its successor reads, because that is the only persistent
+state a boundary cannot leave in place: the successor reads those rings by POINTER inside one graph, and relaying them
+per pass would be a D2H/H2D of the whole visible cache every token.  `Ds41Geometry::kv_src/idx_src` resolve to "the
+latest source <= l", so requiring the layer before a boundary to be BOTH a kv source and an index source makes every
+successor read only its own producer's rings.  For the shipped 40-layer build that admits a boundary after layers
+2, 8, 14 and 20 - `--layer-split 16`, `19`, `25` are refused as messages, not as null tensors mid-graph.
+
+**Decision 3 - the pass unit is decoupled from the state columns.** A staged run drops the layer-major WALK (the relay
+has no seam for a sub-batch another stage's graphs wrote) but keeps its column budget: passes of `sr.unit` tokens cycle
+through `NC` columns at `col0 = (pos / unit) % (NC / unit)`, and the position the graphs see is the run's own, not the
+column's.  That is what lets a prompt longer than the window (and longer than the columns, for that matter) run at all,
+and it is why `relay_write_in` takes the ABSOLUTE source position: producer and consumer derive the same column from
+it, so the payload's offset is 0 on both sides.  `set_pass_cap()` narrows a stage's pass without touching its columns -
+a stage that borrows another's candidate tensor must keep the columns that tensor spans.
+
+**What a staged run refuses**, each with a message rather than a wrong answer: `--serve` (conversation reuse -
+snapshot / park / restore - is per-instance and a staged conversation spans several instances); DSpark (a rejected
+draft overwrites positions a stage already handed over); a stage that shares weights but lands on a different card
+(ggml hands the host an iGPU device pointer that the dGPU's copy engine cannot read, so use `--relay-copy-weights`);
+a pass that would overrun a stage's rings (the per-stage cap is the LAST stage's - the only range that ever sees the
+whole prefix - because an earlier stage's rings hold only `[lb, state_end)`'s output); and a `--layer-split` the
+geometry does not allow.
+
+**The tier needs no cross-device transport** and that is a design fact, not a simplification: at this engine's seam
+the MoE tier is host-in / host-out (`attn_router` returns `fn` on the host, `finish` takes `routed_sum` on the host),
+so it does not care which card ran the layers between its calls.  What it DID need is device pinning - it used to run
+on the ambient device, always 0, because the dense half was its only GPU user - so `Ds41MoeConfig::device` plus a
+`TierDev` RAII guard at every CUDA seam makes it name its own card even while another stage sets the ambient device.
+
+**Where to read it**: the arithmetic gate is `tools/gfx906/test_split_geometry.{hpp,cpp}` (plain g++, no ggml, no GPU:
+the KV rule, the candidate rule, the payload size, stated against a copied geometry), wired into
+`tools/gfx906/gate-device-split.sh`; the runtime witness is `tools/gfx906/run-p5.3b-ds41-handoff.sh` (five runs: two
+unsplit controls, one `--gpus 0,0` same-card split, two `--gpus 0,1 --relay-copy-weights` twins, verdict calibrated
+against the twin pairs' own agreement, exactly as GLM's witness does).
+
+---
+
 ## 7. The ggml buffer-type allocation blocks — one ctx holds ALL dense layers
 
 Yes for both: one ggml context per weight set, allocated into ONE buffer of the backend's DEFAULT buffer type, covering every decoder layer's dense tensors (routed experts skipped — the tier owns them). A layer split therefore needs either two ctx+WStore/weight sets (one per backend, which is what the native GpuStage does, generate.cpp:1106-1115) or per-tensor buffer placement (the manual ggml_backend_buft_alloc_buffer + ggml_backend_tensor_alloc pattern already used for the input/output spans).

@@ -40,7 +40,11 @@ public:
     /// Hash ids of the n-grams ending at `pos` for Engram slot `e` (0 = layer 1, 1 = layer 14): out[cols].
     void hash(int64_t pos, int e, int64_t * out) const;
     /// Rows for tokens at positions pos0..pos0+n-1, every Engram slot: out[e] = n * cols * dim floats (token-major).
-    bool rows(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err);
+    /// `slots` (P5.3b) restricts the read to those Engram layers, in the given order - out[0] is then slots[0]'s
+    /// rows.  Empty = every slot (the whole model, exactly as before): a STAGED run reads only the layers its own
+    /// range holds, so a stage on a second card never pays for (or holds) GBs of rows for another stage's layers.
+    bool rows(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err,
+              const std::vector<int64_t> & slots = {});
     /// The pre-batch reference reader: one pread pair per row, no dedup / sort / coalescing.  Kept so the byte-identity
     /// gate can diff it against the fast path over real tokens; not used by the engine.
     bool rows_reference(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err);
@@ -49,7 +53,8 @@ public:
     /// finish and reports errors.  `out` must stay alive and untouched until wait() returns - it is the destination, not
     /// a copy.  Lets a caller overlap a pass's reads with unrelated work (the dense half knows all hashes at begin()).
     struct Batch;
-    std::shared_ptr<Batch> start(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err);
+    std::shared_ptr<Batch> start(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err,
+                                 const std::vector<int64_t> & slots = {});
     bool wait(const std::shared_ptr<Batch> & b, std::string & err);
     /// Drop this module's tables from the page cache (posix_fadvise DONTNEED on our own fds; not a global drop).
     void drop_cache();

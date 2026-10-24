@@ -90,7 +90,11 @@ struct WStore {
     ggml_context * ctx = nullptr;
     std::vector<ggml_backend_buffer_t> bufs;
     std::map<std::string, ggml_tensor *> t;
+    /// P5.3b: false when the tensors in `t` and the buffers in `bufs` belong to another Impl (build_stages shared
+    /// them).  The owner frees; a borrower empties its own view of them and frees nothing.
+    bool owns = true;
     ~WStore() {
+        if (!owns) { ctx = nullptr; bufs.clear(); t.clear(); return; }
         for (auto b : bufs) ggml_backend_buffer_free(b);
         if (ctx) ggml_free(ctx);
     }
@@ -106,6 +110,26 @@ bool is_routed(const std::string & n) {
     return n.find("_exps.") != std::string::npos || n.find("ffn_exps_") != std::string::npos;
 }
 
+// P5.3b (mirrors skip_weight in tools/glm/glm_dense.cpp): what a STAGE does not load.  Everything outside the range
+// it runs, and nothing of the head unless it is the last stage.  `wl`/`wle` are the stage's WEIGHT bounds, one block
+// wider than its layer range on the top side (see weight_end): the layer AFTER a stage's last layer reads that
+// block's ffn_norm / router / routing-bias weights in the fused finish+predict graph, so a producer loads it too.
+bool skip_weight_stage(const std::string & n, bool skip_experts, int64_t n_layer, int64_t wl, int64_t wle,
+                      bool last_stage) {
+    if (skip_experts && is_routed(n)) return true;
+    if (n.rfind("blk.", 0) == 0) {
+        const int64_t il = std::atoll(n.c_str() + 4);
+        if (il >= n_layer) return true;                        // a block past the decoder (MTP): as before
+        if (wle > 0 && (il < wl || il >= wle)) return true;    // another stage's block
+    }
+    if (!last_stage && (n == "output.weight" || n == "output_norm.weight")) return true;
+    return false;
+}
+
+// Where a stage's block loading stops: the range it RUNS plus the one block its last layer reads ahead into,
+// unless that range already ends the model.
+static int64_t weight_end(int64_t n_layer, int64_t le) { return le >= n_layer ? n_layer : le + 1; }
+
 }  // namespace
 
 // ================================================================== Impl
@@ -115,11 +139,51 @@ struct Ds41Dense::Impl {
     Ds41DenseConfig cfg;
     Ds41Geometry g;
     std::unique_ptr<GgufModel> model;
+    std::string model_path;               ///< P5.3b: build_stages re-opens the same model for a stage
     std::vector<int64_t> layers;          // blocks in the file (0..nl-1)
     int64_t nl = 0;
     ggml_backend_t backend = nullptr;
     bool own_backend = false, cpu = true;
     WStore w;
+    /// P5.3b: whose weight tensors we borrowed (build_stages; nullptr = ours to free).  Set before any shared tensor
+    /// pointer is copied in, so a half-shared Impl is either empty or fully owned - never dangling.
+    Impl * w_owner = nullptr;
+    bool share_weights = false;      ///< cfg.share_weights: init() takes no weight tensors of its own
+    /// P5.3b: this instance's layer range [lb, le) and the WEIGHT bounds it loads (its range plus the one block its
+    /// last layer reads ahead into - build_finish_predict of layer le-1 predicts layer le, and the next stage's
+    /// attn_router(il) builds layer il's graph on demand, so the tensors are needed even though the RUN never
+    /// executes block le).  Defaults: the whole model.
+    int64_t lb = 0, le = 0, wl = 0, wle = 0;
+    bool is_first = true, is_last = true;
+    /// The layer range the persistent state was allocated for: [lb, le).  A stage's LAST layer (le-1) is the producer
+    /// of the compressed KV / index keys its successor's layers read (the geometry's kv_src/idx_src resolve to the
+    /// latest source <= l), so its rings live here; the successor's layers only ever READ tensors this stage owns.
+    /// That is why a stage on ANOTHER card must be handed the KV too (the engine relays it, or the two stages share
+    /// the producer's card) - see the note at the state allocation in init().
+    int64_t state_end() const { return le; }
+    /// P5.3b: does THIS stage run layer `il`?  Every per-layer entry point says so or fails loudly - a layer run
+    /// twice would double-advance the state and a layer nobody runs would leave a relayed column unwritten.
+    bool owns_layer(int64_t il) const { return il >= lb && il < le; }
+    /// P5.3b: true once this instance is part of a staged run (build_stages sets it on every stage).  It is what makes
+    /// the graph builders take the pass's column window from the impl instead of the caller's argument, and what
+    /// enables window_col0(); a single-instance run never reads either.
+    bool staged = false;
+    /// P5.3b: the column a relayed piece of n tokens starts in.  A pass of N tokens is run piecewise by each stage
+    /// inside its own window (see set_pass_cap and staged_pass), and the boundary carries the producer's WHOLE N-column
+    /// block, laid out contiguously.  So the consumer's columns for the producer's columns [k, k+m) are [k, k+m):
+    /// `src_col` is the offset the producer's block starts at, and a piece never crosses a consumer window because the
+    /// consumer's window is the smaller one and every piece is sized to it.
+    /// The column a staged pass of n tokens starting at absolute position pos runs in.  Passes of a window's worth
+    /// cycle the NC columns (NC/S windows); a shorter pass (a decode step, a prompt's tail) still starts at a window
+    /// boundary, chosen by the same position math, so the producer and the consumer of a boundary agree.
+    int64_t stage_col0(int64_t pos, int n) const {
+        const int64_t s = std::max<int64_t>(1, S);
+        const int64_t nwin = std::max<int64_t>(1, NC / s);
+        const int64_t c = (pos / s) % nwin * s;   // the window this position's pass runs in
+        // A short pass (a prompt's tail, a decode step) starts a window but does not fill it; it may not run past the
+        // allocation either, so clamp it inside the columns.  Both bounds hold because n <= S <= NC.
+        return std::min(c, std::max<int64_t>(0, NC - n));
+    }
     Ds41Engram engram;
     std::string err;
 
@@ -141,6 +205,19 @@ struct Ds41Dense::Impl {
     ggml_tensor * o_wts = nullptr;        // [NU, NC]
     ggml_tensor * routed = nullptr;       // [D, NC]
     ggml_tensor * cand = nullptr;         // I32 [CB, NC]  candidate blocks of cand_layer
+    /// P5.3b: the CANDIDATE relay - the boundary copy of cand_layer's blocks, used ONLY when the candidate WRITER and a
+    /// candidate READER live on different cards.  `cand` is then this stage's own tensor, which the successor fills
+    /// from the producer's via relay_read_out / relay_write_in; `cand_src_prev` is the PRODUCER's tensor the graphs read
+    /// instead, on the stage that receives the relay.  The engine's KV rule normally keeps producer and readers in one
+    /// stage (a boundary must follow a kv AND index source, and cand_layer 20 is one), so this path exists for the case
+    /// where it cannot: it is a per-token top-k selection crossing cards, and reading the producer's own tensor keeps
+    /// the gathered ids bit-identical to the unsplit run.
+    ggml_tensor * cand_src_prev = nullptr;
+    /// P5.3b: the PRODUCER's pass window when its candidate column is read in place (relay_cand_from).  The writer
+    /// aligns its column to its own window; this stage reads it at ITS offset, so the two must be the same size.
+    /// The engine's staged run keeps every stage at one pass cap (build_stages requires the configs to agree and
+    /// ds41_generate sets the same cap on all of them), so this is a tripwire, not a mode.
+    int64_t cand_src_cap = 0;
     struct Layer {
         int64_t ratio = 0;
         bool kv_src = false, idx_src = false, cand_src = false, uses_cand = false;
@@ -203,6 +280,8 @@ struct Ds41Dense::Impl {
     std::vector<int32_t> host_ids;
     const uint8_t * embd = nullptr;       // token_embd F16 rows on the mmap
     std::vector<std::vector<float>> eng_rows;
+    std::vector<int64_t> eng_slots;      ///< P5.3b: the Engram slots THIS stage's range holds (its engram_layers), in
+                                         /// file order - the order Ds41Engram::rows()/start() return rows in
     // The pass's Engram reads, started (async) by upload_inputs and waited at the first Engram layer's span /
     // attn_router: the whole pass's rows are read from disk while the embeddings, the init graph and the layers below
     // the first Engram layer (1) run.  Null once uploaded (or when Engram is off) - see engram_ready().
@@ -231,6 +310,16 @@ struct Ds41Dense::Impl {
         if (gctx) ggml_free(gctx);
         if (own_backend && backend) ggml_backend_free(backend);
     }
+    /// Does a stage's relay payload carry cand_layer's candidate blocks?  True iff some stage owns that layer (the
+    /// only writer) AND some layer AFTER it reads it, i.e. the model has an index source past cand_layer (it does).
+    /// A property of the geometry, so it can be asked before any stage exists - and it must be: the engine sizes the
+    /// staging slab before it builds the stages.
+    static bool cand_is_relayed(const strata::v41::Ds41Geometry & g) {
+        if (g.cand_layer < 0 || g.cand_layer >= (int64_t) g.ratio.size()) return false;
+        for (int64_t k : g.index_sources) if (k > g.cand_layer) return true;
+        return false;
+    }
+
     ggml_tensor * W(const std::string & n) const { return w.get(n); }
     ggml_tensor * BL(int64_t il, const std::string & s) const { return w.get("blk." + std::to_string(il) + "." + s); }
     // the router as the prediction graphs read it: the STRATA_PRED_ROUTER copy when the loader made one, else the F32
@@ -256,8 +345,13 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
         ggml_set_name(t, ti.name.c_str());
         return t;
     };
-    // routed experts never reach ggml (PTQ1_0 = 143 is past GGML_TYPE_COUNT); the I32 maps are read by the geometry
-    auto skip = [&](const std::string & n) { return is_routed(n) || n == "token_embd.weight"; };
+    // routed experts never reach ggml (PTQ1_0 = 143 is past GGML_TYPE_COUNT); the I32 maps are read by the geometry.
+    // P5.3b: on a staged run a stage also skips another stage's blocks and (unless it is the last one) the head.
+    // wl/wle are the stage's WEIGHT bounds (its range plus the one block its last layer reads ahead into).
+    const int64_t wl = im.wl, wle = im.wle;
+    auto skip = [&](const std::string & n) {
+        return skip_weight_stage(n, true, im.nl, wl, wle, im.is_last);
+    };
     if (im.cpu) {
         for (size_t s = 0; s < model.size(); ++s) {
             const GgufFile & sh = model.shard(s);
@@ -359,9 +453,14 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                                rq_from / 1e9, rq_to / 1e9);
         if (pq_n) std::fprintf(stderr, "prediction routers: %zu F32 copies as %s\n", pq_n, ggml_type_name(pq));
     }
-    size_t si = 0;
-    const TensorInfo * te = model.find("token_embd.weight", &si);
-    im.embd = model.shard(si).tensor_data(*te);
+    // The token embeddings are read from the GGUF mmap on the HOST (upload_inputs), never uploaded: only the first
+    // stage looks tokens up, so only it maps the rows.  share_weights (a stage that borrowed the whole load) keeps the
+    // owner's pointer, which is why it is not cleared here.
+    if (im.is_first || im.share_weights) {
+        size_t si = 0;
+        const TensorInfo * te = model.find("token_embd.weight", &si);
+        im.embd = model.shard(si).tensor_data(*te);
+    }
     return true;
 }
 
@@ -473,9 +572,24 @@ static ggml_tensor * fake_quant(ggml_context * gc, ggml_tensor * x, Ds41Quant mo
 #endif
 }
 
-static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0) {
+// The column a graph's pass reads and writes.  Unsplit, a pass starts at column 0 and col0 is the caller's; a STAGED
+// stage's pass lives in its own window (relay_write_in set im.col0 when the payload landed), so the builders read the
+// window from the impl rather than a parameter - a stale call site cannot then silently run a staged pass at column 0.
+static inline int64_t pass_col0(const Ds41Dense::Impl & im, int64_t col0) { return im.staged ? im.col0 : col0; }
+
+static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0_p = 0) {
+    const int64_t col0 = pass_col0(im, col0_p);
     using L_t = Ds41Dense::Impl::Layer;
     L_t & L = im.ly[(size_t) il];
+    // P5.3b: the compressed KV / index keys a layer reads belong to the LATEST source at or below it, which may be a
+    // layer no stage in this run allocated state for (the model's first kv/index source is layer 2, so a split at
+    // layer 2 leaves stage 1 with no producer).  Null is a bug we want loud, not a null into a graph.
+    if (L.ratio && (!im.ly[(size_t) L.kvl].comp || !im.ly[(size_t) L.idxl].idxk)) {
+        std::fprintf(stderr, "[ds41_dense] build_attn: layer %lld reads the KV of layer %lld / the index keys of "
+                     "layer %lld, whose state this stage does not own\n", (long long) il, (long long) L.kvl,
+                     (long long) L.idxl);
+        std::abort();
+    }
     const Ds41Geometry & G = im.g;
     B b { &im, gc, &G };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 8192, false);
@@ -593,10 +707,14 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                 ggml_tensor * sc = ggml_lightning_indexer(gc, iq, ksrc, iw, ggml_cast(gc, vis, GGML_TYPE_F16));   // [cap, n]
                 sc = ggml_reshape_2d(gc, sc, cap, n);
                 if (L.uses_cand) {   // rank only inside cand_layer's candidate blocks
+                    // P5.3b: the tensor whose columns are read is the PRODUCER's when the producer lives on another
+                    // card (cand_src_prev, read in place - same-card stages) or this stage's own copy of the relayed
+                    // bytes (cross-card).  Either way it is I32 [CB, NC] with the same strides, so one expression.
+                    ggml_tensor * cnd = im.cand_src_prev ? im.cand_src_prev : im.cand;
                     const int64_t nblk = (cap + im.CBS - 1) / im.CBS, ncb = std::min<int64_t>(im.CB, nblk);
                     ggml_tensor * m = ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, im.CBS, nblk, n), NEG_INF);
                     ggml_tensor * z = ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, im.CBS, ncb, n), 0.0f);
-                    m = ggml_set_rows(gc, m, z, ggml_cont(gc, ggml_view_2d(gc, im.cand, ncb, n, im.cand->nb[1], (size_t) col0 * im.cand->nb[1])));
+                    m = ggml_set_rows(gc, m, z, ggml_cont(gc, ggml_view_2d(gc, cnd, ncb, n, cnd->nb[1], (size_t) col0 * cnd->nb[1])));
                     m = ggml_view_2d(gc, m, cap, n, m->nb[2], 0);
                     sc = ggml_add(gc, sc, m);
                 }
@@ -744,9 +862,17 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
 // output columns, so a prompt token whose later layers are never read does not need them.  The state it does write is
 // exactly what build_attn writes for those positions, so a later query's window / compressed reads see the same
 // values as the full path (verified by the enc-skip gate).
-static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0) {
+static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0_p = 0) {
+    const int64_t col0 = pass_col0(im, col0_p);
     using L_t = Ds41Dense::Impl::Layer;
     L_t & L = im.ly[(size_t) il];
+    // P5.3b: as in build_attn - a layer whose KV / index-key source this stage does not own is a bug, said loudly.
+    if (L.ratio && (!im.ly[(size_t) L.kvl].comp || !im.ly[(size_t) L.idxl].idxk)) {
+        std::fprintf(stderr, "[ds41_dense] build_attn_kv_only: layer %lld reads the KV of layer %lld / the index "
+                     "keys of layer %lld, whose state this stage does not own\n", (long long) il, (long long) L.kvl,
+                     (long long) L.idxl);
+        std::abort();
+    }
     const Ds41Geometry & G = im.g;
     B b { &im, gc, &G };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 8192, false);
@@ -841,7 +967,8 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
 }
 
 // finish: x_state = hc_post(shexp + routed, hap, post_f, comb_f).  col0: the batch column (0 on the single-pass paths).
-static ggml_cgraph * build_finish(Ds41Dense::Impl & im, ggml_context * gc, int64_t n, int64_t col0 = 0) {
+static ggml_cgraph * build_finish(Ds41Dense::Impl & im, ggml_context * gc, int64_t n, int64_t col0_p = 0) {
+    const int64_t col0 = pass_col0(im, col0_p);
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
@@ -872,7 +999,11 @@ static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * g
     // argsort gives all the rows and ONE readback fetches them ([16, 1 + ahead] I32)
     for (int a = 1; a <= ahead && aout; ++a) {
         const int il = next_il + a;
-        if (il >= (int) im.ly.size()) break;
+        // P5.3b: stop at the model's last layer AND at this stage's own range: the fused graph reads block il's
+        // ffn_norm / router / routing-bias weights, and a stage only loads the ONE block past its range (the one
+        // its finish_predict(next_il = le-1) needs).  A caller that asked for more gets fewer rows, which the
+        // readback loop already fills with -1 (never a prefetch hint for a layer this card cannot see).
+        if (il >= (int) im.ly.size() || il >= im.wle) break;
         ggml_tensor * ra = ggml_mul_mat(gc, im.BLpred(il), b.rms_w(xp, im.BL(il, "ffn_norm.weight")));
         ggml_mul_mat_set_prec(ra, GGML_PREC_F32);
         ggml_tensor * sa = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, ra)), im.BL(il, "exp_probs_b.bias")),
@@ -902,7 +1033,8 @@ static ggml_cgraph * build_head(Ds41Dense::Impl & im, ggml_context * gc, int64_t
 
 // begin: x_state = repeat(embd), pre_state = one-hot (model.py make_identity_pre_mix).  col0: the batch column the
 // pass's n tokens live at (0 on the single-pass paths).
-static ggml_cgraph * build_init(Ds41Dense::Impl & im, ggml_context * gc, int64_t n, int64_t col0 = 0) {
+static ggml_cgraph * build_init(Ds41Dense::Impl & im, ggml_context * gc, int64_t n, int64_t col0_p = 0) {
+    const int64_t col0 = pass_col0(im, col0_p);   // stage 0 always: begin() set col0 = 0
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
@@ -1006,11 +1138,36 @@ bool Ds41Dense::set_columns(int nc) {
 
 int Ds41Dense::columns() const { return (int) p_->NC; }
 
+// P5.3b: the pass cap a STAGED run enforces (see the header).  Deliberately NOT a set_columns(): the state columns
+// stay at their allocation, only the largest pass the graphs are built for gets smaller, so a stage's per-pass scratch
+// (the Engram rows, the window masks, the chunk's compute buffer) follows the staging while the columns another stage
+// reads in place do not move.
+void Ds41Dense::set_pass_cap(int n) {
+    Impl & im = *p_;
+    if (n < 1 || n > (int) im.NC) return;
+    im.S = n;
+    im.cfg.max_pass = n;
+    im.graphs.clear();
+    im.logits_out.clear();
+    im.predict_out.clear();
+    im.predict_out_n.clear();
+    im.fpredict_out.clear();
+    im.fpredict_ahead.clear();
+    for (Allo * al : { &im.allo_dec, &im.allo_pass }) {
+        if (al->a) ggml_gallocr_free(al->a);
+        al->a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
+        al->graph_epoch.clear();
+        al->compute_bufs.clear();
+        ++al->epoch;
+    }
+}
+
 bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std::string & err) {
     Impl & im = *p_;
     im.cfg = cfg;
     try {
         im.model = std::make_unique<GgufModel>(GgufModel::open(path));
+        im.model_path = path;
     } catch (const std::exception & e) {
         err = e.what();
         return false;
@@ -1021,6 +1178,29 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     for (size_t i = 0; i < im.layers.size(); ++i)
         if (im.layers[i] != (int64_t) i) { err = "the file's blocks must be 0..k"; return false; }
     im.nl = (int64_t) im.layers.size();
+    // ---- P5.3b: the stage's range.  Defaults (lb 0, le 0 = nl, is_first/is_last true) give the single-stage run of
+    // the last release.  The checks are the ones build_stages also makes, kept here so a hand-built config that lies
+    // about its position fails at init rather than producing a run with no embeddings or no head.
+    im.share_weights = cfg.share_weights;
+    im.lb = cfg.lb;
+    im.le = cfg.le > 0 ? cfg.le : im.nl;
+    im.is_first = cfg.is_first;
+    im.is_last = cfg.is_last;
+    if (im.lb < 0 || im.le > im.nl || im.lb >= im.le) {
+        err = "stage layer range [" + std::to_string(im.lb) + "," + std::to_string(im.le) +
+              ") is not inside the model's [0," + std::to_string(im.nl) + ")";
+        return false;
+    }
+    if (!cfg.is_first && im.lb == 0) { err = "stage [" + std::to_string(im.lb) + "," + std::to_string(im.le) +
+                                           ") starts at 0 but says it is not the first stage"; return false; }
+    if (!cfg.is_last && im.le == im.nl) { err = "stage [" + std::to_string(im.lb) + "," + std::to_string(im.le) +
+                                               ") ends the model but says it is not the last stage"; return false; }
+    if (im.lb > 0 && !cfg.share_weights && im.is_first) { err = "internal: is_first with lb > 0"; return false; }
+    // The weight bounds: the range it RUNS plus the one block its last layer reads ahead into (see Impl::wle).
+    // A stage that borrows the whole load (share_weights) loads nothing, so its bounds do not matter; leaving them
+    // full-width keeps them honest if a borrowed Impl is ever asked what the model has.
+    im.wl = im.share_weights ? 0 : im.lb;
+    im.wle = im.share_weights ? im.nl : weight_end(im.nl, im.le);
     const Ds41Geometry & G = im.g;
     im.D = G.n_embd; im.HC = G.hc; im.DH = G.d_head; im.DHR = G.d_rope; im.NH = G.n_head; im.OG = G.o_groups;
     im.OL = G.o_lora; im.OGD = G.n_head * G.d_head / G.o_groups; im.RQ = G.r_q; im.SWA = G.n_swa;
@@ -1047,8 +1227,16 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         im.own_backend = true;
     }
     im.cpu = ggml_backend_is_cpu(im.backend);
-    if (!load_weights(im, err)) return false;
-    if (!cfg.engram_dirs.empty() && !im.engram.open(G, cfg.engram_dirs, cfg.engram_threads, err)) return false;
+    // share_weights (set by build_stages): this stage takes NO weight tensors of its own - it adopted the owner's map
+    // BEFORE this init ran (build_stages adopts first, because init builds graphs that look weights up by name).
+    if (!im.share_weights && !load_weights(im, err)) return false;
+    // The Engram tables are ~GBs of host memory and only the layer range that holds an engram layer reads them, so a
+    // stage that owns none does not open them (its graphs never ask: no layer in its range has an eslot).
+    const int64_t sen = im.state_end();
+    bool stage_engram = false;
+    for (int64_t l = im.lb; l < sen; ++l)
+        if (G.engram_slot(l) >= 0) { stage_engram = true; im.eng_slots.push_back(G.engram_slot(l)); }
+    if (!cfg.engram_dirs.empty() && stage_engram && !im.engram.open(G, cfg.engram_dirs, cfg.engram_threads, err)) return false;
 
     // layers
     im.ly.resize((size_t) im.nl);
@@ -1080,7 +1268,14 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         }
     };
     const int64_t D = im.D, NCM = im.NCmax;
-    for (int64_t l = 0; l < im.nl; ++l) {
+    // P5.3b: the persistent state covers the layers THIS stage writes and its successor reads: [lb, state_end()).  A
+    // stage's LAST layer is the producer of the compressed KV / index keys every later layer of its ratio reads (the
+    // geometry's kv_src/idx_src always resolve to the latest source <= l, which for a successor layer is at or below
+    // this stage's end), so its rings belong here and the successor's layers - which only READ them - allocate none.
+    // A stage that ends the model allocates to nl (its own range, unchanged).  Layers outside the range keep null
+    // state tensors, which is also what makes attn_router(il) fail loudly for another stage's layer.
+    const int64_t s_end = sen;
+    for (int64_t l = im.lb; l < s_end; ++l) {
         auto & L = im.ly[(size_t) l];
         L.raw = T(kvt, { im.DH, im.RAW });
         L.raw_snap = T(kvt, { im.DH, im.RAW });
@@ -1106,6 +1301,10 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     // the ratio-2 state scores start at -1e30 (an unwritten state gets softmax weight 0); sel = 0 (a valid row)
     for (auto & L : im.ly)
         if (L.st_sc) { std::vector<float> v((size_t) (im.DH * 2), -1.0e30f); ggml_backend_tensor_set(L.st_sc, v.data(), 0, v.size() * 4); }
+    // P5.3b: the candidate blocks live in the NC-column group (im.cand, alloc_cols).  Every stage allocates the
+    // tensor, because the relay WRITES the producer's candidates into the successor's tensor at a boundary; on a
+    // stage that neither writes nor reads them it is CB * NC * 4 bytes of never-touched memory (CB=2048, one
+    // column: 8 KiB) - cheap enough that one rule for every stage beats a conditional payload.
     // inputs
     ggml_init_params ipp = { ggml_tensor_overhead() * 64, nullptr, true };
     im.ictx = ggml_init(ipp);
@@ -1147,9 +1346,322 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     return true;
 }
 
+// ================================================================== P5.3b: the staged run
+
+int64_t Ds41Dense::stage_begin() const { return p_->lb; }
+int64_t Ds41Dense::stage_end() const { return p_->le; }
+int64_t Ds41Dense::stage_layers() const { return p_->le - p_->lb; }
+int64_t Ds41Dense::n_layer_total() const { return p_->nl; }
+bool Ds41Dense::is_last_stage() const { return p_->is_last; }
+bool Ds41Dense::weights_shared() const { return p_->w_owner != nullptr; }
+bool Ds41Dense::relay_carries_cand() const { return Impl::cand_is_relayed(p_->g); }
+// P5.3b: is there a layer AFTER cand_layer that ranks inside its candidate blocks (the same test the relay payload
+// uses), and where would a boundary have to fall to separate the producer from a reader?
+bool Ds41Dense::stages_keep_candidates_local(const strata::v41::Ds41Geometry & g, const std::vector<int64_t> & ends_in,
+                                            bool cross_card, std::string & err) {
+    if (!Impl::cand_is_relayed(g)) return true;   // no candidate blocks, or nobody after them reads them
+    // ends_in may be the split's FULL end list (the last one being n_layer, from --gpus' default tiling) or the
+    // boundary list only; drop the trailing n_layer so `stage_of` counts stages, not ends.
+    std::vector<int64_t> ends = ends_in;
+    const int64_t n_layer = (int64_t) g.ratio.size();
+    while (!ends.empty() && ends.back() >= n_layer) ends.pop_back();
+    const int64_t cl = g.cand_layer;
+    int64_t last_reader = -1;
+    for (int64_t k : g.index_sources) if (k > cl) last_reader = std::max(last_reader, k);
+    // The producer is in the stage whose range holds cl; a reader is in the stage holding some index source > cl.
+    auto stage_of = [&](int64_t l) { int s = 0; for (int64_t e : ends) if (l >= e) ++s; return s; };
+    // The producer's stage must end at cl + 1, so the producer is the stage IMMEDIATELY before the first reader and
+    // the in-place read (relay_cand_from) reaches it.  With more than two stages, a reader two or more stages after the
+    // producer has nothing to borrow: stage s reads stage s-1's column, which never held the producer's.
+    const int owner = stage_of(cl), reader = stage_of(last_reader);
+    if (owner == reader) return true;
+    if (owner + 1 != reader) {
+        err = "layer " + std::to_string(cl) + " picks the candidate blocks the indexers of layer " +
+              std::to_string(last_reader) + " rank inside, and this split puts the producer " +
+              std::to_string(reader - owner) + " stage(s) away from a reader; only the stage right after the producer "
+              "can reach its candidate column, so end stage " + std::to_string(owner) + " at layer " +
+              std::to_string(cl + 1) + " (or past the last index source).";
+        return false;
+    }
+    if (cross_card) {
+        // ACROSS CARDS the candidate column rides in the relay payload: no stage can read another card's tensor, so
+        // every stage keeps a region of its own and the slab stays the same number on both sides.  The engine's split
+        // check (ds41_generate.cpp) turns this into that decision, and refuses only what is genuinely unrunnable - a
+        // producer its readers cannot reach, which the stranded case above already reported.
+        return true;
+    }
+    // ONE CARD: the successor's graphs may point at the producer's own tensor (relay_cand_from), which is bit-exact by
+    // construction and costs no copy.  A caller that has not decided yet gets false and makes the choice.
+    err = "layer " + std::to_string(cl) + "'s candidate blocks are read by layer " + std::to_string(last_reader) +
+          "'s indexer, which this boundary puts in another stage; on one card the successor can read the producer's "
+          "column in place (the engine does that with relay_cand_from).";
+    return false;
+}
+
+size_t Ds41Dense::relay_cand_bytes(const strata::v41::Ds41Geometry & g) {
+    return Impl::cand_is_relayed(g) ? (size_t) (g.cand_blocks * 4) : 0;
+}
+bool Ds41Dense::cand_relay_needed(const strata::v41::Ds41Geometry & g) { return Impl::cand_is_relayed(g); }
+std::vector<int64_t> Ds41Dense::engram_slots() const { return p_->eng_slots; }
+
+/// "2, 8, 14, 20, 24, 28, 32, 36" - the layers a boundary may legally follow (the intersection of the kv and
+/// index source lists), for build_stages' rejection message.
+static std::string ds41_source_layers_str(const strata::v41::Ds41Geometry & g) {
+    std::string r;
+    for (int64_t l = 0; l < (int64_t) g.ratio.size(); ++l)
+        if (g.is_kv_source(l) && g.is_index_source(l)) { if (!r.empty()) r += ", "; r += std::to_string(l); }
+    return r.empty() ? "none" : r;
+}
+
+// P5.3b: the same rule build_stages enforces, factored out so a caller can check a planned --layer-split against the
+// GEOMETRY alone (no weights, no state, no GPU).  `ends` = the end of every stage but the last.
+bool Ds41Dense::split_boundaries_ok(const strata::v41::Ds41Geometry & g, const std::vector<int64_t> & ends,
+                                    std::string & err) {
+    const int64_t n_layer = (int64_t) g.ratio.size();
+    int64_t prev = 0;
+    for (size_t i = 0; i < ends.size(); ++i) {
+        const int64_t e = ends[i];
+        if (e <= prev || e >= n_layer) {
+            err = "stage boundary " + std::to_string(e) + " is not inside (0," + std::to_string(n_layer) +
+                  ") and above the previous boundary " + std::to_string(prev);
+            return false;
+        }
+        const int64_t last = e - 1;
+        if (!g.is_kv_source(last) || !g.is_index_source(last)) {
+            err = "a boundary after layer " + std::to_string(last) + " would leave the next stage reading the "
+                  "compressed KV of layer " + std::to_string(g.kv_src(e)) + " and the index keys of layer " +
+                  std::to_string(g.idx_src(e)) + ", state the previous stage does not own; a stage boundary must come "
+                  "after a kv AND index source layer (this model's: " + ds41_source_layers_str(g) + ")";
+            return false;
+        }
+        prev = e;
+    }
+    return true;
+}
+
+// The bytes per token of a boundary payload: the two state columns every successor reads, plus the candidate column
+// when any stage produces candidates a later stage consumes.  x_state [D, HC, NC] and pre_state [HC, NC] are laid
+// out column-major, so each tensor's NC columns are contiguous from byte 0 and their strides are exactly these
+// numbers - a region is one contiguous copy, and the relay's staging is in this order.
+size_t Ds41Dense::relay_slab_bytes() const {
+    const Impl & im = *p_;
+    size_t s = (size_t) (im.D * im.HC * 4) + (size_t) (im.HC * 4);
+    // The candidate column rides along unless this stage was told it reads the producer's tensor in place
+    // (relay_cand_from): then it has no candidate region and the payload is the state region alone.
+    if (relay_owns_cand_region()) s += (size_t) (im.CB * 4);   // im.cand is I32 [CB, NC]
+    return s;
+}
+
+// Take over the owner's weight tensors.  The order is the point (identical reasoning to GLM's adopt_weights): the
+// store is emptied first (a share_weights stage never allocated its own, so there is nothing to free), the owner
+// pointer is set BEFORE the live tensor pointers are copied in, so any failure between the two leaves a store that
+// is either empty (WStore::get aborts loudly) or fully owned - never a dangling pointer, and never a borrowed Impl
+// that frees what it borrowed.
+static void adopt_weights_into(Ds41Dense::Impl & st, Ds41Dense::Impl * owner) {
+    st.w.ctx = nullptr;
+    st.w.bufs.clear();
+    st.w.t.clear();
+    st.w.owns = false;
+    st.w_owner = owner;
+    st.w.t = owner->w.t;   // the live tensor pointers (the map itself stays ours)
+    st.w.ctx = owner->w.ctx;
+    st.w.bufs = owner->w.bufs;
+    // The token embeddings are read from the owner's GGUF mmap (the file it opened is the same model), so a borrowed
+    // stage's host lookups read the owner's mapping - it is not freed until the owner is.
+    st.embd = owner->embd;
+}
+
+// P5.3b (mirrors GlmDense::build_stages): build the stages of a split run on THIS instance's weights.  A stage whose
+// cfg.backend is this instance's borrows the tensors (one load, one copy: stage 0 also needs the embeddings and the
+// last stage also needs the head, so n separate loads would hold more than the whole model on the card the split is
+// meant to help); a stage on another card cannot borrow tensors that live in the first card's memory, so it loads
+// its OWN range onto its own backend and its destructor frees exactly that.
+bool Ds41Dense::build_stages(std::vector<std::unique_ptr<Ds41Dense>> & stage, const std::vector<Ds41DenseConfig> & cfg,
+                             std::string & err) {
+    Impl & im = *p_;
+    if (im.w_owner) { err = "build_stages: this instance shares another's weights; it cannot hand them on"; return false; }
+    if (stage.size() != cfg.size()) { err = "build_stages: " + std::to_string(stage.size()) + " stages, " +
+                                            std::to_string(cfg.size()) + " configs"; return false; }
+    if (stage.empty()) { err = "build_stages: no stages"; return false; }
+    const int64_t n_layer = im.nl;
+    // Validate the tiling BEFORE loading anything: an overlap would run a layer twice and a gap would leave a column
+    // of the relay payload unwritten, so both are refused here rather than seen in the numbers.
+    int64_t next_lb = 0;
+    for (size_t s = 0; s < stage.size(); ++s) {
+        const Ds41DenseConfig & c = cfg[s];
+        const int64_t le = c.le > 0 ? c.le : n_layer;
+        if (c.lb != next_lb) {
+            err = "build_stages: stage " + std::to_string(s) + " starts at layer " + std::to_string(c.lb) +
+                  ", but the stage before it ends at " + std::to_string(next_lb) +
+                  " (the ranges must tile the model with no gap and no overlap)";
+            return false;
+        }
+        if (le <= c.lb || le > n_layer) {
+            err = "build_stages: stage " + std::to_string(s) + " range [" + std::to_string(c.lb) + "," +
+                  std::to_string(le) + ") is outside the model's [0," + std::to_string(n_layer) + ")";
+            return false;
+        }
+        if (c.is_first != (s == 0) || c.is_last != (s + 1 == stage.size())) {
+            err = "build_stages: stage " + std::to_string(s) + " of " + std::to_string(stage.size()) +
+                  " says is_first=" + std::to_string(c.is_first) + " is_last=" + std::to_string(c.is_last) +
+                  "; the first stage owns the token embeddings and the last one owns the head";
+            return false;
+        }
+        if (c.max_pass != im.cfg.max_pass || c.ctx_max != im.cfg.ctx_max) {
+            err = "build_stages: stage " + std::to_string(s) + " has max_pass " + std::to_string(c.max_pass) +
+                  " / ctx_max " + std::to_string(c.ctx_max) + ", but the run's are " + std::to_string(im.cfg.max_pass) +
+                  " / " + std::to_string(im.cfg.ctx_max) + " (a relayed column is only the same tensor on both sides"
+                  " if both sides sized it the same way)";
+            return false;
+        }
+        // P5.3b THE KV RULE, and the reason the boundary is legal at all: a stage's LAST layer (le-1) must be the
+        // producer of the compressed KV and the index keys its successor's layers read, because that is the only
+        // persistent state a boundary cannot leave in place - the successor runs on another card and reads the
+        // producer's rings by POINTER inside one graph (a per-token KV relay would be a D2H/H2D of the whole visible
+        // cache, every pass).  The geometry's kv_src/idx_src resolve to the latest source <= l, so requiring the
+        // layer BEFORE the boundary to be a kv AND index source makes every successor read only this stage's rings.
+        // A boundary anywhere else is refused here, not discovered as a null tensor mid-graph.
+        if (le < n_layer) {
+            std::string berr;
+            if (!split_boundaries_ok(im.g, { le }, berr)) {
+                err = "build_stages: stage " + std::to_string(s) + ": " + berr;
+                return false;
+            }
+        }
+        next_lb = le;
+    }
+    if (next_lb != n_layer) {
+        err = "build_stages: the stages cover " + std::to_string(next_lb) + " of the model's " +
+              std::to_string(n_layer) + " layers";
+        return false;
+    }
+    for (size_t s = 0; s < stage.size(); ++s) {
+        if (!stage[s]) stage[s] = std::make_unique<Ds41Dense>();   // a caller may pass the vector holding nothing
+        Ds41DenseConfig sc = cfg[s];
+        const bool same_be = !sc.backend || sc.backend == im.backend;
+        if (same_be) {
+            sc.share_weights = true;   // init(): geometry, checks and graphs - but no weight tensors of its own
+            sc.backend = im.backend;   // the owner's backend; the stage neither creates nor frees one
+            // Adopt BEFORE init: init ends by building graphs, and a graph build looks weights up by name.  Borrowing
+            // up front is safe under the same invariant as the borrow after it: w_owner is set first and WStore
+            // checks `owns`, so a borrowed Impl frees nothing it borrowed.
+            adopt_weights_into(*stage[s]->p_, &im);
+        }
+        if (!stage[s]->init(im.model_path, sc, err)) {
+            err = "build_stages: stage " + std::to_string(s) + ": " + err;
+            return false;
+        }
+        Impl & st = *stage[s]->p_;
+        if (st.g.n_layer != im.g.n_layer || st.g.n_embd != im.g.n_embd || st.g.hc != im.g.hc ||
+            st.g.cand_blocks != im.g.cand_blocks || st.g.cand_layer != im.g.cand_layer) {
+            err = "build_stages: stage " + std::to_string(s) + "'s geometry does not match the model this instance loaded";
+            return false;
+        }
+        // A relayed column is only the same tensor on both sides if the stages sized it the same way: every stage gets
+        // the OWNER's context limit (the compressed-row counts and every index map derive from it) whatever its config
+        // said.  The state COLUMNS stay at the run's width on every stage, including one on another card - a later
+        // stage may share the producer's card and read the producer's candidate tensor in place, and a graph that reads
+        // it spans the same columns.  What the staging limits is the PASS, which the engine sets per stage with
+        // set_pass_cap() after this returns.
+        if (same_be) adopt_weights_into(st, &im);   // idempotent re-adopt after the geometry check
+        st.staged = true;   // the graph builders read the pass's column window from the impl (see pass_col0)
+    }
+    return true;
+}
+
+// The relay's two halves.  Each region starts at byte 0 of its tensor (the pass's columns are the leading columns of
+// a column-major state tensor), so a boundary is relay_slab_bytes()/token contiguous bytes in relay_slab_bytes()'s
+// region order; the sync is the native relay's rule - the producer's stream completion observed by the HOST before
+// the successor is launched (docs/gfx906/P5-RELAY-PATTERN.md section 1a), no cross-device event anywhere.
+bool Ds41Dense::relay_read_out(int n, void * dst, size_t dst_bytes) {
+    Impl & im = *p_;
+    if (n < 1 || n > (int) im.NC) { im.err = "relay_read_out: pass size out of range"; return false; }
+    if (!dst) { im.err = "relay_read_out: no destination"; return false; }
+    const size_t xs = (size_t) (im.D * im.HC * 4), ps = (size_t) (im.HC * 4);
+    // the cand region is this instance's to copy only if it produced it (see relay_slab_bytes's rule)
+    const size_t cs = relay_slab_bytes() - xs - ps;
+    const size_t bytes = ((xs + ps + cs) * (size_t) n);
+    if (dst_bytes < bytes) {
+        im.err = "relay_read_out: the staging slot holds " + std::to_string(dst_bytes) + " bytes, the pass needs " +
+                 std::to_string(bytes);
+        return false;
+    }
+    // P5.3b: the columns the pass just ran in (see relay_write_in's window).  Unsplit, col0 is 0 and this is byte 0.
+    const int64_t c0 = im.staged ? im.col0 : 0;
+    uint8_t * d = (uint8_t *) dst;
+    ggml_backend_synchronize(im.backend);   // finish() is issued async; the payload must be complete
+    ggml_backend_tensor_get(im.x_state, d, (size_t) c0 * xs, xs * (size_t) n);
+    ggml_backend_tensor_get(im.pre_state, d + xs * (size_t) n, (size_t) c0 * ps, ps * (size_t) n);
+    if (cs)   // this stage's own candidate column
+        ggml_backend_tensor_get(im.cand, d + (xs + ps) * (size_t) n, (size_t) c0 * cs, cs * (size_t) n);
+    return true;
+}
+
+// defined below with the span helpers; declared here so relay_write_in can set the pass's ranking span.
+static void span_pass_caps(const Ds41Dense::Impl & im, int pos0, int n, int64_t out[3]);
+
+bool Ds41Dense::relay_write_in(int n, const void * src, size_t src_bytes, int64_t src_pos0) {
+    Impl & im = *p_;
+    if (n < 1 || n > (int) im.NC) { im.err = "relay_write_in: pass size out of range"; return false; }
+    if (!src) { im.err = "relay_write_in: no payload"; return false; }
+    const size_t xs = (size_t) (im.D * im.HC * 4), ps = (size_t) (im.HC * 4);
+    const size_t cs = relay_slab_bytes() - xs - ps;   // 0 when this stage reads the producer's candidates in place
+    const size_t bytes = ((xs + ps + cs) * (size_t) n);
+    if (src_bytes < bytes) {
+        im.err = "relay_write_in: the staging slot holds " + std::to_string(src_bytes) + " bytes, the pass needs " +
+                 std::to_string(bytes);
+        return false;
+    }
+    // P5.3b: the payload lands in the columns this stage runs the pass in.  Stage 0 writes from column 0 (begin());
+    // a relayed stage's window is its own pass cap, and the run's pass loop subdivides a longer pass so every stage
+    // stays inside its window (see staged_pass), which keeps the token->column map one-to-one at the boundary.
+    const int64_t c0 = im.stage_col0(src_pos0, n);
+    if (c0 + n > im.NC || n > im.S) {
+        im.err = "relay_write_in: " + std::to_string(n) + " tokens at column " + std::to_string(c0) +
+                 " run past this stage's " + std::to_string(im.NC) + " columns / window " + std::to_string(im.S);
+        return false;
+    }
+    const uint8_t * s = (const uint8_t *) src;
+    ggml_backend_synchronize(im.backend);   // whatever was reading this stage's state (or the producer's graphs)
+    ggml_backend_tensor_set(im.x_state, s, (size_t) c0 * xs, xs * (size_t) n);
+    ggml_backend_tensor_set(im.pre_state, s + xs * (size_t) n, (size_t) c0 * ps, ps * (size_t) n);
+    if (cs) ggml_backend_tensor_set(im.cand, s + (xs + ps) * (size_t) n, (size_t) c0 * cs, cs * (size_t) n);
+    // P5.3b: `src_pos0` is the position the run is feeding (the staging says which COLUMNS the payload covered; the
+    // position is what the graphs put into RoPE and the index maps).
+    im.pos0 = (int) src_pos0;
+    im.n = n;
+    im.col0 = c0;
+    // the pass's ranking span, by this stage's rule (span_pass_caps subtracts the rows below its range)
+    span_pass_caps(im, (int) src_pos0, n, im.pass_cap);
+    return true;
+}
+
+// P5.3b: read another stage's candidate blocks in place (same card).  See the header: this is only for a same-device
+// split that puts cand_layer's producer and its readers on different stages, and it makes this stage's relay payload
+// the state region alone (relay_slab_bytes() follows, so the staging is sized consistently).
+void Ds41Dense::relay_cand_from(Ds41Dense * src) {
+    Impl & im = *p_;
+    // NULL = the opposite decision: this stage keeps a candidate region of its own (the relay's default).  An explicit
+    // reset matters because build_stages applies the engine's decision to EVERY stage, including ones that never had it.
+    if (!src) { im.cand_src_prev = nullptr; return; }
+    if (!src->p_->cand) { im.err = "relay_cand_from: the source stage has no candidate tensor"; return; }
+    if (src->p_->backend != im.backend) {
+        im.err = "relay_cand_from: the source stage runs on another backend; a graph cannot read its tensor";
+        return;
+    }
+    im.cand_src_prev = src->p_->cand;
+    // P5.3b: the producer runs BEFORE this stage in every pass, so its candidate column is in the state this stage was
+    // handed - EXCEPT when this stage's pass window is narrower than the producer's, which needs the producer's own
+    // column count (set_pass_cap's cap; see the run's refusal of that combination).
+    im.cand_src_cap = src->p_->S;
+}
+bool Ds41Dense::relay_owns_cand_region() const {
+    return Impl::cand_is_relayed(p_->g) && !p_->cand_src_prev;
+}
+
 void Ds41Dense::set_route_bias(int il, const float * bias) {
     Impl & im = *p_;
-    if (il < 0 || il >= (int) im.ly.size() || !im.ly[(size_t) il].rbias) return;
+    if (il < im.lb || il >= im.state_end() || !im.ly[(size_t) il].rbias) return;   // another stage's layer
     ggml_backend_tensor_set(im.ly[(size_t) il].rbias, bias, 0, (size_t) im.NE * 4);
 }
 
@@ -1166,11 +1678,16 @@ void Ds41Dense::release_pass() {
 }
 
 // pass_cap (per ratio) of a pass of n tokens ending at pos0+n: the visible compressed rows it ranks over.
+// P5.3b: on a STAGED run the stage's rings hold only its own range's rows - the sources at or below its range were
+// produced below the split and are NOT part of this instance's state - so the rows it can rank over are the model's
+// span MINUS floor(lb/r).  Subtracting here rather than at each call site means begin(), the layer-major spans and a
+// relayed stage's window all agree by construction.
 static void span_pass_caps(const Ds41Dense::Impl & im, int pos0, int n, int64_t out[3]) {
     out[0] = 0;
     for (int r = 1; r <= 2; ++r) {
         const int64_t nvis_last = (pos0 + n) / r;
         out[r] = nvis_last == 0 ? 0 : std::min<int64_t>(next_pow2(std::max<int64_t>(nvis_last, im.CBS)), im.cmax[r]);
+        out[r] = std::max<int64_t>(0, out[r] - im.lb / r);
     }
 }
 
@@ -1192,6 +1709,8 @@ static bool engram_ready(Ds41Dense::Impl & im) {
 bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     Impl & im = *this;
     im.span_memo_pos0 = -1;   // this writes i_widx / i_wslot / i_sidx / i_sslot: upload_span's memo is stale
+    // P5.3b: a staged pass writes the tables of its own column window; it must not run past the allocation.
+    if (col0 + n > NC) { err = "internal: a staged pass runs past the state columns"; return false; }
     const int64_t D = im.D, SWA = im.SWA, RAW = im.RAW;
     // embeddings (F16 rows on the mmap)
     im.host_emb.resize((size_t) (D * n));
@@ -1200,10 +1719,12 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
         const uint16_t * row = reinterpret_cast<const uint16_t *>(im.embd) + (size_t) tids[t] * (size_t) D;
         for (int64_t i = 0; i < D; ++i) im.host_emb[(size_t) (t * D + i)] = ggml_fp16_to_fp32(row[i]);
     }
-    ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), 0, im.host_emb.size() * 4);
+    // P5.3b: the same column offset for the embeddings and the positions (only stage 0 has embeddings at all, and a
+    // staged piece of it lives at col0, so build_init's b.cols2(..., col0) must read the same slice).
+    ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), (size_t) im.col0 * (size_t) D * 4, im.host_emb.size() * 4);
     std::vector<int32_t> pos(n);
     for (int t = 0; t < n; ++t) pos[t] = pos0 + t;
-    ggml_backend_tensor_set(im.i_pos, pos.data(), 0, (size_t) n * 4);
+    ggml_backend_tensor_set(im.i_pos, pos.data(), (size_t) im.col0 * 4, (size_t) n * 4);
     // window: per query the SWA positions [p - SWA + 1, p] as rows of [ring (RAW) | pass rows]
     std::vector<int32_t> widx((size_t) (SWA * n));
     std::vector<float> wm((size_t) (SWA * n));
@@ -1220,8 +1741,10 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             wm[(size_t) (t * SWA + j)] = m;
         }
     }
-    ggml_backend_tensor_set(im.i_widx, widx.data(), 0, widx.size() * 4);
-    ggml_backend_tensor_set(im.i_wmask, wm.data(), 0, wm.size() * 4);
+    // P5.3b: a staged piece writes its own slice of the window tables (offset = the piece's column); unsplit col0 is 0.
+    const size_t woff = (size_t) im.col0;
+    ggml_backend_tensor_set(im.i_widx, widx.data(), woff * 4, widx.size() * 4);
+    ggml_backend_tensor_set(im.i_wmask, wm.data(), woff * (size_t) SWA * 4, wm.size() * 4);
     {
         const int64_t k = std::min<int64_t>(n, RAW);
         std::vector<int32_t> ws((size_t) k);
@@ -1239,13 +1762,13 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             cs[t] = (int32_t) (done ? p / r : im.cmax[r]);   // an open group writes the spare row
             cp[t] = (int32_t) ((p / r) * r);
         }
-        ggml_backend_tensor_set(im.i_nvis[r], nv.data(), 0, (size_t) n * 4);
-        ggml_backend_tensor_set(im.i_cslot[r], cs.data(), 0, (size_t) n * 4);
-        ggml_backend_tensor_set(im.i_cpos[r], cp.data(), 0, (size_t) n * 4);
+        ggml_backend_tensor_set(im.i_nvis[r], nv.data(), woff * 4, (size_t) n * 4);
+        ggml_backend_tensor_set(im.i_cslot[r], cs.data(), woff * 4, (size_t) n * 4);
+        ggml_backend_tensor_set(im.i_cpos[r], cp.data(), woff * 4, (size_t) n * 4);
         if (r == 1) {
             std::vector<float> lb(n);
             for (int t = 0; t < n; ++t) lb[t] = (float) ((nv[t] - 1) >= 0 ? (int64_t) (nv[t] - 1) / im.CBS : -1);
-            ggml_backend_tensor_set(im.i_lastblk, lb.data(), 0, (size_t) n * 4);
+            ggml_backend_tensor_set(im.i_lastblk, lb.data(), woff * 4, (size_t) n * 4);
         }
     }
     {   // ratio-2 state: rows of [ring (2) | pass states] for each token's group (2g, 2g+1); open groups repeat 2g
@@ -1258,7 +1781,7 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
         }
         const int64_t k = std::min<int64_t>(n, 2);
         for (int64_t j = 0; j < k; ++j) ss.push_back((int32_t) ((pos0 + n - k + j) % 2));
-        ggml_backend_tensor_set(im.i_sidx, si.data(), 0, si.size() * 4);
+        ggml_backend_tensor_set(im.i_sidx, si.data(), woff * 2 * 4, si.size() * 4);
         ggml_backend_tensor_set(im.i_sslot, ss.data(), 0, ss.size() * 4);
     }
     // Engram rows: hash the whole pass now and START the (dedup/sort/coalesce) reads; they are waited - and the rows
@@ -1271,7 +1794,7 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             static const bool eprof = std::getenv("STRATA_ENG_PROF") != nullptr;
             static double eng_ms = 0; static long eng_n = 0;
             const auto te = std::chrono::steady_clock::now();
-            if (!im.engram.rows(pos0, n, im.eng_rows, im.err)) return false;
+            if (!im.engram.rows(pos0, n, im.eng_rows, im.err, im.eng_slots)) return false;
             if (eprof) {
                 eng_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te).count();
                 if (++eng_n % 64 == 0) std::fprintf(stderr, "engram decode reads: %.3f ms/call over %ld calls\n", eng_ms / eng_n, eng_n);
@@ -1279,7 +1802,7 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
                 ggml_backend_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
         } else {
-            im.eng_batch = im.engram.start(pos0, n, im.eng_rows, im.err);
+            im.eng_batch = im.engram.start(pos0, n, im.eng_rows, im.err, im.eng_slots);
             if (!im.eng_batch) return false;
         }
     }
@@ -1288,10 +1811,34 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
 
 bool Ds41Dense::begin(const int * tids, int n, int pos0) {
     Impl & im = *p_;
-    if (n < 1 || n > im.NC || pos0 < 0 || pos0 + n > im.cfg.ctx_max) { im.err = "bad pass"; return false; }
-    im.pos0 = pos0;
+    if (im.lb > 0) { im.err = "begin: stage [" + std::to_string(im.lb) + "," + std::to_string(im.le) +
+                                   ") has no token embeddings; only the first stage takes token ids";
+                    return false; }
+    // P5.3b: a STAGED run cycles the state columns: the run feeds a prompt in passes of at most the window (im.S
+    // columns), pass k at column (pos0 / S) % (NC / S), and the token positions the graphs see are the run's own
+    // (pos0 + t) - NOT the column.  The rings are position-indexed (slot = pos % RAW for the window ring, row =
+    // pos / r for the compressed rows), so reusing a column overwrites the state of position pos - S * NC/S, a
+    // position SWA tokens back and therefore outside every later query's reach.  Unsplit, this is pos0 at column 0.
+    int64_t p0 = pos0;
+    if (im.staged) {
+        if (n < 1 || n > im.S || pos0 < 0) {
+            im.err = "begin: a staged pass takes 1.." + std::to_string(im.S) + " tokens (got " +
+                     std::to_string(n) + " at position " + std::to_string(pos0) + ")";
+            return false;
+        }
+        if (im.cand_src_prev && im.cand_src_cap != im.S) {
+            im.err = "stage reads another stage's candidate column, whose writer aligns to a window of " +
+                     std::to_string(im.cand_src_cap) + " columns but this stage's window is " + std::to_string(im.S) +
+                     ": the pass would read the producer's column at the wrong offset";
+            return false;
+        }
+        im.col0 = im.stage_col0(pos0, n);
+    }
+    if (n < 1 || n > im.NC || p0 < 0 || p0 + n > im.cfg.ctx_max) { im.err = "bad pass"; return false; }
+    im.pos0 = (int) p0;
     im.n = n;
-    if (!im.upload_inputs(tids, n, pos0)) return false;
+    if (!im.upload_inputs(tids, n, (int) p0)) return false;
+    // (span_pass_caps applies this stage's ring correction; see its comment.)
     span_pass_caps(im, pos0, n, im.pass_cap);
     // embeddings -> state
     ggml_context * gc = nullptr;
@@ -1317,6 +1864,9 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
 
 bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
     Impl & im = *p_;
+    if (im.lb > 0) { im.err = "begin_batch: stage [" + std::to_string(im.lb) + "," + std::to_string(im.le) +
+                                       ") has no token embeddings; only the first stage takes token ids";
+                     return false; }
     if (B < 1 || B > im.cfg.prompt_batch || B > im.NC || pos0 < 0 || pos0 + B > im.cfg.ctx_max) { im.err = "bad batch"; return false; }
     if (!im.upload_inputs(tids, B, pos0)) return false;
     im.pos0 = pos0; im.batch_pos0 = pos0; im.batch = B; im.n = B; im.col0 = 0;
@@ -1395,6 +1945,7 @@ static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
 
 bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
     Impl & im = *p_;
+    if (!im.owns_layer(il)) { im.err = "attn_router_span_kv: layer " + std::to_string(il) + " is not this stage's [" + std::to_string(im.lb) + "," + std::to_string(im.le) + ")"; return false; }
     if (!upload_span(im, col0, n)) return false;
     if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;   // the Engram add feeds this layer's K/V
     im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
@@ -1408,6 +1959,7 @@ bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
 
 bool Ds41Dense::attn_router_span(int il, int col0, int n) {
     Impl & im = *p_;
+    if (!im.owns_layer(il)) { im.err = "attn_router_span: layer " + std::to_string(il) + " is not this stage's [" + std::to_string(im.lb) + "," + std::to_string(im.le) + ")"; return false; }
     double tp = g_dprof_on ? dprof_now() : 0;
     auto lap = [&](int i) { if (g_dprof_on) { const double t = dprof_now(); g_dprof[i] += t - tp; tp = t; } };
     if (!upload_span(im, col0, n)) return false;
@@ -1446,6 +1998,7 @@ float * Ds41Dense::routed_dev() { return p_->cpu || !p_->routed ? nullptr : (flo
 
 bool Ds41Dense::finish_span(int il, int col0, int n) {
     Impl & im = *p_;
+    if (!im.owns_layer(il)) { im.err = "finish_span: layer " + std::to_string(il) + " is not this stage's [" + std::to_string(im.lb) + "," + std::to_string(im.le) + ")"; return false; }
     (void) il;
     if (col0 < 0 || n < 1 || im.S < 1 || col0 % im.S != 0 || (int64_t) col0 + n > im.batch) { im.err = "bad span"; return false; }
     const double tf0 = g_dprof_on ? dprof_now() : 0;
@@ -1476,6 +2029,7 @@ const float * Ds41Dense::batch_fn() const { return p_->host_fn.data(); }
 
 bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_host, ggml_tensor ** fn_dev) {
     Impl & im = *p_;
+    if (!im.owns_layer(il)) { im.err = "attn_router: layer " + std::to_string(il) + " is not this stage's [" + std::to_string(im.lb) + "," + std::to_string(im.le) + ")"; return false; }
     const int64_t n = im.n;
     // Engram layer: wait the pass's reads (started in upload_inputs) before the graph that reads i_eng runs.  For the
     // chunk path this is the first Engram layer too, so the layers below it ran while the disk was reading.
@@ -1513,6 +2067,7 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
 
 bool Ds41Dense::predict(int il, int * top_ids, int n_top) {
     Impl & im = *p_;
+    if (!im.owns_layer(il)) { im.err = "predict: layer " + std::to_string(il) + " is not this stage's [" + std::to_string(im.lb) + "," + std::to_string(im.le) + ")"; return false; }
     if (im.n != 1 || n_top < 1 || n_top > 16) return false;
     const Impl::GKey key { il, 3, 0, 1 };
     auto it = im.graphs.find(key);
@@ -1531,6 +2086,7 @@ bool Ds41Dense::predict(int il, int * top_ids, int n_top) {
 
 bool Ds41Dense::predict_multi(int il, int * top_ids) {
     Impl & im = *p_;
+    if (!im.owns_layer(il)) { im.err = "predict_multi: layer " + std::to_string(il) + " is not this stage's [" + std::to_string(im.lb) + "," + std::to_string(im.le) + ")"; return false; }
     const int64_t n = im.n;
     if (n < 1) return false;
     if (n == 1) return predict(il, top_ids, 16);
@@ -1551,6 +2107,7 @@ bool Ds41Dense::predict_multi(int il, int * top_ids) {
 bool Ds41Dense::finish(int il, const float * routed_sum) {
     Impl & im = *p_;
     (void) il;
+    if (!im.owns_layer(il)) { im.err = "finish: layer " + std::to_string(il) + " is not this stage's [" + std::to_string(im.lb) + "," + std::to_string(im.le) + ")"; return false; }
     const int64_t n = im.n;
     if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) (im.D * n) * 4);
     ggml_cgraph * gf = nullptr;
@@ -1575,7 +2132,12 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
 bool Ds41Dense::finish_predict(int il, const float * routed_sum, int next_il, int * top_ids, int n_top) {
     Impl & im = *p_;
     (void) il;
-    if (im.n != 1 || n_top < 1 || n_top > 16 || next_il < 0 || next_il >= (int) im.ly.size()) return false;
+    if (!im.owns_layer(il)) { im.err = "finish_predict: layer " + std::to_string(il) + " is not this stage's [" + std::to_string(im.lb) + "," + std::to_string(im.le) + ")"; return false; }
+    if (im.n != 1 || n_top < 1 || n_top > 16) return false;
+    // P5.3b: the fused graph runs on THIS stage's device with THIS stage's weight bounds: next_il must be the
+    // layer the successor call will ask this stage to run, i.e. inside [lb, wle).  A staged loop's last layer of
+    // a stage calls with next_il == le, which is exactly why wle is le + 1.
+    if (next_il < im.lb || next_il >= im.wle) return false;
     if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) im.D * 4);
     const Impl::GKey key { next_il, 5, 0, 1 };
     auto it = im.graphs.find(key);
@@ -1596,8 +2158,10 @@ bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_
                                      int * ahead_ids) {
     Impl & im = *p_;
     (void) il;
+    if (!im.owns_layer(il)) { im.err = "finish_predict_ahead: layer " + std::to_string(il) + " is not this stage's [" + std::to_string(im.lb) + "," + std::to_string(im.le) + ")"; return false; }
     if (ahead <= 0 || !ahead_ids) return finish_predict(il, routed_sum, next_il, top_ids, n_top);
-    if (im.n != 1 || n_top < 1 || n_top > 16 || next_il < 0 || next_il >= (int) im.ly.size()) return false;
+    if (im.n != 1 || n_top < 1 || n_top > 16) return false;
+    if (next_il < im.lb || next_il >= im.wle) return false;   // P5.3b: as in finish_predict
     if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) im.D * 4);
     const Impl::GKey key { next_il, 6, ahead, 1 };
     auto it = im.graphs.find(key);
@@ -1628,12 +2192,15 @@ bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_
 
 bool Ds41Dense::logits(int row0, int nrows, float * out) {
     Impl & im = *p_;
+    if (!im.is_last) { im.err = "logits: this stage is not the last one (no output head)"; return false; }
     if (row0 < 0 || nrows < 1 || row0 + nrows > im.n) { im.err = "bad logits rows"; return false; }
+    // P5.3b: the caller counts rows from the start of the last pass; a staged pass's rows live at im.col0.
+    const int64_t hrow0 = im.staged ? im.col0 + row0 : row0;
     std::vector<uint8_t> meta(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
     ggml_init_params p = { meta.size(), meta.data(), true };
     ggml_context * gc = ggml_init(p);
     ggml_tensor * lg = nullptr;
-    ggml_cgraph * gf = build_head(im, gc, row0, nrows, &lg);
+    ggml_cgraph * gf = build_head(im, gc, hrow0, nrows, &lg);
     const bool ok = im.compute(gf, false);
     if (ok) ggml_backend_tensor_get(lg, out, 0, (size_t) nrows * (size_t) im.g.vocab * 4);
     ggml_free(gc);
@@ -1660,7 +2227,9 @@ bool Ds41Dense::read_state_cols(int c0, int n, std::vector<float> & x) {
 
 bool Ds41Dense::snapshot(int pos) {
     Impl & im = *p_;
+    // P5.3b: on a staged run the layers outside this stage's range own no state to snapshot.
     for (auto & L : im.ly) {
+        if (!L.raw) continue;
         ggml_backend_tensor_copy(L.raw, L.raw_snap);
         if (L.st_kv) { ggml_backend_tensor_copy(L.st_kv, L.st_kv_snap); ggml_backend_tensor_copy(L.st_sc, L.st_sc_snap); }
     }
@@ -1673,6 +2242,7 @@ bool Ds41Dense::restore() {
     Impl & im = *p_;
     if (im.snap_pos < 0) return false;
     for (auto & L : im.ly) {
+        if (!L.raw) continue;   // P5.3b: another stage's layer (see snapshot())
         ggml_backend_tensor_copy(L.raw_snap, L.raw);
         if (L.st_kv) { ggml_backend_tensor_copy(L.st_kv_snap, L.st_kv); ggml_backend_tensor_copy(L.st_sc_snap, L.st_sc); }
     }
@@ -1732,7 +2302,7 @@ bool Ds41Dense::read_sel(int il, std::vector<int> & sel, std::vector<float> & ma
     sel.clear();
     mask.clear();
     *K = 0;
-    if (!L.idx_src || !L.ratio) return true;
+    if (!im.owns_layer(il) || !L.idx_src || !L.ratio) return true;   // P5.3b: another stage's layer: the empty answer
     const int64_t cap = im.pass_cap[L.ratio];
     if (cap == 0) return true;
     const int64_t k = std::min<int64_t>(cap, im.ITOP);

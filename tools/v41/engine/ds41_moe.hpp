@@ -339,6 +339,12 @@ struct Ds41MoeConfig {
     /// expert; only where the blob sits changes.  Off = the static seed, as before.
     bool vram_lru = false;
     uint64_t seed = 20261005;     ///< the synthetic arm's generator (unused by the tier itself)
+    /// P5.3b step 2 (mirrors Ds4MoeConfig::device in tools/ds4/ds4_moe.hpp): the CUDA device this tier's VRAM,
+    /// streams and kernels live on.  The tier does NOT follow the process' ambient device: the engine's ggml
+    /// backends - and, on a --gpus staged run, stages living on other cards - set the ambient device with every
+    /// call they make, so the tier names its own at every GPU entry and restores what it found.  0 = the behavior
+    /// of every run so far (the first enumerated device).
+    int device = 0;
 
     static constexpr int kPredW = 16;   ///< ranked predictions the caller passes to `prefetch`
     static constexpr int kMaxPf = 6;    ///< prefetch staging slots (the DMA window of one layer)
