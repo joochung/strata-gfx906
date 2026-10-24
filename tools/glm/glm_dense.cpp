@@ -278,9 +278,9 @@ struct GlmDense::Impl {
     int64_t D = 0, HC = 0, NH = 0, SK = 0, DI = 0, DC = 0, KVL = 0, KM = 0, VM = 0;
     int64_t NEXP = 0, NUSED = 0, NT = 1, CAPMAX = 0;
     int64_t KP = 4, IDXD = 128, IDXH = 32, PCAP = 0, NNEW = 1, MCAP = 0;   // indexer; MCAP = rows of i_mask per token
-    // P5.3 step 1: the layer range this instance owns ([lb, le), le defaults to the model's n_layer) and the column
-    // of x_state its first layer reads.  Defaults = the whole model, column 0: a single-stage run is unchanged.
-    int64_t lb = 0, le = 0, col0 = 0;
+    // P5.3 step 1: the layer range this instance owns ([lb, le), le defaults to the model's n_layer).
+    // Defaults = the whole model: a single-stage run is unchanged.
+    int64_t lb = 0, le = 0;
     /// P5.3 step 1: point this instance at another's weight tensors (see GlmDense::build_stages).  The store is
     /// cleared first, then filled from the owner's live contents, and the owner pointer is set before the pointers are
     /// copied so the destructor of a shared instance never frees buffers it does not own.
@@ -315,16 +315,6 @@ struct GlmDense::Impl {
     ggml_tensor * i_newdst = nullptr;    // I32 [NNEW] their pool rows (PCAP = dump)
     ggml_tensor * i_tail = nullptr;      // F32 [(KP - 1) * NT] incomplete-pool cells per token (dump when absent)
     ggml_tensor * i_span = nullptr;
-    // P5.3 step 1 (stage 1 of the relay): where a LATER stage's own column region of x_state is copied FROM.  The
-    // staging of tools/gfx906/relay_staging.hpp holds the predecessor's whole slab (every column of every layer, the
-    // layout the producer's x_state has); x_relay_in is a second buffer with that same row stride holding this
-    // stage's columns, so the upload is one contiguous range and the copy into x_state is a ggml_cpy the first
-    // attention graph performs - see build_attn's `xin` and stage_state_inject().  NULL on the first stage.
-    ggml_tensor * x_relay_in = nullptr;
-    ggml_backend_buffer_t rbuf = nullptr;
-    std::vector<uint8_t> relay_host;   ///< the D2H landing pad a producer stage copies its slab into
-    std::vector<uint8_t> relay_stage;  ///< the host staging the payload is relayed through (see relay_staging.hpp)
-    size_t relay_bytes = 0;            ///< n * relay_slab_bytes() the largest pass needs
     std::vector<uint8_t> in_host;
     bool bias_dirty = true;             ///< a route bias changed since the last upload (the first upload sends them)
     uint8_t * in_base = nullptr;
@@ -376,9 +366,6 @@ struct GlmDense::Impl {
     std::vector<Layer> ly;
     std::vector<ggml_cgraph *> gf_init, gf_head;
     std::vector<ggml_gallocr_t> allo_init, allo_head;
-    // P5.3 step 1: the relay's inject copy, one graph per pass size (only a stage with lb > 0 ever builds them)
-    std::vector<ggml_cgraph *> gf_inject;
-    std::vector<ggml_gallocr_t> allo_inject;
     std::vector<ggml_tensor *> logits_t;
     std::vector<float> host_logits;
 
@@ -395,7 +382,7 @@ struct GlmDense::Impl {
             // graph's own tensors (they point into a compute buffer that a later, bigger plan may have freed)
             // (compare pointers only: a stale buffer pointer must not be dereferenced)
             auto persistent = [&](ggml_backend_buffer_t bb) {
-                if (bb == sbuf || bb == ibuf || bb == obuf || bb == pbuf || bb == lbuf || bb == rbuf) return true;
+                if (bb == sbuf || bb == ibuf || bb == obuf || bb == pbuf || bb == lbuf) return true;
                 for (ggml_backend_buffer_t wb : w.bufs) if (bb == wb) return true;
                 return false;
             };
@@ -464,7 +451,6 @@ struct GlmDense::Impl {
     /// P5.3 step 1: put the slab the predecessor relayed into this stage's own columns of x_state, with a ggml_cpy
     /// that runs on the backend before any layer graph of the pass.  Returns false when this stage takes a relay at
     /// all (the first stage writes column 0 from the token embeddings instead and must not be handed a slab).
-    bool stage_state_inject(int n);
 };
 
 // ================================================================== graph helpers
@@ -555,11 +541,10 @@ static ggml_cgraph * build_attn(GlmDense::Impl & im, int il, int64_t cap, int64_
     B b { &im, gc, &im.g };
     const int64_t D = im.D, HC = im.HC, NH = im.NH;
 
-    // The state this layer reads: x_state's column il, the expression of the last release (build_finish writes column
-    // il+1, so layer il reads what layer il-1's finish left; column 0 is the embedding).  x_state keeps every column
-    // on every stage, so this needs no stage adjustment - a later stage simply finds its column filled by the relay.
-    ggml_tensor * xin = ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2],
-                                     (size_t) il * im.x_state->nb[2]);
+    // The state this layer reads: x_state's token columns [0,n) at byte 0 - the expression of the last release, and
+    // it holds on a stage too: layers run IN ORDER (one finish graph per layer, each writing the same region the next
+    // reads), so a later stage simply finds this region holding the state its predecessor relayed in.
+    ggml_tensor * xin = ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2], 0);
     ggml_tensor * post_a = nullptr, * comb_a = nullptr;
     ggml_tensor * cur = b.hc_pre(xin, b.BL(il, "hc_attn_fn.weight"), b.BL(il, "hc_attn_scale.weight"),
                                  b.BL(il, "hc_attn_base.weight"), &post_a, &comb_a);
@@ -734,12 +719,11 @@ static ggml_cgraph * build_finish(GlmDense::Impl & im, int il, int64_t n) {
     ggml_tensor * pf = ggml_view_2d(gc, L.post_f, HC, n, L.post_f->nb[1], 0);
     ggml_tensor * cf = ggml_view_3d(gc, L.comb_f, HC, HC, n, L.comb_f->nb[1], L.comb_f->nb[2], 0);
     ggml_tensor * lout = ggml_reshape_3d(gc, b.hc_post(ffo, hap, pf, cf), D, HC, n);
-    // Where this layer's output lands: x_state's column il+1, byte offset (il+1)*nb[2] - the expression of the last
-    // release, on every stage (x_state keeps all n_layer+1 columns, and a stage writes only its own layers' columns;
-    // the last layer of a stage's range writes the column the RELAY then hands to the next stage).
-    const size_t xoff = (size_t) (il + 1) * im.x_state->nb[2];
+    // Where this layer's output lands: the same token columns the next layer reads (the overwrite design of the last
+    // release; the layer GRAPHS run in order, so the write-then-read ordering is the engine's, not the layout's - and
+    // the LAST layer of a stage's range leaves the state exactly where the relay seam reads it: columns [0,n) at 0).
     ggml_build_forward_expand(gf, ggml_cpy(gc, lout, ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1],
-                                                                  im.x_state->nb[2], xoff)));
+                                                                  im.x_state->nb[2], 0)));
     if (im.gate_taps)
         ggml_build_forward_expand(gf, ggml_cpy(gc, lout, ggml_view_3d(gc, L.t_lout, D, HC, n, L.t_lout->nb[1],
                                                                       L.t_lout->nb[2], 0)));
@@ -764,15 +748,13 @@ static ggml_cgraph * build_finish(GlmDense::Impl & im, int il, int64_t n) {
 }
 
 // predict: the layer's router on rms_norm(hc_attn_pre) * ffn_norm.weight for token 0 (selection scores).
-// Layer `il` reads x_state's column il, which is where layer il-1's finish put the state (column 0 = the embedding);
-// that is the expression of the last release and it holds on a stage too, because x_state keeps every column.
+// It reads the state region the previous layer's finish wrote (x_state's columns [0,n) at byte 0), on every stage.
 static ggml_cgraph * build_predict(GlmDense::Impl & im, int il) {
     GlmDense::Impl::Layer & L = im.ly[(size_t) il];
     ggml_context * gc = im.gctx;
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 256, false);
     B b { &im, gc, &im.g };
-    ggml_tensor * xin = ggml_view_3d(gc, im.x_state, im.D, im.HC, 1, im.x_state->nb[1], im.x_state->nb[2],
-                                     (size_t) il * im.x_state->nb[2]);
+    ggml_tensor * xin = ggml_view_3d(gc, im.x_state, im.D, im.HC, 1, im.x_state->nb[1], im.x_state->nb[2], 0);
     ggml_tensor * post = nullptr, * comb = nullptr;
     ggml_tensor * pre = b.hc_pre(xin, b.BL(il, "hc_attn_fn.weight"), b.BL(il, "hc_attn_scale.weight"),
                                  b.BL(il, "hc_attn_base.weight"), &post, &comb);
@@ -798,8 +780,8 @@ static ggml_cgraph * build_init(GlmDense::Impl & im, int64_t n) {
 }
 
 // head: mean of the hc streams -> output_norm -> output (glm5-next.cpp: build_hc_mean, no hc_head weights).  `x` is
-// the state it reads: x_state's LAST column (column n_layer unsplit - the expression of the last release - or a
-// stage's hand-off column), or the head staging tensor hx when the state arrived through the relay.
+// the state it reads: the state region (what the last finish wrote), or the head staging tensor hx when rows were
+// copied out for a multi-row read (logits_rows).
 static ggml_cgraph * build_head(GlmDense::Impl & im, int64_t n, ggml_tensor * x) {
     ggml_context * gc = im.gctx;
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
@@ -817,9 +799,9 @@ static ggml_cgraph * build_head(GlmDense::Impl & im, int64_t n, ggml_tensor * x)
 bool GlmDense::Impl::ensure_n(int64_t n) {
     if (n < 1 || n > NT) { err = "pass size " + std::to_string(n) + " out of range 1.." + std::to_string(NT); return false; }
     // The graphs of a pass size, built once.  On a split run only the first stage has token embeddings, so only it
-    // builds the embedding-init graph, and only the last stage has the head weights, so only it builds the head; the
-    // head reads the state from the relay payload instead of x_state (GlmDense::logits_relay).  A stage that builds
-    // neither leaves both slots NULL, which is what its engine loop expects of it.
+    // builds the embedding-init graph, and only the last stage has the head weights, so only it builds the head,
+    // over the state region.  A stage that builds neither leaves both slots NULL, which is what its engine loop
+    // expects of it.
     const bool want_init = lb == 0, want_head = is_last && n <= kSmallN;
     if (!gf_init[(size_t) n] && (!want_init || !gf_head[(size_t) n])) {
         if (want_init) {
@@ -827,8 +809,7 @@ bool GlmDense::Impl::ensure_n(int64_t n) {
             allo_init[(size_t) n] = allo_for(n);
         }
         if (want_head && !gf_head[(size_t) n]) {   // a prompt chunk reads its logits through logits_rows
-            ggml_tensor * x = ggml_view_3d(gctx, x_state, D, HC, n, x_state->nb[1], x_state->nb[2],
-                                           (size_t) (x_state->ne[2] - 1) * x_state->nb[2]);
+            ggml_tensor * x = ggml_view_3d(gctx, x_state, D, HC, n, x_state->nb[1], x_state->nb[2], 0);
             gf_head[(size_t) n] = build_head(*this, n, x);
             allo_head[(size_t) n] = new_allo();
         }
@@ -850,8 +831,6 @@ int64_t GlmDense::stage_end() const { return p_->le; }
 int64_t GlmDense::stage_layers() const { return p_->le - p_->lb; }
 int64_t GlmDense::n_layer_total() const { return p_->g.n_layer; }
 bool GlmDense::is_last_stage() const { return p_->is_last; }
-size_t GlmDense::state_col0() const { return (size_t) p_->col0 * (size_t) p_->x_state->nb[2]; }
-int64_t GlmDense::slab_col0() const { return p_->col0; }
 size_t GlmDense::relay_slab_bytes() const { return (size_t) p_->x_state->nb[2]; }
 int GlmDense::max_tokens() const { return (int) p_->NT; }
 ggml_backend_t GlmDense::backend() const { return p_->backend; }
@@ -892,16 +871,6 @@ bool GlmDense::init(const std::string & model_path, const GlmDenseConfig & cfg, 
     if (!cfg.is_last && im.le == g.n_layer) { err = "stage [" + std::to_string(im.lb) + "," + std::to_string(im.le) +
                                                    ") is not the last stage but ends at layer " +
                                                    std::to_string(g.n_layer); return false; }
-    // P5.3 step 1: x_state is [D, HC, n_layer+1] - the hc_* streams after every layer (column 0 = the embedding,
-    // column l+1 = layer l's finish) - on EVERY stage, split or not.  A stage writes only the columns its own layers
-    // produce (see build_finish's xoff), so the slab a boundary hands over is the whole row stride, identical layout
-    // on both sides, and the successor reads the column its predecessor last wrote (im.col0).
-    // A stage's col0 is the column ITS OWN slab starts at, the offset of its first column inside the slab: 0 for the
-    // first stage (its slab begins with the embedding), and the hand-off column - one past the last layer its
-    // predecessor ran - for every later one.  Same number on both sides of a boundary, which is what makes a
-    // whole-slab copy line up stage to stage (build_attn picks each layer's own column il separately, so this value
-    // is only ever used by the relay seams).
-    im.col0 = im.lb;
     // share_weights (set by build_stages) skips the load: the stage adopts the owner's tensors below instead.  The
     // map is left EMPTY on purpose - WStore::get aborts on a name that is not there, so a stage that asks for a tensor
     // before its owner handed them over fails loudly rather than reading a dangling pointer.
@@ -942,9 +911,11 @@ bool GlmDense::init(const std::string & model_path, const GlmDenseConfig & cfg, 
     im.ictx = ggml_init(ip);
     if (!im.sctx || !im.ictx) { err = "ggml_init(state) failed"; return false; }
     const int64_t NT = im.NT;
-    // x_state is [D, HC, n_layer+1]: the hc_* streams after each layer (column 0 = the embedding, column l+1 = layer
-    // l's finish).  On a stage it holds this range's columns + 1, the last being the relay's hand-off column.
-    im.x_state = ggml_new_tensor_3d(im.sctx, GGML_TYPE_F32, im.D, im.HC, g.n_layer + 1);
+    // x_state is [D, HC, NT]: the hc_* streams of THIS pass's tokens, the region every layer reads and the next
+    // overwrites (graphs run in order).  A stage keeps the same region: its relayed input lands here, its own layers
+    // advance it, and the relay seam takes it back out of here.  (P5.3 first attempt made this [D,HC,n_layer+1] and
+    // the first 14-token prefill asserted past the tensor end: dim2 is TOKENS, not layer columns.)
+    im.x_state = ggml_new_tensor_3d(im.sctx, GGML_TYPE_F32, im.D, im.HC, NT);
     im.routed_sum = ggml_new_tensor_2d(im.sctx, GGML_TYPE_F32, im.D, NT);
     im.i_emb = ggml_new_tensor_2d(im.sctx, GGML_TYPE_F32, im.D, NT);
     // The layer table is indexed by the GLOBAL layer id on every stage, so a stage sizes it to where its own
@@ -979,10 +950,8 @@ bool GlmDense::init(const std::string & model_path, const GlmDenseConfig & cfg, 
         }
     }
     im.host_fn.resize((size_t) (im.D * NT));
-    // hx: the per-token state the head runs over, taken out of x_state by logits_rows (and out of the relay payload
-    // by logits_relay).  A stage's slab is read from column `le`, so hx is sized to hold rows up to that column.
-    const int64_t hx_cols = std::max<int64_t>(Impl::kRowsMax, g.n_layer + 1 - im.col0);
-    im.hx = ggml_new_tensor_3d(im.sctx, GGML_TYPE_F32, im.D, im.HC, hx_cols);
+    // hx: the per-token state the head runs over, taken out of x_state by logits_rows.
+    im.hx = ggml_new_tensor_3d(im.sctx, GGML_TYPE_F32, im.D, im.HC, Impl::kRowsMax);
 
     // ---- run-time rank-1 adapter: the dense half's whole-module targets (`attn_output`, `ffn_down_shexp`).  Each
     // pair is a bare linear merge y += B (A x), so it is two tiny mul_mats added in the graph; the A [in,1] / B [1,out]
@@ -1049,25 +1018,6 @@ bool GlmDense::init(const std::string & model_path, const GlmDenseConfig & cfg, 
         if (ggml_backend_tensor_alloc(im.ibuf, im.i_span, im.in_base) != GGML_STATUS_SUCCESS) { err = "cannot place the input span"; return false; }
         im.in_host.assign(in_bytes, 0);
     }
-    // ---- P5.3 step 1: a LATER stage's relay landing pad.  A SECOND buffer with x_state's row stride, holding the
-    // columns THIS stage was handed.  It is deliberately not part of the ggml graph: the engine writes it with
-    // ggml_backend_tensor_set (one contiguous range for a whole pass) and stage_state_inject() copies it into
-    // x_state, so a boundary costs one upload and one on-device copy, and no graph of any pass size has to be
-    // re-planned when the chunk compute buffer is released (release_big).  Sized like x_state's slab for NT tokens.
-    if (im.lb > 0) {
-        // The pad holds a whole token slab MINUS the columns before this stage's first one: what the staging carries
-        // for this stage is exactly those bytes (see relay_read_out), so the upload is one range and the inject copy
-        // reads it from its start.  (A stage's col0 = the column its predecessor ended at, the same number on both
-        // sides of the boundary, so the two sizes always agree.)
-        const size_t slab = (size_t) im.x_state->nb[2];
-        const size_t pad_cols = (size_t) (g.n_layer + 1 - im.col0);
-        im.rbuf = ggml_backend_buft_alloc_buffer(buft, slab * pad_cols * (size_t) NT + al);
-        if (!im.rbuf) { err = "cannot allocate the relay landing pad"; return false; }
-        im.x_relay_in = ggml_new_tensor_3d(im.sctx, GGML_TYPE_F32, im.D, im.HC, (int64_t) pad_cols);
-        if (ggml_backend_tensor_alloc(im.rbuf, im.x_relay_in, (uint8_t *) ggml_backend_buffer_get_base(im.rbuf) + al)
-            != GGML_STATUS_SUCCESS) { err = "cannot place the relay landing pad"; return false; }
-    }
-
     // ---- router output blocks: per layer NT x [fn | ids | wts], one readback per layer
     const size_t o1 = up(ggml_row_size(GGML_TYPE_F32, im.D)), o2 = o1 + up(4 * im.NUSED), blk = o2 + up(4 * im.NUSED);
     im.o_blk = (int64_t) blk; im.o_ids_off = (int64_t) o1; im.o_wts_off = (int64_t) o2;
@@ -1105,8 +1055,6 @@ bool GlmDense::init(const std::string & model_path, const GlmDenseConfig & cfg, 
     im.gf_head.assign((size_t) NT + 1, nullptr);
     im.allo_init.assign((size_t) NT + 1, nullptr);
     im.allo_head.assign((size_t) NT + 1, nullptr);
-    im.gf_inject.assign((size_t) NT + 1, nullptr);
-    im.allo_inject.assign((size_t) NT + 1, nullptr);
     im.logits_t.assign((size_t) NT + 1, nullptr);
     if (!im.ensure_n(1)) { err = im.err; return false; }
     for (int64_t il = im.lb; il < im.le; ++il)
@@ -1177,102 +1125,41 @@ bool GlmDense::advance_stage_pos(int pos0, int n) {
 
 int GlmDense::snapshot_pos() const { return p_->snap_pos; }
 
-// P5.3 step 1: the boundary hand-off OUT of a producer stage.  A boundary ships WHOLE TOKEN SLABS: x_state's bytes of
-// tokens [0,n) from column `col_off` on, which is slab * n bytes for every pass and the SAME layout on every stage -
-// so the successor's layers find the columns they read where the producer's x_state had them, and no stage needs a
-// re-indexing of the other's columns.  The staging (relay_staging.hpp) is token-major with exactly that many bytes
-// per token, so this is one contiguous copy into the slot the plan handed out.  `col_off` counts from the top of the
-// slab and is each stage's own business: 0 on the first stage (which wrote column 0 with the embeddings and every
-// column up to its hand-off), and on a later stage the columns its own injection already put in (state_col0()).
-// The engine has already synchronized the backend - the native relay's rule too: the sync the successor waits on is
-// the producer's stream completion observed by the host (docs/gfx906/P5-RELAY-PATTERN.md section 1a).
-bool GlmDense::relay_read_out(int n, size_t col_off, void * dst, size_t dst_bytes) {
+// P5.3 step 1: the boundary hand-off OUT of a producer stage.  The pass's state is x_state's token columns [0,n) at
+// byte 0 on EVERY stage (the overwrite layout the last release uses), so a boundary is ONE contiguous D2H of
+// n * slab bytes, slab = D * HC * 4 being the same number on every stage - the successor's layers find the state
+// exactly where their own x_state keeps it, and no stage re-indexes another's columns.  The staging
+// (relay_staging.hpp) is token-major with exactly that many bytes per token.  The sync is the native relay's rule:
+// the producer's stream completion observed by the HOST before the successor is launched
+// (docs/gfx906/P5-RELAY-PATTERN.md section 1a) - no cross-device event anywhere.
+bool GlmDense::relay_read_out(int n, void * dst, size_t dst_bytes) {
     Impl & im = *p_;
     const size_t slab = (size_t) im.x_state->nb[2];
-    if (n < 1) { im.err = "relay_read_out: no tokens"; return false; }
+    if (n < 1 || n > (int) im.NT) { im.err = "relay_read_out: pass size out of range"; return false; }
     if (!dst) { im.err = "relay_read_out: no destination"; return false; }
-    if (col_off % slab) { im.err = "relay_read_out: the column offset is not a whole slab"; return false; }
     const size_t bytes = slab * (size_t) n;
     if (dst_bytes < bytes) { im.err = "relay_read_out: the staging slot is smaller than the pass"; return false; }
-    if (col_off + bytes > ggml_nbytes(im.x_state)) {
-        im.err = "relay_read_out: slab bytes past the end of x_state";
-        return false;
-    }
-    if (col_off != (size_t) im.col0 * slab) {
-        im.err = "relay_read_out: a stage hands on from column " + std::to_string(im.col0) + ", not from byte offset " +
-                 std::to_string((long long) col_off) + " (pass state_col0())";
-        return false;
-    }
     ggml_backend_synchronize(im.backend);   // finish() is issued async; the payload must be complete
-    ggml_backend_tensor_get(im.x_state, dst, col_off, bytes);
+    ggml_backend_tensor_get(im.x_state, dst, 0, bytes);
     return true;
 }
 
-// P5.3 step 1: the boundary hand-off IN to a consumer stage.  One upload of the pass's payload into the stage's
-// landing pad, at the pad's OWN offset for this stage (`col_off`, which is 0: the pad holds only what a stage takes
-// in, while the staging and the producer's x_state are slab-wide); stage_state_inject() then copies it into the
-// columns of x_state this stage's layers read.  The pointer is the staging slot, so a mapped/pinned staging makes
-// this a DMA out of the host pages the producer just wrote (the native relay's prefill pattern: memcpyAsync H2D from
-// hand_in_, prefill.cpp:2205-2212).
-bool GlmDense::relay_write_in(int n, size_t col_off, const void * src, size_t src_bytes) {
+// P5.3 step 1: the boundary hand-off IN to a consumer stage: one upload straight into the state region its first
+// layer reads (x_state's columns [0,n) at byte 0 - the layout makes a separate landing pad a pointless second copy).
+// The pointer is the staging slot, so a mapped/pinned staging makes this a DMA out of the host pages the producer
+// just wrote (the native relay's prefill pattern: memcpyAsync H2D from hand_in_, prefill.cpp:2205-2212).
+bool GlmDense::relay_write_in(int n, const void * src, size_t src_bytes) {
     Impl & im = *p_;
     const size_t slab = (size_t) im.x_state->nb[2];
-    if (!im.x_relay_in) { im.err = "relay_write_in: this stage takes no relay (it is the first one)"; return false; }
-    if (n < 1) { im.err = "relay_write_in: no tokens"; return false; }
+    if (n < 1 || n > (int) im.NT) { im.err = "relay_write_in: pass size out of range"; return false; }
     if (!src) { im.err = "relay_write_in: no payload"; return false; }
-    if (col_off % slab) { im.err = "relay_write_in: the column offset is not a whole slab"; return false; }
     const size_t bytes = slab * (size_t) n;
     if (src_bytes < bytes) { im.err = "relay_write_in: the staging slot is smaller than the pass"; return false; }
-    if (col_off + bytes > ggml_nbytes(im.x_relay_in)) {
-        im.err = "relay_write_in: payload past the end of the landing pad";
-        return false;
-    }
-    ggml_backend_synchronize(im.backend);   // the previous pass's inject copy must have read the pad first
-    ggml_backend_tensor_set(im.x_relay_in, src, col_off, bytes);
+    ggml_backend_synchronize(im.backend);   // whatever was reading this stage's x_state (or the producer's graphs)
+    ggml_backend_tensor_set(im.x_state, src, 0, bytes);
     return true;
 }
 
-// P5.3 step 1: move the uploaded slab into THIS stage's columns of x_state, the only place its layer graphs read.
-// The relay ships WHOLE TOKEN SLABS (every column of every layer, the layout the producer's x_state has, so one
-// contiguous range per pass and one number - relay_slab_bytes() - that is the same on every stage), and the
-// producer filled the slab's columns [0, lb] up to its own hand-off column.  This stage's own layers [lb, le) read
-// columns [lb, le], so those are the ones copied; the model's later columns are relayed but unread here, and column
-// 0 (the embedding) is not needed past the first stage.  build_attn keeps reading x_state's column il exactly as it
-// does unsplit, which is why a later stage's attention graph needs no stage-specific view.
-bool GlmDense::Impl::stage_state_inject(int n) {
-    if (!x_relay_in) { err = "inject: this stage takes no relay (it is the first one)"; return false; }
-    if (n < 1 || n > NT) { err = "inject: pass size out of range"; return false; }
-    const size_t slab = (size_t) x_state->nb[2];
-    ggml_cgraph * gf = gf_inject[(size_t) n];
-    if (!gf) {
-        ggml_context * gc = gctx;
-        gf = ggml_new_graph_custom(gc, 8, false);
-        // one cpy whose SOURCE is the landing pad (a tensor whose data lives in an ordinary buffer, at a base
-        // pointer of its own) and whose DESTINATION is this stage's own columns inside x_state, n tokens wide.  A
-        // ggml view of a tensor with data is treated as allocated elsewhere (alloc()'s persistent check), so both
-        // sides keep their real addresses through the plan and the copy is one contiguous device memcpy.
-        const size_t doff = (size_t) lb * slab;                   // this stage's first layer reads column lb
-        const int64_t ncol = le - lb + 1;                         // columns lb..le (le = the hand-off column it read)
-        // the payload's columns lb..le sit at (lb - col0) * slab inside the pad: col0 is the column the producer's
-        // slab starts at, so a stage whose first column is lb has payload column (lb - col0) first
-        const size_t poff = (size_t) (lb - col0) * slab;
-        ggml_tensor * srcv = ggml_view_3d(gc, x_relay_in, D, HC, n * ncol, x_relay_in->nb[1], x_relay_in->nb[2], poff);
-        ggml_tensor * dstv = ggml_view_3d(gc, x_state, D, HC, n * ncol, x_state->nb[1], x_state->nb[2], doff);
-        ggml_build_forward_expand(gf, ggml_cpy(gc, srcv, dstv));
-        gf_inject[(size_t) n] = gf;
-        allo_inject[(size_t) n] = new_allo();
-    }
-    if (!alloc(allo_inject[(size_t) n], gf)) { err = "gallocr(inject) failed"; return false; }
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { err = "relay inject copy failed"; return false; }
-    return true;
-}
-
-bool GlmDense::stage_relay_inject(int n) { return p_->stage_state_inject(n); }
-
-// The head over rows of a RELAYED slab.  On the last stage of a split run the state the head reads arrives in the
-// staging (that stage's own layers wrote no x_state column for it), and the same rows must produce the same logits as
-// logits_rows does unsplit - so the rows are the model's row range, translated by this stage's slab offset, and the
-// head graph, the hx upload and the logits readback are literally logits_relay's.
 // P5.3 step 1 (opt-in): build the stages of a split run on THIS instance's weights.  The staged run shares the dense
 // weight tensors rather than loading the model once per stage: stage 0 also needs the token embeddings and the last
 // stage also needs the output head, so n separate loads would hold more than the whole model at once - more memory
@@ -1360,21 +1247,6 @@ void GlmDense::Impl::adopt_weights(Impl * owner) {
 }
 
 bool GlmDense::weights_shared() const { return p_->w_owner != nullptr; }
-
-bool GlmDense::logits_slab(int r0, int nr, const uint8_t * slab_host, float * out) {
-    Impl & im = *p_;
-    if (!im.is_last) { im.err = "logits_slab: this stage is not the last one (no output head)"; return false; }
-    if (!slab_host) { im.err = "logits_slab: no payload"; return false; }
-    if (nr < 1 || nr > Impl::kRowsMax) { im.err = "logits_slab: bad rows"; return false; }
-    // hx holds the slab's rows from this stage's own first column on, so the model's row r0 sits at (r0 - col0)
-    if (r0 < im.col0 || r0 + nr > im.g.n_layer + 1) {
-        im.err = "logits_slab: rows are outside this stage's part of the slab (columns " + std::to_string(im.col0) +
-                 ".." + std::to_string(im.g.n_layer) + ")";
-        return false;
-    }
-    return logits_relay(r0, nr, (const float *) slab_host, out);
-}
-
 
 bool GlmDense::begin_tokens(const int * tids, int n) {
     Impl & im = *p_;
@@ -1598,11 +1470,6 @@ bool GlmDense::logits_rows(int r0, int nr, float * out) {
     Impl & im = *p_;
     if (nr < 1 || nr > Impl::kRowsMax || r0 < 0 || r0 + nr > im.NT) { im.err = "logits_rows: bad rows"; return false; }
     if (!im.is_last) { im.err = "logits_rows: this stage is not the last one (no output head)"; return false; }
-    if (im.le > 0 && r0 + nr > im.le) {   // the columns a stage writes end at its hand-off column im.le
-        im.err = "logits_rows: rows [" + std::to_string(r0) + "," + std::to_string(r0 + nr) +
-                 ") are past this stage's columns (0.." + std::to_string(im.le) + ")";
-        return false;
-    }
     if (im.gf_rows.empty()) {
         im.gf_rows.assign((size_t) Impl::kRowsMax + 1, nullptr);
         im.rows_t.assign((size_t) Impl::kRowsMax + 1, nullptr);
@@ -1623,15 +1490,8 @@ bool GlmDense::logits_rows(int r0, int nr, float * out) {
         im.rows_t[(size_t) nr] = lg;
     }
     const size_t slab = im.x_state->nb[2];
-    ggml_backend_synchronize(im.backend);   // the async finish graphs wrote x_state
-    // Only a stage that OWNS the model's last layer leaves a state column in x_state.  A later stage's last finish
-    // writes the boundary's hand-off column, which lives in the staging, so its head rows come from the payload:
-    // use logits_slab / logits_relay for those, and this call is refused rather than reading columns nobody wrote.
-    if (im.lb > 0) {
-        im.err = "logits_rows: stage [" + std::to_string(im.lb) + "," + std::to_string(im.le) +
-                 ") has no x_state column to read the head's rows from; use logits_slab with the relayed payload";
-        return false;
-    }
+    // The state region holds the rows of the pass just run on EVERY last stage: a staged run's later stage got its
+    // input through relay_write_in and its own finishes advanced it in place, exactly like the unsplit engine.
     ggml_backend_synchronize(im.backend);   // the pass's finish() is issued async; the rows are not valid until it lands
     im.host_x.resize(slab * (size_t) nr);
     ggml_backend_tensor_get(im.x_state, im.host_x.data(), slab * (size_t) r0, slab * (size_t) nr);
@@ -1662,52 +1522,3 @@ const float * GlmDense::tap_l_out(int il) const {
     if (il < im.lb || il >= im.le) return nullptr;   // another stage's tap
     return im.ly[(size_t) il].host_lout.data();
 }
-
-// P5.3 step 1: the LAST stage's head over a relayed slab.  The payload is what the staging of
-// tools/gfx906/relay_staging.hpp carries: per token, the stage's full column set (its x_state's nb[2] bytes), so
-// `x_host` is nr * relay_slab_bytes() floats-as-bytes, rows r0..r0+nr-1 of the pass.  This is logits_rows' host leg
-// with the read-out of x_state replaced by a copy from the staging, then the same head graph - which is why the two
-// paths give the same logits for the same state bytes.
-bool GlmDense::logits_relay(int r0, int nr, const float * x_host, float * out) {
-    Impl & im = *p_;
-    if (!im.is_last) { im.err = "logits_relay: this stage is not the last one (no output head)"; return false; }
-    if (!x_host) { im.err = "logits_relay: no payload"; return false; }
-    if (nr < 1 || nr > Impl::kRowsMax || r0 < 0) {   // the range check is the column check below (the model's last
-        im.err = "logits_relay: bad rows";            // column is n_layer, which is one past a stage's le)
-        return false;
-    }
-    // hx holds a slab's rows from THIS stage's own first column on, and `r0` counts rows of the relayed slab the
-    // same way logits_rows counts them, so the upload starts at (r0 - col0) rows into hx.
-    if (r0 < im.col0 || r0 + nr > im.g.n_layer + 1) {
-        im.err = "logits_relay: rows are outside this stage's part of the slab (columns " + std::to_string(im.col0) +
-                 ".." + std::to_string(im.g.n_layer) + ")";
-        return false;
-    }
-    if (im.gf_rows.empty()) {
-        im.gf_rows.assign((size_t) Impl::kRowsMax + 1, nullptr);
-        im.rows_t.assign((size_t) Impl::kRowsMax + 1, nullptr);
-        im.allo_rows = im.new_allo();
-    }
-    if (!im.gf_rows[(size_t) nr]) {   // the same head graph logits_rows builds, over hx's first nr rows
-        ggml_context * gc = im.gctx;
-        ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
-        B b { &im, gc, &im.g };
-        ggml_tensor * x = ggml_view_3d(gc, im.hx, im.D, im.HC, nr, im.hx->nb[1], im.hx->nb[2], 0);
-        ggml_tensor * acc = ggml_view_2d(gc, x, im.D, nr, x->nb[2], 0);
-        for (int64_t s = 1; s < im.HC; ++s) acc = ggml_add(gc, acc, ggml_view_2d(gc, x, im.D, nr, x->nb[2], (size_t) s * x->nb[1]));
-        acc = ggml_scale(gc, acc, 1.0f / (float) im.HC);
-        ggml_tensor * lg = ggml_mul_mat(gc, b.W("output.weight"), b.rms_w(acc, b.W("output_norm.weight")));
-        ggml_set_output(lg);
-        ggml_build_forward_expand(gf, lg);
-        im.gf_rows[(size_t) nr] = gf;
-        im.rows_t[(size_t) nr] = lg;
-    }
-    const size_t slab = im.x_state->nb[2];
-    ggml_backend_synchronize(im.backend);   // nothing may still be reading hx
-    ggml_backend_tensor_set(im.hx, x_host, slab * (size_t) (r0 - im.col0), slab * (size_t) nr);
-    if (!im.alloc(im.allo_rows, im.gf_rows[(size_t) nr])) { im.err = "gallocr(relay rows) failed"; return false; }
-    if (ggml_backend_graph_compute(im.backend, im.gf_rows[(size_t) nr]) != GGML_STATUS_SUCCESS) { im.err = "relay head failed"; return false; }
-    ggml_backend_tensor_get(im.rows_t[(size_t) nr], out, 0, (size_t) (im.g.vocab * nr) * 4);
-    return true;
-}
-

@@ -230,7 +230,7 @@ int sample_p(const float * logits, int n_vocab, float temp, int top_k, float top
 // split into ranges, and every pass runs the stages in order with ONE host-synchronized hand-off per boundary: the
 // producer's finished columns of x_state go to host staging, the successor uploads them and copies them into its own
 // columns before its first layer reads them (the staging of tools/gfx906/relay_staging.hpp, the driver
-// relay_stage_pass, the seams GlmDense::relay_read_out / relay_write_in / stage_relay_inject).  Without --gpus none of
+// relay_stage_pass, the seams GlmDense::relay_read_out / relay_write_in).  Without --gpus none of
 // this is allocated: the single dense instance runs every layer, exactly as in the last release.
 //
 // Step 1's scope, stated plainly: this runs the layers in stages with a real relay, and it REFUSES unless every stage
@@ -246,7 +246,6 @@ struct StagedRun {
     size_t slab = 0;                            // relay_slab_bytes(): the same on every stage
     int cap = 0;                                // tokens per staged pass (min of --relay-chunk and the model's max)
     std::vector<int64_t> lb, le;                // the stage ranges, from the split plan
-    std::vector<uint8_t> rx;                    // this pass's payload, kept readable after its slot is released
     std::string err;
     // what the relay cost, so a staged run can be compared against the same run unsplit
     double ms_relay = 0;
@@ -265,48 +264,40 @@ static std::string same_device_example(int n_stage) {
 // each boundary the producer's finished columns go through one staging slot to the stage after it.  The staging is the
 // caller's (StagedRun::st), so a sequence of passes shares the double-buffered slots and the driver's rotation.
 //
-//   run_stage(s, n, payload)   the CALLER's layer loop for stage s over this pass's tokens; the tier is the caller's,
-//                              so the MoE half is too.  `payload` is the host slab this stage received (the staging
-//                              slot the driver handed it) on a later stage, and nullptr on the first (whose column 0
-//                              is the embedding it wrote itself).
-//   finish_head(n, payload)    the last stage's head over this pass's rows, from the payload the relay carried.
+//   run_stage(s, n)            the CALLER's layer loop for stage s over this pass's tokens; the tier is the caller's,
+//                              so the MoE half is too.  A later stage's first layer reads the state region its
+//                              relay_write_in just filled; the first stage's is the embedding its init graph wrote.
+//   finish_head(n)             the last stage's head over this pass's rows (its own x_state, as unsplit).
 //
 // The pass's whole payload (n * slab bytes) must fit the staging: relay_stage_pass says so before any stage runs, and
 // the caller splits a longer prompt into passes (see --relay-chunk).
 static bool staged_pass(StagedRun & sr, int n, int pos0,
-                        const std::function<bool(int stage, int n, const uint8_t * payload)> & run_stage,
-                        const std::function<bool(int n, const uint8_t * payload)> & finish_head, std::string & err) {
+                        const std::function<bool(int stage, int n)> & run_stage,
+                        const std::function<bool(int n)> & finish_head, std::string & err) {
     const size_t payload = sr.slab * (size_t) n;
     const int n_stage = (int) sr.stage.size();
-    if (sr.rx.size() < payload) sr.rx.resize(payload);
 
     const auto run = [&](int s, std::string & e) -> bool {
-        // a later stage reads the slab the boundary carried (kept in rx, which outlives the slot); the first stage
-        // needs no payload - its own graphs wrote column 0 from the token ids
-        if (!run_stage(s, n, s == 0 ? nullptr : sr.rx.data())) {
+        if (!run_stage(s, n)) {
             e = "stage " + std::to_string(s) + ": " + sr.stage[(size_t) s]->last_error();
             return false;
         }
         return true;
     };
-    // the producer's finished columns into the slot: one D2H of n whole slabs, host-synchronized inside GlmDense
+    // the producer's state region into the slot: one D2H of n token slabs, host-synchronized inside GlmDense
     const auto stage_out = [&](int s, uint8_t * slot, size_t slot_bytes, std::string & e) -> bool {
         const double tr = now_ms();
-        const bool okc = sr.stage[(size_t) s]->relay_read_out(n, sr.stage[(size_t) s]->state_col0(), slot, slot_bytes);
+        const bool okc = sr.stage[(size_t) s]->relay_read_out(n, slot, slot_bytes);
         sr.ms_relay += now_ms() - tr;
         if (!okc) { e = "stage " + std::to_string(s) + ": " + sr.stage[(size_t) s]->last_error(); return false; }
-        // Keep a readable copy: the slot is released as soon as the successor has uploaded it, and the LAST stage's
-        // head runs after that, so the payload it reads must live somewhere of its own.
-        std::memcpy(sr.rx.data(), slot, payload);
         sr.n_boundary++;
         sr.bytes_relayed += payload;
         return true;
     };
-    // the slot into the consumer's landing pad, then into the columns its own layers read
+    // the slot straight into the consumer's state region - the region its first layer reads (no landing pad)
     const auto stage_in = [&](int s, const uint8_t * slot, size_t slot_bytes, std::string & e) -> bool {
         const double tr = now_ms();
-        bool okc = sr.stage[(size_t) s]->relay_write_in(n, 0, slot, slot_bytes);
-        if (okc) okc = sr.stage[(size_t) s]->stage_relay_inject(n);
+        const bool okc = sr.stage[(size_t) s]->relay_write_in(n, slot, slot_bytes);
         sr.ms_relay += now_ms() - tr;
         if (!okc) { e = "stage " + std::to_string(s) + ": " + sr.stage[(size_t) s]->last_error(); return false; }
         return true;
@@ -319,8 +310,8 @@ static bool staged_pass(StagedRun & sr, int n, int pos0,
                 e = "stage " + std::to_string(k) + ": " + sr.stage[(size_t) k]->last_error();
                 return false;
             }
-        // every layer of the pass has run and the payload holds the state the head reads: run the head now
-        if (!finish_head(n, sr.rx.data())) { e = "head: " + sr.stage[(size_t) s]->last_error(); return false; }
+        // every layer of the pass has run; the head reads the last stage's own state region, exactly as unsplit
+        if (!finish_head(n)) { e = "head: " + sr.stage[(size_t) s]->last_error(); return false; }
         ++sr.n_pass;
         return true;
     };
@@ -759,16 +750,16 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "relay: token slab %zu bytes, %d-token passes, %lld bytes staged (%s)\n", sr.slab, sr.cap,
                      (long long) sr.st.plan.bytes, sr.st.note.c_str());
         for (size_t s = 0; s < sr.stage.size(); ++s)
-            std::fprintf(stderr, "relay:   stage %zu: layers [%lld,%lld)  slab starts at column %lld  head %s  weights %s\n",
-                         s, (long long) sr.lb[s], (long long) sr.le[s], (long long) sr.stage[s]->slab_col0(),
+            std::fprintf(stderr, "relay:   stage %zu: layers [%lld,%lld)  head %s  weights %s\n",
+                         s, (long long) sr.lb[s], (long long) sr.le[s],
                          sr.stage[s]->is_last_stage() ? "here" : "not here",
                          sr.stage[s]->weights_shared() ? "shared" : "own copy");
     }
 
     std::vector<float> first_logits((size_t) G.vocab, 0.0f);
-                                        // Chunked prefill: the prompt's last row.  A staged run also keeps each
-                                        // decode pass's logits here (the staged engine relays its head rows, so it has
-                                        // no logits_n of its own), which is what the decode loop reads.
+                                        // Chunked prefill: the prompt's last row.  A staged run keeps each decode
+                                        // pass's logits here too (its head returns them through the head seam), which
+                                        // is what the decode loop reads.
     // Chunk scratch shared by the unsplit chunk path and the staged chunk path.  A staged run never runs a pass bigger
     // than the staging (sr.cap), so it is capped there - which is what keeps a staged run from allocating the full
     // 512-token prefill scratch at all; the unsplit path sizes and fills them exactly as before.
@@ -785,11 +776,11 @@ int main(int argc, char ** argv) {
     // same `tier`, which holds the whole routed set (splitting the tier is P5.4, docs/gfx906/P5-MULTI-GPU-DESIGN.md).
     //
     // The head is not called on a stage that does not own it; the pass's logits come from the LAST stage's head over
-    // the relayed payload (GlmDense::logits_slab), at the model's row index - which for a pass of n tokens is the
-    // n-th row of the LAST stage's own slab part, i.e. the pass's last token as the head sees it.
+    // its OWN state region (its relay_write_in + its own finishes leave the pass state there, as in the unsplit
+    // engine), so this is the same logits_rows the unsplit path reads - no payload round trip for the head.
     auto staged_step = [&](int tid, int pos, float * logits_out) -> bool {
         if (!sr.stage[0]->begin_token(tid)) { err = sr.stage[0]->last_error(); return false; }
-        const auto run_stage = [&](int s, int nn, const uint8_t *) -> bool {
+        const auto run_stage = [&](int s, int nn) -> bool {
             GlmDense & d = *sr.stage[(size_t) s];
             for (int64_t l = sr.lb[(size_t) s]; l < sr.le[(size_t) s]; ++l) {
                 const bool moe = G.routed(l);
@@ -803,10 +794,9 @@ int main(int argc, char ** argv) {
             }
             return true;
         };
-        // The head reads the model's LAST column (n_layer) of the pass's payload; on the last stage that is row
-        // (n_layer - col0) of its own part, one row, the token just produced.
-        const auto head = [&](int, const uint8_t * payload) -> bool {
-            return sr.stage.back()->logits_slab_row_last(payload, logits_out);
+        // One token per decode pass: row 0 of the last stage's state region.
+        const auto head = [&](int) -> bool {
+            return sr.stage.back()->logits_rows(0, 1, logits_out);
         };
         std::string perr;
         if (!staged_pass(sr, 1, pos, run_stage, head, perr)) {
@@ -821,7 +811,7 @@ int main(int argc, char ** argv) {
         for (int c0 = 0; c0 < n; ) {
             int m = std::min(sr.cap, n - c0);
             m = sr.stage[0]->safe_chunk(pos0 + c0, m);
-            const auto run_stage = [&](int s, int nn, const uint8_t *) -> bool {
+            const auto run_stage = [&](int s, int nn) -> bool {
                 GlmDense & d = *sr.stage[(size_t) s];
                 if (s == 0 && !d.begin_tokens(ids + c0, nn)) return false;
                 for (int64_t l = sr.lb[(size_t) s]; l < sr.le[(size_t) s]; ++l) {
@@ -833,10 +823,11 @@ int main(int argc, char ** argv) {
                 }
                 return true;
             };
-            // The head runs on every pass (a pass is a full forward through the stages, and its logits are what a
-            // caller reading the prompt's last row wants from the FINAL pass); the caller only reads `out` once.
-            const auto head = [&](int, const uint8_t * payload) -> bool {
-                return sr.stage.back()->logits_slab_row_last(payload, out);
+            // The head runs on every pass (a pass is a full forward through the stages); `out` keeps the FINAL
+            // pass's last row - what a prompt's next-token distribution is.  Rows are the pass's own token
+            // positions, read from the last stage's state region.
+            const auto head = [&](int nn) -> bool {
+                return sr.stage.back()->logits_rows(nn - 1, 1, out);
             };
             std::string perr;
             if (!staged_pass(sr, m, pos0 + c0, run_stage, head, perr)) {
@@ -848,8 +839,8 @@ int main(int argc, char ** argv) {
         return true;
     };
     auto step = [&](int tid, int pos) -> bool {
-        if (staged) {   // The staged engine runs the same pass; the logits come back from the last stage's head over the
-                        // relayed payload, and the sampling below is the unsplit path's, unchanged.  `dense` runs no
+        if (staged) {   // The staged engine runs the same pass; the logits come back from the last stage's head, and
+                        // the sampling below is the unsplit path's, unchanged.  `dense` runs no
                         // layers on a staged run, so its logits are never read.
             std::vector<float> lg((size_t) G.vocab);
             if (!staged_step(tid, pos, lg.data())) { std::fprintf(stderr, "glm_generate: %s\n", err.c_str()); return false; }
@@ -1271,9 +1262,8 @@ int main(int argc, char ** argv) {
         const double th0 = now_ms();
         const float * lg = nullptr;
         int n_vocab = 0;
-        // A staged run keeps EVERY pass's logits (prompt's last row and each token) in first_logits: the staged engine
-        // has no logits_n of its own because its head runs over the relayed payload, not over a persistent x_state
-        // column.  The unsplit path is the else-branch below, unchanged.
+        // A staged run keeps EVERY pass's logits (prompt's last row and each token) in first_logits, filled by
+        // staged_step from the last stage's head.  The unsplit path is the else-branch below, unchanged.
         if (staged) {
             if (first_logits.empty()) { std::fprintf(stderr, "glm_generate: staged run has no logits yet\n"); return 1; }
             lg = first_logits.data(); n_vocab = (int) first_logits.size();

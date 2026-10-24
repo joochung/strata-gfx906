@@ -77,8 +77,8 @@ struct GlmDenseConfig {
     /// does not start at 0 the token embeddings are not needed and are not looked up; with one that does not end at
     /// n_layer the LM head and output_norm are not loaded, so no stage but the last holds them.  Per-layer state
     /// (KDA S + conv, the MLA latent cache, the indexer pools) is allocated for this range's layers only, and the
-    /// layer graphs are built over this stage's columns of x_state - the relay of tools/gfx906/relay_staging.hpp
-    /// hands off at the stage's end, so a column this stage does not own is never written by it.
+    /// layer graphs run only over this stage's layers; the relay of tools/gfx906/relay_staging.hpp hands the state
+    /// region over at the stage's end.
     int64_t lb = 0, le = 0;   ///< le 0 = n_layer (filled in from the GGUF when not given)
     bool is_first = true, is_last = true;
 };
@@ -96,8 +96,6 @@ public:
 
     /// P5.3 step 1: the stage this instance runs (cfg.lb/cfg.le, or the whole model for the default config), and
     /// whether it is the one that owns the LM head.  With no range given these answer like a single-stage engine.
-    /// x_state's row stride is the same n_layer+1 columns on every stage, so these byte offsets are comparable
-    /// between stages and match the staging of tools/gfx906/relay_staging.hpp token for token.
     int64_t stage_begin() const;
     int64_t stage_end() const;
     int64_t stage_layers() const;   ///< the layers THIS stage owns (the full model's count when unsplit)
@@ -106,21 +104,13 @@ public:
     /// P5.3 step 1 (opt-in): does this instance own its weights, or were they shared with it by build_stages()?  A
     /// shared instance must be destroyed BEFORE the instance that owns the weights.
     bool weights_shared() const;
-    /// The byte offset in an x_state token slab where this stage reads its input column (0 on stage 0; one column
-    /// past the columns its predecessor ran on a later stage, where the relay puts the state it handed over).
-    size_t state_col0() const;
-    /// The COLUMN index at which this stage's part of an x_state slab starts (0 on the first stage; the hand-off
-    /// column on a later one).  The same number on both sides of a boundary, which is what makes a whole-slab copy
-    /// line up stage to stage: a caller that wants rows [r0, r0+nr) of the MODEL's slab asks the last stage for rows
-    /// starting at r0 - slab_col0() of the payload it received.
-    int64_t slab_col0() const;
     /// P5.3 step 1 (opt-in): build the STAGES of a split run on this instance's weights instead of loading the model
     /// once per stage.  Every `stage` is init'd with its own config (its layer range, its flags) and then uses the
     /// WEIGHT TENSORS of this instance rather than its own copies: on a split, stage 0 also holds the token embeddings
     /// and the last stage also holds the output head, so loading each stage separately costs MORE memory than the whole
     /// model, which defeats the point of a split on one card.  The weights a stage's range needs are a subset of what
     /// the whole model needs, so sharing is always safe; each stage still gets its own state (KDA/conv, MLA cache,
-    /// indexer pools), its own landing pad and its own graphs.  This instance must outlive every stage.  The stage
+    /// indexer pools) and its own graphs.  This instance must outlive every stage.  The stage
     /// ranges must tile the model's layers in order and each config's is_first/is_last must match its position.
     /// On failure, `err` says which stage and why, and no stage is left half-built.
     /// Stages are held as unique_ptrs (GlmDense is pimpl'd and deliberately not movable); a null entry is created.
@@ -152,40 +142,17 @@ public:
     /// Logits of rows [r0, r0+nr) of the last pass (nr <= 16) into out[nr * vocab]; works for any pass size (prompt
     /// chunks: their head is never built for all n rows - 2048 x 154880 floats would not fit).
     bool logits_rows(int r0, int nr, float * out);
-    /// The same head over rows of a relayed slab (see logits_relay), for the LAST stage of a staged run: rows
-    /// [r0, r0+nr) of the model's slab, given the host payload the run relayed.  On the last stage this is what
-    /// logits_rows does when the stage has no x_state column of its own for those rows; a caller that runs the head
-    /// itself (the tier and the sampling live in the engine) uses this.  nr <= 16.
-    bool logits_slab(int r0, int nr, const uint8_t * slab, float * out);
-    /// P5.3 step 1: run the LAST STAGE's head over rows [r0, r0+nr) of a token slab that is not in this instance's
-    /// x_state - the relay's payload, nr * relay_slab_bytes() bytes, the layout the staging carries.  The stage
-    /// uploads the slab into its own state tensor, runs the same head graph logits_rows runs, and writes the logits.
-    /// Fails on a stage that is not the last one (it holds no output.weight).
-    bool logits_relay(int r0, int nr, const float * x_host, float * out);
-    /// The head over a staged pass's LAST row: the model's column n_layer, which a stage reaches at its own offset
-    /// (slab_col0() + nrows() - 1).  Spelled out once here so no caller re-derives it and gets the wrong row.
-    // The model's slab rows are numbered 0..n_layer (column l+1 is layer l's output; column n_layer is the last
-    // layer's finish, i.e. what the head reads).  logits_slab takes the MODEL's row number and translates it.
-    bool logits_slab_row_last(const uint8_t * slab, float * out) {
-        return logits_slab((int) n_layer(), 1, slab, out);
-    }
-    /// The bytes per token of the relay payload: x_state's row stride = (n_layer + 1) * hc * n_embd * sizeof(float).
-    /// The same number on every stage of a split run, which is what makes a boundary a single whole-slab copy.
+    /// The bytes per token of the relay payload: x_state's token-column stride = n_embd * hc * sizeof(float).
+    /// The same number on every stage of a split run, which is what makes a boundary a single contiguous copy.
     size_t relay_slab_bytes() const;
-    /// P5.3 step 1: the two halves of a stage boundary, for the engine's loop (glm_generate.cpp).  Both name a
-    /// contiguous byte range of a token slab - `col_off` is the boundary's column times relay_slab_bytes(), the value
-    /// relay_boundary_columns() computes - and both move tokens [0,n) of it, so the payload is n * slab bytes.
-    /// relay_read_out() copies the producer's finished columns out of its x_state into the staging slot `dst`
-    /// (synchronizing the backend first: the payload must be complete before the successor is launched, which is the
-    /// native relay's rule).  relay_write_in() uploads the consumer's staging slot into this stage's landing pad;
-    /// stage_relay_inject() then copies that range into x_state's columns this stage's layers read.  A stage that is
-    /// not the first refuses write_in/inject; any stage can read out.
-    /// `col_off` counts UP from the stage's own first column, in slabs: a producer hands on every column its own
-    /// range wrote, so the first stage passes 0 and a later stage passes the bytes its own injection already put in
-    /// (relay_boundary_columns() gives the column index; multiply by relay_slab_bytes() for a whole-slab offset).
-    bool relay_read_out(int n, size_t col_off, void * dst, size_t dst_bytes);
-    bool relay_write_in(int n, size_t col_off, const void * src, size_t src_bytes);
-    bool stage_relay_inject(int n);
+    /// P5.3 step 1 (opt-in): the two halves of a stage boundary, for the engine's loop (glm_generate.cpp).
+    /// The pass's state is x_state's token columns [0,n) at byte 0 on EVERY stage, so a boundary is one contiguous
+    /// copy of n * relay_slab_bytes() bytes.  relay_read_out() copies the producer's finished state out of its
+    /// x_state into the staging slot ~dst~, synchronizing the backend first (the payload must be complete before
+    /// the successor is launched - the native relay's rule).  relay_write_in() uploads the staging slot straight
+    /// into this stage's state region, which its first layer then reads.  Any stage can do either.
+    bool relay_read_out(int n, void * dst, size_t dst_bytes);
+    bool relay_write_in(int n, const void * src, size_t src_bytes);
     /// P5.3 step 1: tell a LATER stage that the pass at positions [pos0, pos0+n) is the next one.  It owns no token
     /// ids, so it cannot see positions advance on its own, and its ordered-position rule (the KDA state cannot
     /// rewind) still has to hold.  Refused, with the same wording as the attention check, if pos0 is not where its

@@ -33,6 +33,24 @@ MIN_AVAIL_GIB=${MIN_AVAIL_GIB:-$((ARENA_GIB + 25))}
 AVAIL=$(( $(awk '/MemAvailable/{print $2}' /proc/meminfo) / 1048576 ))
 [ "$AVAIL" -ge "$MIN_AVAIL_GIB" ] || { echo "refusing: ${AVAIL} GiB available < ${MIN_AVAIL_GIB}"; exit 3; }
 
+# The artifacts this witness stands on (witness #1 of 2026-10-24 ran a binary older than the tree it
+# was launched from, and died in a view assert the current tree does not have).  Check before pinning.
+[[ -x tools/glm/serve/glm-engine-906.sh ]] || { echo "FATAL: missing wrapper tools/glm/serve/glm-engine-906.sh"; exit 3; }
+GEN="build-906/glm_generate"
+[[ -x "$GEN" ]] || { echo "FATAL: missing engine binary $GEN - run tools/gfx906/build-906-gate.sh 24 first"; exit 3; }
+if [ "$GEN" -ot tools/glm/glm_dense.cpp ] || [ "$GEN" -ot tools/glm/glm_generate.cpp ]; then
+    echo "FATAL: $GEN is older than the engine sources - the witness would measure a stale binary"
+    echo "       (this is what witness #1 did); rebuild with tools/gfx906/build-906-gate.sh 24 first"
+    exit 3
+fi
+# Drift guard: the state region must keep the last release's TOKEN-indexed layout [D, HC, max_tokens].
+# A staged run must never widen dim2 to n_layer+1 columns - the unsplit prefill then GGML_ASSERTs in
+# ggml_view_3d the moment a pass has more tokens than the model has layers (witness #1's exact failure).
+if grep -q "int64_t NT = n_layer + 1" tools/glm/glm_dense.cpp; then
+    echo "FATAL: glm_dense.cpp gives x_state n_layer+1 DIM2 columns; the layout must stay token-indexed"
+    exit 3
+fi
+
 PY=/root/.pyenv/versions/venv312/bin/python3
 IDS=logs/p5.3-ids-${TS}.i32
 PYTHONPATH="$PWD/tools" $PY - "$IDS" <<'EOF' || exit 1
