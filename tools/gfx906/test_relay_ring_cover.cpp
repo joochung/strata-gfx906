@@ -148,7 +148,7 @@ int main() {
             }
         lost_rel += lr; lost_carry += lc;
         printf("NC=%4lld S=%4lld SWA=%4lld RAW=%4lld : newest decode row NOT published - release %5lld, tilt/carry %5lld (of %5lld prompts)\n",
-               NC, S, SWA, RAW, lr, lc, 9 * 1200);
+               NC, S, SWA, RAW, lr, lc, (long long) (9 * 1200));
     }
 
     printf("\n=== SWA > RAW: the ring cannot hold a full window for ANY tiling (the release loses decode rows too) ===\n");
