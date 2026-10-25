@@ -85,6 +85,7 @@ ARGS=(-m "$M/V41-GSQ.gguf" --backend cuda --experts gpu
       --ids-file "$IDS" -n "$N_TOK" --arena-gib "$ARENA_GIB" --arena-adapt --vram-margin 1.0
       --prefill-chunk 64)
 STAGED=(--gpus "${DEVS:-0,0}" --layer-split "$SPLIT" --relay-chunk 64)
+[ "${DEVS:-0,0}" = "0,0" ] || STAGED+=(--relay-copy-weights)
 
 run_one() {   # run_one <name> <extra args...>
     sleep 10                                # a finished engine frees VRAM asynchronously
