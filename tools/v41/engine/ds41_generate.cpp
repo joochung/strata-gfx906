@@ -498,7 +498,17 @@ const auto stage_in = [&](int s, const uint8_t * slot, size_t slot_bytes, std::s
         ++sr.n_pass;
         return true;
     };
-    return strata::gfx906::relay_stage_pass(n, sr.st, run, stage_out, stage_in, advance, err);
+    if (!strata::gfx906::relay_stage_pass(n, sr.st, run, stage_out, stage_in, advance, err)) return false;
+    // P5.3b THE BACK-RELAY: a pass begins from the PREVIOUS pass's FINAL state, and only the last stage ever holds
+    // that depth (see Ds41Dense::relay_back_copy).  Feeding the last stage's finalized columns back into stage 0's
+    // same window is what makes stage 0's NEXT pass - the witness's first decode pass, whose layer 0 diverged with
+    // bitwise-equal inputs - start at the depth an unsplit pass starts at.  With more than two stages every stage
+    // before the last needs it, so the chain goes back to the producer and, transitively, to every stage.
+    if (sr.stage.size() > 1) {
+        Ds41Dense & last = *sr.stage[sr.stage.size() - 1];
+        if (!last.relay_back_copy(sr.stage[0].get(), n)) { err = "back-relay: " + last.last_error(); return false; }
+    }
+    return true;
 }
 
 }  // namespace
@@ -1296,6 +1306,17 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
     // (which is where the relay landed it in this stage's window).
     auto staged_run_stage = [&](int s, int n, const int * toks, int pos) -> bool {
         if (s == 0 && !sr.stage[0]->begin(toks, n, pos)) { ferr = sr.stage[0]->last_error(); return false; }
+        // STRATA_DUMP_STATE=PREFIX: what stage 0's begin() just wrote (embedding, one-hot pre, tables) - the
+        // ACTUAL inputs layer 0 consumes on a staged decode pass, as opposed to the boundary state dumped earlier
+        // (which is the depth-19 leftover begin() partially overwrites).  If these match the unsplit control's
+        // state at the same moment and layer 0 still diverges, the difference is in what the graph EXECUTES.
+        if (s == 0) {
+            if (const char * bs = std::getenv("STRATA_DUMP_STATE")) {
+                char tag[48];
+                std::snprintf(tag, sizeof tag, "postbegin.p%d", pos);
+                dump_state_cols(*sr.stage[0], bs, tag, "s0");
+            }
+        }
         return staged_stage_layers(sr, s, n, sids.data(), swts.data(), srouted.data(), staged_experts, ferr);
     };
     // one decode token through every stage; `logits_out` = the last stage's head over this pass's single row
@@ -1366,6 +1387,11 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
             dm_row.assign((size_t) 3 * n_embd, 0.0f);
         }
         if (!dense.begin(&tok, 1, pos)) { ferr = dense.last_error(); return false; }
+        if (const char * bs = std::getenv("STRATA_DUMP_STATE")) {   // same moment as the staged postbegin dump
+            char tag[48];
+            std::snprintf(tag, sizeof tag, "postbegin.p%d", pos);
+            dump_state_cols(dense, bs, tag, "full");
+        }
         if (dprof) { const double t = now_ms(); dp[0] += t - ta; ta = t; }
         int32_t top16[16];
         bool have_pred = false;

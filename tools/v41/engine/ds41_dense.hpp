@@ -171,6 +171,20 @@ public:
     /// src_pos0: the ABSOLUTE position the run is feeding (the graphs read it for RoPE and the index maps; the columns
     /// the payload covered are derived from it and this stage's window).  0 = the first unit of a prompt.
     bool relay_write_in(int n, const void * src, size_t src_bytes, int64_t src_pos0 = 0);
+    /// P5.3b THE BACK-RELAY: copy the columns the caller's last pass ran in into the same columns of `dst`, for a
+    /// pass of `n` tokens.  A layer split needs this because a pass BEGINS from the previous pass's FINAL state:
+    /// unsplit, x_state / pre_state / cand hold what layer nl-1 wrote, and layer 0 reads them as the residual
+    /// stream's running value.  Staged, only the LAST stage ever holds that depth - every earlier stage's columns
+    /// hold what ITS last layer left (depth le-1, not depth nl-1).  Without this, stage 0's second pass - the
+    /// witness's first DECODE pass, whose per-layer dumps showed layer 0's output differing across all 20480
+    /// floats with bitwise-equal tables, token, position and column - consumes the wrong residual depth.
+    /// Same-backend only (a graph/set_rows cannot cross a card here); the cross-device case takes the staging slot
+    /// the same way the forward relay does, which is step 2's transport.  No table refresh: this moves state,
+    /// not positions, and dst's next pass refreshes its own tables exactly as an unsplit pass's does.  The copy is a
+    /// host bounce (tensor_get then tensor_set), so it works for stages on different cards too - the transport P5.1
+    /// measured as the best available on this box (no Infinity Fabric).  The candidate region is copied only when
+    /// BOTH instances own a region; a stage reading another's tensor in place needs no copy (they share it).
+    bool relay_back_copy(Ds41Dense * dst, int n);
     /// P5.3b: does this instance's relay payload include the candidate column?  True unless it was told the
     /// candidates come from another stage's tensor in place (relay_cand_from).  The ENGINE owns this decision, because
     /// only it knows which stages share a card: it must match relay_slab_bytes() on both sides of a boundary, which

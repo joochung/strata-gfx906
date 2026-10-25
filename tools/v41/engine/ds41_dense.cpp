@@ -1876,6 +1876,39 @@ bool Ds41Dense::relay_write_in(int n, const void * src, size_t src_bytes, int64_
     return true;
 }
 
+bool Ds41Dense::relay_back_copy(Ds41Dense * dst, int n) {
+    Impl & im = *p_;
+    if (!dst) { im.err = "relay_back_copy: no destination stage"; return false; }
+    if (n < 1 || n > (int) im.NC) { im.err = "relay_back_copy: pass size out of range"; return false; }
+    Impl & od = *dst->p_;
+    if (n > (int) od.NC) { im.err = "relay_back_copy: destination has fewer columns than the pass"; return false; }
+    const size_t xs = (size_t) (im.D * im.HC * 4), ps = (size_t) (im.HC * 4);
+    const size_t cs_src = relay_slab_bytes() - xs - ps;
+    const size_t cs_dst = dst->relay_slab_bytes() - xs - ps;
+    // the columns THIS instance's last pass ran in - the same window formula the forward relay lands in, so the
+    // producer's next pass reads exactly the columns the consumer's pass just finalized.
+    const int64_t c0 = im.staged ? im.col0 : 0;
+    const int64_t d0 = od.staged ? od.stage_col0(im.pos0, n) : 0;
+    if (c0 + n > im.NC || d0 + n > od.NC) {
+        im.err = "relay_back_copy: " + std::to_string(n) + " columns from " + std::to_string(c0) + " do not fit";
+        return false;
+    }
+    std::vector<uint8_t> buf;
+    buf.resize((xs + ps) * (size_t) n + (cs_src && cs_dst ? cs_src * (size_t) n : 0));
+    uint8_t * b = buf.data();
+    ggml_backend_synchronize(im.backend);   // the consumer's last layer's writes must be complete
+    ggml_backend_tensor_get(im.x_state, b, (size_t) c0 * xs, xs * (size_t) n);
+    ggml_backend_tensor_get(im.pre_state, b + xs * (size_t) n, (size_t) c0 * ps, ps * (size_t) n);
+    if (cs_src && cs_dst)
+        ggml_backend_tensor_get(im.cand, b + (xs + ps) * (size_t) n, (size_t) c0 * cs_src, cs_src * (size_t) n);
+    ggml_backend_synchronize(od.backend);   // whatever was reading the destination's state
+    ggml_backend_tensor_set(od.x_state, b, (size_t) d0 * xs, xs * (size_t) n);
+    ggml_backend_tensor_set(od.pre_state, b + xs * (size_t) n, (size_t) d0 * ps, ps * (size_t) n);
+    if (cs_src && cs_dst)
+        ggml_backend_tensor_set(od.cand, b + (xs + ps) * (size_t) n, (size_t) d0 * cs_dst, cs_dst * (size_t) n);
+    return true;
+}
+
 // P5.3b: read another stage's candidate blocks in place (same card).  See the header: this is only for a same-device
 // split that puts cand_layer's producer and its readers on different stages, and it makes this stage's relay payload
 // the state region alone (relay_slab_bytes() follows, so the staging is sized consistently).

@@ -286,6 +286,21 @@ for l in range(0, 20):
         print(f"  L{l:02d}: decode column: {int((d0 > 0).sum()):6d}/20480 differ, max {d0.max():.3e}{mark}")
 print("first diverging layer:", first_L if first_L is not None else "NONE - stage 0 matches to its end")
 
+# ---- stage 0's ACTUAL layer-0 inputs after begin() (postbegin dumps) ----
+print("== POST-BEGIN state (what layer 0 actually consumes on the first decode pass) ==")
+for _pv in poss if 'poss' in dir() else []:
+    a_f = f"{out}.ctrl/state.st.postbegin.p{_pv}.full.bin"
+    b_f = f"{out}.staged/state.st.postbegin.p{_pv}.s0.bin"
+    if not (_os.path.exists(a_f) and _os.path.exists(b_f)):
+        print(f"  p{_pv}: missing"); continue
+    a, b = np.fromfile(a_f, dtype=np.uint8), np.fromfile(b_f, dtype=np.uint8)
+    n = min(len(a), len(b))
+    nc = n // 81936
+    ax, bx = a[:nc * 81920], b[:nc * 81920]
+    ap, bp = a[nc * 81920:n], b[nc * 81920:n]
+    dx = int((ax != bx).sum()); dp2 = int((ap != bp).sum())
+    print(f"  p{_pv}: x_state {dx} bytes differ, pre_state {dp2} bytes differ (of {nc} cols)")
+
 EOF
 rc2=$?
 [ $rc2 -eq 0 ] || rc=$rc2
