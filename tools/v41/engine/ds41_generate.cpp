@@ -621,9 +621,16 @@ int main(int argc, char ** argv) {
     // a chunk-path UNSPLIT run (--prompt-batch 0, enc-skip off through the check above, same ids) reproduced the
     // layer-major controls exactly (logs/p5.3b-probe-sequnsplit.toks) - the prefill path was innocent; this flag was
     // the only remaining difference the staged runs carried.
-    if (enc_skip && a.split.n_stage > 1) {
-        if (a.enc_skip == 1) std::fprintf(stderr, "note: --enc-skip disabled (a staged run is a chunk-path run; the layer-major slice has no meaning over cycling columns)\n");
-        enc_skip = false;
+    // The test is the NAMED-DEVICE COUNT, not a.split.n_stage: n_stage is filled by split_plan() further down (it
+    // needs the layer count), so at this point it is still its default 1.  The first witness of this clause
+    // (run3, logs/p5.3b-run3-20261024-223307.log) proved that: the plan line still printed, because the clause as
+    // first written tested n_stage.  split_ints() over --gpus is the same predicate the staged decision above uses.
+    {
+        std::vector<int> ns_gpus;
+        if (enc_skip && !a.split.gpus.empty() && strata::gfx906::split_ints(a.split.gpus, ns_gpus) && ns_gpus.size() > 1) {
+            if (a.enc_skip == 1) std::fprintf(stderr, "note: --enc-skip disabled (a staged run is a chunk-path run; the layer-major slice has no meaning over cycling columns)\n");
+            enc_skip = false;
+        }
     }
     int64_t ER = enc_skip ? (int64_t) a.enc_replay : 0;
     dc.engram_dirs = a.engram;
