@@ -60,6 +60,10 @@ if pgrep -f "engine/strata|vllm|glm_generate|ds41_generate" >/dev/null 2>&1; the
     echo "refusing: another engine is alive - one HIP engine at a time (SVM crash rule)"; exit 3
 fi
 ARENA_GIB=${ARENA_GIB:-64}
+# EXTRA_ARGS: a space-separated string, word-split into the common ARGS for EVERY run (controls included), so a
+# shape-neutral rerun can turn off a lever both shapes would otherwise score as a divergence.  Unset = empty array.
+EXTRA_ARGS_STR=${EXTRA_ARGS:-}
+read -r -a EXTRA_ARGS <<< "$EXTRA_ARGS_STR"
 MIN_AVAIL_GIB=${MIN_AVAIL_GIB:-$((ARENA_GIB + 25))}
 AVAIL=$(( $(awk '/MemAvailable/{print $2}' /proc/meminfo) / 1048576 ))
 [ "$AVAIL" -ge "$MIN_AVAIL_GIB" ] || { echo "refusing: ${AVAIL} GiB available < ${MIN_AVAIL_GIB}"; exit 3; }
@@ -114,7 +118,11 @@ SPLIT=${SPLIT:-20}
 ARGS=(-m "$M/V41-GSQ.gguf" --backend cuda --experts gpu
       --engram "$M/engram/l1:$M/engram/l14" --rank "$M/rank.bin"
       --ids-file "$IDS" -n 64 --arena-gib "$ARENA_GIB" --arena-adapt --vram-margin 1.0
-      --prefill-chunk 64)   # --relay-chunk belongs to the STAGED runs only (run3/4/5): the engine refuses a relay
+      --prefill-chunk 64 "${EXTRA_ARGS[@]+${EXTRA_ARGS[@]}}")   # EXTRA_ARGS (default empty) applies to EVERY run, controls
+                                              # included: a shape-neutral rerun with --route-bias 0 --route-bias-file 0
+                                              # removes the residency bonus, which a staged run must earn from less
+                                              # free VRAM and would otherwise score as a relay divergence.
+                                              # --relay-chunk belongs to the STAGED runs only (run3/4/5): the engine refuses a relay
                                               # cap with no --gpus, and a control must not carry staged flags at all.
                                               # --prompt-batch stays at the engine's 8192: a staged run takes its
                                               # state columns from it (the layer-major walk never runs), which is
