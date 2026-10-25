@@ -1876,6 +1876,8 @@ bool Ds41Dense::relay_write_in(int n, const void * src, size_t src_bytes, int64_
     return true;
 }
 
+int64_t Ds41Dense::dim_embd() const { return p_->D; }
+
 size_t Ds41Dense::debug_eng_col_bytes() const { return (size_t) p_->EC * (size_t) p_->ED * 4u; }
 
 bool Ds41Dense::debug_read_eng(int slot, int ncols, void * dst) {

@@ -189,6 +189,7 @@ public:
     /// build_attn reads at line "rows = b.cols2(im.i_eng[L.eslot], ...)") into dst.  Layer 0 of the witness has
     /// bitwise-equal x/pre after begin() yet diverges, and the Engram rows are the ONE input column region no
     /// state dump has ever covered (i_eng is per-instance state, fed at begin() from the Engram tables).
+    int64_t dim_embd() const;   // D, the model width (for dumps that must not over-read the router's fn row)
     bool debug_read_eng(int slot, int ncols, void * dst);
     size_t debug_eng_col_bytes() const;   // EC * ED * 4, or 0 before init
     /// P5.3b: does this instance's relay payload include the candidate column?  True unless it was told the

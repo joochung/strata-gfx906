@@ -561,7 +561,7 @@ static bool staged_stage_layers(StagedRun & sr, int s, int n, int * ids, float *
             char who[32], tag[48];
             std::snprintf(tag, sizeof tag, "L00.p%d", (int) sr.pos_of);
             std::snprintf(who, sizeof who, "s%d", s);
-            dump_router_seam(bs_rt, tag, who, ids, 256, wts, 256, fn, (size_t) n_embd);
+            dump_router_seam(bs_rt, tag, who, ids, 256, wts, 256, fn, (size_t) d.dim_embd());
         }
         if (!experts((int) l, ids, wts, fn, n, routed)) { err = "tier refused at layer " + std::to_string(l); return false; }
         if (!d.finish((int) l, routed)) { err = d.last_error(); return false; }
