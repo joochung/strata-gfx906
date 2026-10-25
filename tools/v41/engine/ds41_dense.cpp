@@ -210,114 +210,17 @@ struct Ds41Dense::Impl {
     /// block, laid out contiguously.  So the consumer's columns for the producer's columns [k, k+m) are [k, k+m):
     /// `src_col` is the offset the producer's block starts at, and a piece never crosses a consumer window because the
     /// consumer's window is the smaller one and every piece is sized to it.
-    /// P5.3b: THE COLUMN A STAGED PASS RUNS IN, THE ONE DEFINITION EVERY READER USES.  A pass is identified by the position of
-    /// its FIRST ROW: with the ring carry (see Ds41Dense::begin) that is the position BELOW the slice the run feeds, so a
-    /// carrying pass lands one column below the pass above it - the column where that piece left the row this one carries.
-    /// The state buffer cycles in windows S columns wide, so a pass of `rows` rows whose first row sits at position `pos` runs at
-    ///
-    ///     col0 = (pos / S) % (NC / S) * S
-    ///
-    /// a function of the position, the window and the width ALONE.  That is the property the relay exists on: the producer
-    /// that wrote a payload, the consumer that reads it, the run's own stash and the head that reads the run's rows all call
-    /// THIS with the pass's first position and width, and land on the same columns without talking to each other - which is
-    /// why a payload needs no offsets and cannot drift.
-    ///
-    /// WHY THE WIDTH IS AN ARGUMENT.  `rows` moves nothing: col0 + rows <= NC is a pass's whole obligation to the buffer, and
-    /// asking the map with it is how a caller learns a pass fits BEFORE committing to it (a run asks this when it decides
-    /// whether a piece may carry).  Since S divides NC and rows <= S, the obligation always holds - but "always" is what the
-    /// first two theories of this bug got wrong, so it is checked here, loudly, rather than assumed.
-    // WHERE A PASS'S ROWS GO.  A position p owns column
-    //     (p / S) % (NC / S) * S + (p % S)
-    // (the map's window, plus the row's offset inside it), and upload_pos_tables writes a pass's rows from col0 upward, so a pass
-    // whose rows are to sit on the columns their OWN positions own - which is what every span graph asks for - must satisfy
-    //     col0 = column_of(first_row) - (first_row % S)   and   rows <= S - (first_row % S)
-    // An UNSPLIT pass begins at a window boundary (first_row % S == 0) and the two collapse to the release's map with S rows of
-    // room.  A CARRYING pass begins one position BELOW the window it feeds - first_row % S == S - 1 - and lands its rows on the
-    // columns their positions own with exactly one row of room to spare, which is the row the piece below re-computes.  Asking
-    // with the first row's position and the pass's width is therefore the whole answer, for both shapes.
-    int64_t stage_col0(int64_t pos, int rows, bool carry = false) const {
+    /// The column a staged pass of n tokens starting at absolute position pos runs in.  Passes of a window's worth
+    /// cycle the NC columns (NC/S windows); a shorter pass (a decode step, a prompt's tail) still starts at a window
+    /// boundary, chosen by the same position math, so the producer and the consumer of a boundary agree.
+    int64_t stage_col0(int64_t pos, int n) const {
         const int64_t s = std::max<int64_t>(1, S);
         const int64_t nwin = std::max<int64_t>(1, NC / s);
-        (void) rows;
-        const int64_t win = (pos / s) % nwin * s;
-        // THE MAP -- UNCHANGED FROM THE RELEASE, WITH ONE EXCEPTION THE RING CARRY NEEDS.
-        //
-        // An ordinary pass writes at its window's head: win(pos).  Every unsplit pass, every release pass, and every staged
-        // piece that does not carry takes this branch, and its rows land on the columns their own positions own, which is
-        // what every reader (i_pos / i_widx / i_wmask, and the span graphs that address a column by position) asks for.
-        //
-        // A CARRYING pass is one row wider than the rows it feeds: its row 0 re-computes the position BELOW the slice, the
-        // window below's last row, which the piece above deliberately did not run.  That row's position owns the column at
-        // the head of the block this pass feeds -- exactly the column the piece above would have written it at, had it run
-        // it -- so a carrying pass's rows start ONE COLUMN INTO its own window, and the carried row lands at win(pos) + 1
-        // while the rows it feeds occupy win(pos) + 1 .. win(pos) + rows - 1: the columns their positions own.  A pass that
-        // does not carry, even a one-row pass begun at a window's last position, keeps the release's column; the flag is
-        // what keeps the release's arithmetic byte-identical, and the run never leaves it unset by accident (set_pass_row
-        // clears it on every non-carrying pass and finish() clears it with the pass).
-        // A carrying pass re-computes the position BELOW the run's slice, and its rows land on the columns their own
-        // positions own: a position's row sits at its window's head plus its offset inside the window (that is where
-        // upload_pos_tables writes it and where every reader looks).  The row is placed ONE COLUMN LOWER than the window its
-        // first row falls in, which is exactly the column the producing pass ended at - so the payload's offset is 0 on both
-        // sides without either side exchanging an offset.  At the map's wrap the column below is the buffer's LAST column,
-        // which is the producer's own column and holds no live row of the consumer's pass; both sides compute it the same way.
-        // A CARRYING PASS IS PLACED ONE WINDOW UP.  Its row 0 re-computes the window below's LAST position, and its rows 1..
-        // are the window it feeds - so the block it writes is the FED window's block, offset by the one carried row: starting
-        // at win(pos) + s puts the carried row at the PRODUCER's last column (win(pos) + s - 1 = the block it ended at, because
-        // pos is the window below's last row) and the fed rows on the columns their own positions own.  Both sides of a stage
-        // boundary call this one function, so the payload's offset is 0 on both sides without an offset being exchanged.
-        // An ordinary pass - every unsplit pass, and every staged piece that does not carry - keeps the release's column exactly.
-        return carry ? (win + s) % (nwin * s) : win;
+        const int64_t c = (pos / s) % nwin * s;   // the window this position's pass runs in
+        // A short pass (a prompt's tail, a decode step) starts a window but does not fill it; it may not run past the
+        // allocation either, so clamp it inside the columns.  Both bounds hold because n <= S <= NC.
+        return std::min(c, std::max<int64_t>(0, NC - n));
     }
-    // The pass's obligation, in one place: the column the first row lands on, plus the rows, must fit the stage's state columns
-    // AND the window's block (rows at or below S - pos % S), because a position outside its window's block is a column a reader
-    // never asks for.  This is the inequality a run asks before it commits to a carry, and the one begin() re-checks.
-    // P5.3b: set by the RUN for the duration of a pass that re-computes the row below its slice (see Ds41Generate::staged_feed),
-    // so the stage's own table writer knows the columns that pass writes.  begin()/begin_batch() set it from the caller's `overlap`.
-    // The PASS's first row, named by the run before begin()/begin_batch() when it carries: a carrying pass's first row is the
-    // position BELOW the tokens it feeds.  -1 means "no carry", which is what every unsplit pass and the release leave it, so the
-    // release's arithmetic is untouched - the pass's first row is then the slice itself.
-    int64_t pass_pos0 = -1;
-    bool pass_fits(int64_t pos, int64_t rows) const {
-        const int64_t s = std::max<int64_t>(1, S);
-        return rows >= 1 && rows <= s - (pos % s) && stage_col0(pos, (int) rows) + rows <= NC;
-    }
-    /// THE CARRY'S FIT: a pass of `rows` rows begun at the window's LAST position (pos = slice - 1, slice % s == 0), whose
-    /// rows are the re-computed edge row plus the slice's window.  It is placed one column into the slice's window (see
-    /// stage_col0), so its obligation is one column tighter than an ordinary pass's: win(slice) + 1 + rows <= NC.  The
-    /// window it feeds must exist, which is what slice % s == 0 says.
-    bool carry_fits_pos(int64_t pos, int64_t rows) const {
-        const int64_t s = std::max<int64_t>(1, S);
-        if (rows < 2 || pos < 0) return false;
-        if (((pos + 1) % s + s) % s != 0) return false;   // the carry closes a WINDOW boundary: pos is the window's last row
-        if (rows > s + 1) return false;                   // the re-run row plus the window it feeds, never more
-        const int64_t col0 = stage_col0(pos, (int) rows, /*carry=*/true);
-        return col0 >= 0 && col0 + rows <= NC;
-    }
-    // The ROOM a pass beginning at the run's first row `slice` has, asked of the map (the release's bound: a pass stays inside the
-    // window its first row fell in, and inside the state columns).  The run asks THIS rather than deriving a width, so a piece can
-    // never be wider than the columns its rows own - a wider piece lands its tail in columns no reader asks for, which is a silent
-    // corruption of the ring rather than a loud refusal.
-    int64_t pass_room(int64_t slice) const {
-        const int64_t s = std::max<int64_t>(1, S);
-        // A pass beginning at the run's row `slice` owns the columns of the window its positions fall in: S - slice%S of them.
-        // (A CARRYING pass begins one row lower and owns S - slice%S + 1; the run adds the row back when carry_fits agrees.)
-        const int64_t room = std::min(s - (slice % s), NC - stage_col0(slice, 1));
-        return pass_fits(slice, std::max<int64_t>(1, room)) ? room : 1;
-    }
-    // A CARRY'S OBLIGATION.  A carrying pass RE-COMPUTES the position below `slice` and feeds the run from `slice`.  Asked about its
-    // own first row (slice - 1) the map names the window BELOW, so the pass spills that window's bound by the offset plus the row it
-    // re-computes, and - because the map slides a pass to its window's first column - it would write its rows ONE COLUMN BELOW the
-    // columns its own positions own.  A span graph reads i_pos / i_widx / i_wmask at the column its POSITION names, so a carrying
-    // pass writes at the column the run's rows fall in, one lower than the map's own: the columns line up and the re-computed row
-    // lands in the block the producer left it in.  Hence the bound is asked of the map at `slice` (a window must exist above to
-    // slide into) and the width gets the one row of slack back.  The release's arithmetic accounted for, not a new map.
-    /// Can a piece whose slice opens at `slice` carry the row BELOW it (which its producer ran last) and feed its own rows
-    /// after it?  The shape is fixed by the ring's grain: the re-run row is the window below's LAST position, so the pass is
-    /// begun at a window edge and the map places it at the window it FEEDS (see stage_col0).  The width is whatever the
-    /// tiling asked for - the fed window's rows plus that one - and the only obligation is that the block fits this stage's
-    /// columns.  A piece whose fed window is the buffer's LAST window cannot be placed, and the run says so out loud rather
-    /// than wrapping the block into columns another window owns.
-    bool carry_fits(int64_t slice, int64_t rows) const { return carry_fits_pos(slice - 1, rows); }
     Ds41Engram engram;
     std::string err;
 
@@ -410,13 +313,6 @@ struct Ds41Dense::Impl {
 
     // ---- the pass
     int pos0 = 0, n = 0;
-    /// P5.3b: whether the pass this stage is running CARRIES a row the run is not feeding (see Ds41Dense::begin /
-    /// relay_write_in): stage 0 RE-COMPUTES the row of the position below the slice as its first row, a relayed stage RECEIVES
-    /// it in the payload at the same column.  Either way the pass's rows occupy exactly the columns the map assigns the
-    /// position its first row sits at, so nothing here shifts and no reader needs the flag to find a row.  It is kept for
-    /// whoever asks what kind of pass this is, and because a pass that carries is one row wider than the tokens it feeds -
-    /// build_attn's write-back (i_wslot, read UNSLICED) therefore covers the row too, which is the point of the whole thing.
-    bool carry = false;
     int64_t pass_cap[3] = { 0, 0, 0 };
     // ---- the layer-major prompt batch (begin_batch): S = the dense sub-batch size, batch = B, span_cap per sub-batch
     int64_t S = 1, batch = 0, col0 = 0;
@@ -437,13 +333,8 @@ struct Ds41Dense::Impl {
     ggml_context * gctx = nullptr;        // node structs of the cached (n = 1) graphs
     std::vector<uint8_t> pf_meta;         // node structs of a pass graph with n > 1 (built per pass)
     Allo allo_dec, allo_pass;
-    // P5.3b: `rc` is the COLUMN the cached graph was built for (a staged run's pass column; 0 for an unsplit run).  It
-    // is part of the key because a cached graph bakes that column into its tensor views (b.cols3(im.x_state, ..., col0)):
-    // the positions a pass carries are DATA (i_pos, uploaded per pass) but its column is not, and a staged run's column
-    // for a position depends on the pass's width - which depends on whether it carries a ring row - so the same (layer,
-    // n = 1) graph serves passes that live in different columns.
-    struct GKey { int il, kind; int64_t cap, n; int64_t col0 = 0; bool operator<(const GKey & o) const {
-        return std::tie(il, kind, cap, n, col0) < std::tie(o.il, o.kind, o.cap, o.n, o.col0); } };
+    struct GKey { int il, kind; int64_t cap, n; bool operator<(const GKey & o) const {
+        return std::tie(il, kind, cap, n) < std::tie(o.il, o.kind, o.cap, o.n); } };
     std::map<GKey, ggml_cgraph *> graphs;
     std::map<int, ggml_tensor *> logits_out;   // decode head graph output, by nrows
     std::map<int, ggml_tensor *> predict_out;  // predict graph output, by layer
@@ -513,13 +404,7 @@ struct Ds41Dense::Impl {
     /// shares stage 0's buffer and silently reads stage 0's row; a cross-backend stage reads its own zeroed buffer).
     /// Splitting the table math out lets both entry points share it verbatim, so a relayed stage's tables match an
     /// unsplit run's for the same (pos0, col0, n) - which is exactly what makes the staged first decode token agree.
-    // col_at: the columns to write (-1 = this stage's own map column).  A carrying pass writes one column LOWER so the row it
-    // borrows lands in the block its consumer reads; see the comment at Ds41Generate::carry_fits.
-    bool upload_pos_tables(int n_rows, int pos0, int col_at = -1, bool overlap = false);
-    /// The body of begin(), after the pass's column window and (for a ring overlap) the widened pass are settled:
-    /// uploads the pass's rows and runs the embedding -> state init.  Kept separate so begin() can widen a staged
-    /// pass by the borrowed ring row without duplicating its window / candidate-column checks.
-    bool begin_impl(const int * tids, int n, int pos0);
+    bool upload_pos_tables(int n, int pos0);
 };
 
 // ================================================================== weights
@@ -767,11 +652,8 @@ static ggml_tensor * fake_quant(ggml_context * gc, ggml_tensor * x, Ds41Quant mo
 // stage's pass lives in its own window (relay_write_in set im.col0 when the payload landed), so the builders read the
 // window from the impl rather than a parameter - a stale call site cannot then silently run a staged pass at column 0.
 static inline int64_t pass_col0(const Ds41Dense::Impl & im, int64_t col0) { return im.staged ? im.col0 : col0; }
+
 static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0_p = 0) {
-    // P5.3b: `n` is the whole pass (a ring overlap row included).  `rn` is the RUN's rows and `col0` the column they
-    // live in - which for an unsplit pass and a pass without an overlap is simply (n, col0).  Everything that reads a
-    // PERSISTENT source or writes one uses (rn, col0); only the ring write-back uses the pass's extra row, and that is
-    // the row the overlap was added for.
     const int64_t col0 = pass_col0(im, col0_p);
     using L_t = Ds41Dense::Impl::Layer;
     L_t & L = im.ly[(size_t) il];
@@ -806,11 +688,8 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     const int64_t r = L.ratio;
     const int64_t cap = r ? im.pass_cap[r] : 0;
     std::vector<ggml_tensor *> outs, late;    // late: ring / state write-backs, after every read
-    // P5.3b: nothing here knows about the ring overlap.  A pass that carries one arrived as a pass ONE ROW WIDER (see
-    // Ds41Dense::begin), so its KV rows, its window rows and its write-back all include the carried row as a matter of
-    // course - the graph is the release's, node for node, which is the property that makes the repair unable to
-    // disagree with itself.
     ggml_tensor * pos = b.v1(im.i_pos, n, (size_t) col0 * 4);
+
     // ---- Engram (model.py Engram.forward), before the block, on the hc state
     ggml_tensor * x = b.cols3(im.x_state, D, HC, n, col0);
     if (L.eslot >= 0 && im.engram.enabled()) {
@@ -852,7 +731,6 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_tensor * Kw = ggml_reshape_3d(gc, ggml_get_rows(gc, wsrc, b.v1(im.i_widx, SWA * n, (size_t) col0 * SWA * 4)), DH, SWA, n);
     ggml_tensor * Mw = b.cols2(im.i_wmask, SWA, n, col0);
     {
-        // The write-back stores the pass's LAST min(n, RAW) KV rows into the slots of THEIR positions.
         const int64_t k = std::min<int64_t>(n, RAW);
         ggml_tensor * last = ggml_view_2d(gc, kv2, DH, k, kv2->nb[1], (size_t) (n - k) * kv2->nb[1]);
         late.push_back(ggml_set_rows(gc, L.raw, last, b.v1(im.i_wslot, k, 0)));
@@ -1253,16 +1131,11 @@ static ggml_cgraph * build_init(Ds41Dense::Impl & im, ggml_context * gc, int64_t
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
-    // P5.3b: `n` is the WHOLE pass, a carried ring row included: stage 0 computes that row's embedding from the token the
-    // caller handed it, exactly like the rows above it, and it lands at the pass's first column.  The column BELOW the
-    // pass is where a RELAYED stage receives the same row's bytes from its producer, and nothing here touches it.
-    const int64_t c = col0;
-    const int64_t nr = n;
-    ggml_tensor * e = ggml_reshape_3d(gc, b.cols2(im.i_emb, D, nr, c), D, 1, nr);
-    ggml_build_forward_expand(gf, ggml_cpy(gc, ggml_repeat_4d(gc, e, D, HC, nr, 1), b.cols3(im.x_state, D, HC, nr, c)));
-    ggml_tensor * one = ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, 1, nr), 1.0f);
+    ggml_tensor * e = ggml_reshape_3d(gc, b.cols2(im.i_emb, D, n, col0), D, 1, n);
+    ggml_build_forward_expand(gf, ggml_cpy(gc, ggml_repeat_4d(gc, e, D, HC, n, 1), b.cols3(im.x_state, D, HC, n, col0)));
+    ggml_tensor * one = ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, 1, n), 1.0f);
     ggml_tensor * oh = ggml_pad(gc, one, (int) (HC - 1), 0, 0, 0);                            // [1, 0, 0, 0] per token
-    ggml_build_forward_expand(gf, ggml_cpy(gc, oh, b.cols2(im.pre_state, HC, nr, c)));
+    ggml_build_forward_expand(gf, ggml_cpy(gc, oh, b.cols2(im.pre_state, HC, n, col0)));
     return gf;
 }
 
@@ -1357,32 +1230,6 @@ bool Ds41Dense::set_columns(int nc) {
 }
 
 int Ds41Dense::columns() const { return (int) p_->NC; }
-
-int64_t Ds41Dense::window_swa() const { return p_->SWA; }
-int64_t Ds41Dense::window_raw() const { return p_->RAW; }
-int64_t Ds41Dense::stage_column(int64_t pos, int rows, bool carry) const {
-    return p_->stage_col0(pos, std::max(1, rows), carry);
-}
-
-int64_t Ds41Dense::stage_position(int64_t pos) const {
-    const int64_t s = std::max<int64_t>(1, p_->S);
-    return p_->stage_col0(pos - (pos % s), 1) + (((pos % s) + s) % s);   // window head + offset inside the window
-}
-
-bool Ds41Dense::pass_fits(int pos, int rows) const { return p_->pass_fits(pos, std::max(1, rows)); }
-
-bool Ds41Dense::carry_fits(int slice, int rows) const { return p_->carry_fits(slice, std::max(2, rows)); }
-
-int Ds41Dense::pass_room(int slice) const { return (int) p_->pass_room(slice); }
-
-// THE RUN NAMES ITS PASS.  A carrying pass's first row is the position BELOW the tokens it feeds, and the stage that runs it
-// writes that pass's tables at the column the RUN's rows own (Impl::carry).  A relayed stage does not need this: its tables
-// are written by relay_write_in, which is given the producer's pass row and overlap with the payload.  -1 clears it, which is the
-// default and what every unsplit pass and the release use; a run that forgets cannot leak a carry into the next pass or decode.
-void Ds41Dense::set_pass_row(int pos0) {
-    if (pos0 < 0) { p_->pass_pos0 = -1; p_->carry = false; return; }
-    p_->pass_pos0 = pos0;
-}
 
 // P5.3b: the pass cap a STAGED run enforces (see the header).  Deliberately NOT a set_columns(): the state columns
 // stay at their allocation, only the largest pass the graphs are built for gets smaller, so a stage's per-pass scratch
@@ -1960,33 +1807,27 @@ bool Ds41Dense::relay_read_out(int n, void * dst, size_t dst_bytes) {
     // count is a function of the GEOMETRY, never of a stage's range, which is the property that makes the two sides of a
     // boundary agree on where the copy ends.  cs is 0 on any model whose caches are its KV / index source lists.
     const size_t cs = relay_slab_bytes() - xs - ps;
-    // P5.3b: WITH A RING CARRY, THE CARRIED ROW TRAVELS TOO - and it needs no extra region.  A carrying pass's LAST row is the
-    // position just past the slice it feeds, which is the row the NEXT piece carries (see Ds41Dense::begin), so the pass's own
-    // n columns already contain it:
-    //
-    //   [ x_state: the pass's n slabs ][ pre_state: the same ][ cand: the same, only if it crosses ]
-    //
-    // exactly the release's payload.  Publishing it is what lets a cross-card run carry the ring row that a same-card run gets
-    // for free by sharing the producer's state buffer.
-    const size_t bytes = (xs + ps + cs) * (size_t) n;   // the run's slot is sized per unit; this is what the layout defines
-    (void) bytes;   // the slot's capacity is the run's business; the regions below are what the layout means
-    // WHERE THE PASS'S ROWS ARE: the map, asked with the pass's first position and its width - the same call the graphs were
-    // built with, so this reads exactly the columns the pass wrote.  No carry flag is consulted: the producer's n rows are its
-    // own columns whichever way the run tiled them.  Unsplit, col0 is 0 and this is byte 0.
-    const int64_t base = im.staged ? im.stage_col0(im.pos0, n) : 0;
+    const size_t bytes = ((xs + ps + cs) * (size_t) n);
+    if (dst_bytes < bytes) {
+        im.err = "relay_read_out: the staging slot holds " + std::to_string(dst_bytes) + " bytes, the pass needs " +
+                 std::to_string(bytes);
+        return false;
+    }
+    // P5.3b: the columns the pass just ran in (see relay_write_in's window).  Unsplit, col0 is 0 and this is byte 0.
+    const int64_t c0 = im.staged ? im.col0 : 0;
     uint8_t * d = (uint8_t *) dst;
     ggml_backend_synchronize(im.backend);   // finish() is issued async; the payload must be complete
-    ggml_backend_tensor_get(im.x_state, d, (size_t) base * xs, xs * (size_t) n);
-    ggml_backend_tensor_get(im.pre_state, d + xs * (size_t) n, (size_t) base * ps, ps * (size_t) n);
+    ggml_backend_tensor_get(im.x_state, d, (size_t) c0 * xs, xs * (size_t) n);
+    ggml_backend_tensor_get(im.pre_state, d + xs * (size_t) n, (size_t) c0 * ps, ps * (size_t) n);
     if (cs)   // this stage's own candidate column
-        ggml_backend_tensor_get(im.cand, d + (xs + ps) * (size_t) n, (size_t) base * cs, cs * (size_t) n);
+        ggml_backend_tensor_get(im.cand, d + (xs + ps) * (size_t) n, (size_t) c0 * cs, cs * (size_t) n);
     return true;
 }
 
 // defined below with the span helpers; declared here so relay_write_in can set the pass's ranking span.
 static void span_pass_caps(const Ds41Dense::Impl & im, int pos0, int n, int64_t out[3]);
 
-bool Ds41Dense::relay_write_in(int n, const void * src, size_t src_bytes, int64_t src_pos0, bool overlap) {
+bool Ds41Dense::relay_write_in(int n, const void * src, size_t src_bytes, int64_t src_pos0) {
     Impl & im = *p_;
     if (n < 1 || n > (int) im.NC) { im.err = "relay_write_in: pass size out of range"; return false; }
     if (!src) { im.err = "relay_write_in: no payload"; return false; }
@@ -1996,44 +1837,32 @@ bool Ds41Dense::relay_write_in(int n, const void * src, size_t src_bytes, int64_
     // token).  Skipping it would make a stage's copy depend on a choice its PRODUCER cannot see, and the two sides'
     // idea of the payload's end is the one thing that must never disagree.
     const size_t cs = relay_slab_bytes() - xs - ps;
-    // P5.3b: THE LAYOUT, shared with relay_read_out (see the note there): the pass's n rows, in pass order, no carry region.
-    // `src_pos0` is the position of the pass's FIRST row - the row below the slice the producer fed, when the run carries - and
-    // this stage's own map turns it into the column the producer ran that row at, because both sides call one function with
-    // one number.
-    const size_t bytes = (xs + ps + cs) * (size_t) n;
+    const size_t bytes = ((xs + ps + cs) * (size_t) n);
     if (src_bytes < bytes) {
         im.err = "relay_write_in: the staging slot holds " + std::to_string(src_bytes) + " bytes, the pass needs " +
                  std::to_string(bytes);
         return false;
     }
-    // THE COLUMNS THIS PASS RUNS IN.  The payload's `n` rows are the producer's PASS rows, and they land at the column the
-    // producer ran them at: the same stage_col0 with the same first position and width (see Impl::stage_col0 for why that is the
-    // only definition under which a payload can land on the columns its consumer asks for).  A pass that would run off this
-    // stage's columns REFUSES rather than landing partly - silently dropping the tail is what made the last two theories hard
-    // to see.
-    const int64_t base = im.stage_col0(src_pos0, n);   // the column the payload's FIRST row owns
-    if (base < 0 || base + n > im.NC || !(overlap ? im.carry_fits(src_pos0 + 1, n) : im.pass_fits(src_pos0, n))) {
-        im.err = "relay_write_in: " + std::to_string(n) + " pass rows from position " + std::to_string(src_pos0) +
-                 " (column " + std::to_string(base) + ") do not fit this stage's " + std::to_string(im.NC) +
-                 " columns / window " + std::to_string(im.S);
+    // P5.3b: the payload lands in the columns this stage runs the pass in.  Stage 0 writes from column 0 (begin());
+    // a relayed stage's window is its own pass cap, and the run's pass loop subdivides a longer pass so every stage
+    // stays inside its window (see staged_pass), which keeps the token->column map one-to-one at the boundary.
+    const int64_t c0 = im.stage_col0(src_pos0, n);
+    if (c0 + n > im.NC || n > im.S) {
+        im.err = "relay_write_in: " + std::to_string(n) + " tokens at column " + std::to_string(c0) +
+                 " run past this stage's " + std::to_string(im.NC) + " columns / window " + std::to_string(im.S);
         return false;
     }
     const uint8_t * s = (const uint8_t *) src;
     ggml_backend_synchronize(im.backend);   // whatever was reading this stage's state (or the producer's graphs)
-    // the payload: [x_state: n columns from base][pre_state: n][cand: n] - pass order, so row 0 is the carried row
-    ggml_backend_tensor_set(im.x_state, s, (size_t) base * xs, xs * (size_t) n);
-    ggml_backend_tensor_set(im.pre_state, s + xs * (size_t) n, (size_t) base * ps, ps * (size_t) n);
-    if (cs) ggml_backend_tensor_set(im.cand, s + (xs + ps) * (size_t) n, (size_t) base * cs, cs * (size_t) n);
-    // the pass the graphs run: n rows from position src_pos0, exactly what the producer's stage 0 ran.  With a carry that
-    // position is the row BELOW the producer's slice, so the tables below cover it as the pass's first row - which is what
-    // makes this stage's RoPE / window maps / ring write-back identical to an unsplit pass over the same positions.
+    ggml_backend_tensor_set(im.x_state, s, (size_t) c0 * xs, xs * (size_t) n);
+    ggml_backend_tensor_set(im.pre_state, s + xs * (size_t) n, (size_t) c0 * ps, ps * (size_t) n);
+    if (cs) ggml_backend_tensor_set(im.cand, s + (xs + ps) * (size_t) n, (size_t) c0 * cs, cs * (size_t) n);
+    // P5.3b: `src_pos0` is the position the run is feeding (the staging says which COLUMNS the payload covered; the
+    // position is what the graphs put into RoPE and the index maps).
     im.pos0 = (int) src_pos0;
-    im.n = (int) n;
-    im.col0 = base;
-    // Marks a carrying pass for anything that asks; the column bookkeeping above never reads it, because a carrying pass's
-    // rows are simply its own columns (see Impl::stage_col0).
-    im.carry = overlap;   // set BEFORE upload_pos_tables: it is what makes the column below the map column the pass's own
-    // P5.3b THE FIX: refresh THIS stage's position-derived tables for the pass the payload describes.  The state copy
+    im.n = n;
+    im.col0 = c0;
+    // P5.3b THE FIX: refresh THIS stage's position-derived tables for the column the payload landed in.  The state copy
     // above only moves x_state / pre_state / cand; the graphs ALSO read i_pos (RoPE), i_widx / i_wmask (the window rows
     // and their causal mask, into flash_attn_ext), i_wslot (the ring write-back) and the compressed-row maps, all of
     // which upload_inputs writes and relay used NOT to.  Left stale, a same-backend stage reads the row a PRIOR stage 0
@@ -2041,9 +1870,9 @@ bool Ds41Dense::relay_write_in(int n, const void * src, size_t src_bytes, int64_
     // decode token (the n=14 witness: prompt = one sub-unit pass that ends at the last position, so the ring REACH is
     // fine; what differed was these tables).  upload_pos_tables computes them from (pos0, col0, n) exactly as an unsplit
     // pass does, so the two agree for the same geometry.
-    if (!im.upload_pos_tables((int) n, (int) src_pos0, -1, overlap)) return false;
+    if (!im.upload_pos_tables(n, (int) src_pos0)) return false;
     // the pass's ranking span, by this stage's rule (span_pass_caps subtracts the rows below its range)
-    span_pass_caps(im, (int) src_pos0, (int) n, im.pass_cap);
+    span_pass_caps(im, (int) src_pos0, n, im.pass_cap);
     return true;
 }
 
@@ -2120,26 +1949,15 @@ static bool engram_ready(Ds41Dense::Impl & im) {
 
 // Per-token inputs of n tokens at positions pos0.. (embeddings, positions, the window / compressed / indexer index
 // maps, the Engram rows and the per-pass ring slots).  Shared by begin() and begin_batch().
-bool Ds41Dense::Impl::upload_pos_tables(int n, int pos0, int col_at, bool overlap) {
+bool Ds41Dense::Impl::upload_pos_tables(int n, int pos0) {
     Impl & im = *this;
     im.span_memo_pos0 = -1;   // this writes i_widx / i_wslot / i_sidx / i_sslot: upload_span's memo is stale
-    // The columns this pass writes: its own map column unless the caller names one (-1 = my own column, which is what every
-    // unsplit pass, every begin() and the relay use).  A pass's rows always start at the column its FIRST ROW owns.
-    // Where the tables go: a caller may name the columns (a carrying pass writes one column below the window its own first row fell
-    // in, which is where its positions' columns are - see Impl::pass_col0); -1 means the pass's own column.
-    const int wcol = col_at < 0 ? (int) stage_col0(pos0, n) : col_at;   // the column the pass's first row owns
-    // The tables are written at [wcol, wcol + n), so that range must be inside the allocation.  Whether the PASS fits its window is
-    // begin()'s and the relay's business (Impl::pass_fits / Impl::carry_fits); this writes where it is told, which is what lets a
-    // carrying pass write one column below the window its first row fell in.
-    if (wcol < 0 || wcol + n > NC) { err = "internal: a staged pass writes outside the state columns"; return false; }
-    // P5.3b: `n` rows at `pos0`, exactly the release's - a pass that borrows a ring row arrived here as a pass ONE ROW
-    // WIDER (begin() ran n + 1 rows from position pos0 - 1), so the overlap needs NO special case in the tables: i_pos,
-    // the window maps, the compressed rows and the ring slots are computed from (pos0, n) as if the row had always been
-    // there, because for this pass it has.  That is what makes the repair unable to disagree with itself.
+    // P5.3b: a staged pass writes the tables of its own column window; it must not run past the allocation.
+    if (col0 + n > NC) { err = "internal: a staged pass runs past the state columns"; return false; }
     const int64_t SWA = im.SWA, RAW = im.RAW;
     std::vector<int32_t> pos(n);
     for (int t = 0; t < n; ++t) pos[t] = pos0 + t;
-    ggml_backend_tensor_set(im.i_pos, pos.data(), (size_t) wcol * 4, (size_t) n * 4);
+    ggml_backend_tensor_set(im.i_pos, pos.data(), (size_t) im.col0 * 4, (size_t) n * 4);
     // window: per query the SWA positions [p - SWA + 1, p] as rows of [ring (RAW) | pass rows]
     std::vector<int32_t> widx((size_t) (SWA * n));
     std::vector<float> wm((size_t) (SWA * n));
@@ -2157,16 +1975,13 @@ bool Ds41Dense::Impl::upload_pos_tables(int n, int pos0, int col_at, bool overla
         }
     }
     // P5.3b: a staged piece writes its own slice of the window tables (offset = the piece's column); unsplit col0 is 0.
-    const size_t woff = (size_t) wcol;
+    const size_t woff = (size_t) im.col0;
     ggml_backend_tensor_set(im.i_widx, widx.data(), woff * 4, widx.size() * 4);
     ggml_backend_tensor_set(im.i_wmask, wm.data(), woff * (size_t) SWA * 4, wm.size() * 4);
     {
-        // THE WINDOW RING WRITE-BACK: the slots of the rows build_attn's write-back stores, the LAST min(n, RAW) of the
-        // pass (a borrowing pass is already one row wider - see above).  The graphs read this table UNSLICED (build_attn's
-        // set_rows takes b.v1(i_wslot, k, 0)), so its length IS what the write-back writes.
         const int64_t k = std::min<int64_t>(n, RAW);
         std::vector<int32_t> ws((size_t) k);
-        for (int64_t j = 0; j < k; ++j) ws[(size_t) j] = (int32_t) ((pos0 + j) % RAW);
+        for (int64_t j = 0; j < k; ++j) ws[(size_t) j] = (int32_t) ((pos0 + n - k + j) % RAW);
         ggml_backend_tensor_set(im.i_wslot, ws.data(), 0, ws.size() * 4);
     }
     // compressed rows per ratio
@@ -2189,8 +2004,7 @@ bool Ds41Dense::Impl::upload_pos_tables(int n, int pos0, int col_at, bool overla
             ggml_backend_tensor_set(im.i_lastblk, lb.data(), woff * 4, (size_t) n * 4);
         }
     }
-    {   // ratio-2 state: rows of [ring (2) | pass states] for each token's group (2g, 2g+1); open groups repeat 2g.
-        // NOT widened, for the reason above: the ratio-2 rings hold compressed-group state, not position-local rows.
+    {   // ratio-2 state: rows of [ring (2) | pass states] for each token's group (2g, 2g+1); open groups repeat 2g
         std::vector<int32_t> si((size_t) (2 * n)), ss;
         auto row = [&](int64_t q) { return (int32_t) (q >= pos0 ? 2 + (q - pos0) : q % 2); };
         for (int t = 0; t < n; ++t) {
@@ -2218,11 +2032,10 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     }
     // P5.3b: the same column offset for the embeddings and the positions (only stage 0 has embeddings at all, and a
     // staged piece of it lives at col0, so build_init's b.cols2(..., col0) must read the same slice).
-    if (im.col0 + n > im.NC) { im.err = "internal: a staged pass's embeddings run past the state columns"; return false; }
     ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), (size_t) im.col0 * (size_t) D * 4, im.host_emb.size() * 4);
     // The position-derived tables (i_pos, the window ring maps and mask, the compressed-row maps).  Shared verbatim
     // with relay_write_in so a relayed stage and an unsplit pass disagree about NONE of them.
-    if (!im.upload_pos_tables(n, (int) im.pass_pos0, -1, im.carry)) return false;
+    if (!im.upload_pos_tables(n, pos0)) return false;
     // Engram rows: hash the whole pass now and START the (dedup/sort/coalesce) reads; they are waited - and the rows
     // moved to the state tensor - by the first Engram layer's span (engram_ready), so the disk read overlaps the
     // embeddings upload, the init graph and the layers below it.  A tiny batch (decode) still runs on the caller.
@@ -2248,50 +2061,11 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     return true;
 }
 
-bool Ds41Dense::begin(const int * tids, int n, int pos0, const float * prev_x) {
-    if (p_->pass_pos0 < 0) p_->pass_pos0 = pos0;   // the run named no pass row: this pass begins at its slice
+bool Ds41Dense::begin(const int * tids, int n, int pos0) {
     Impl & im = *p_;
     if (im.lb > 0) { im.err = "begin: stage [" + std::to_string(im.lb) + "," + std::to_string(im.le) +
                                    ") has no token embeddings; only the first stage takes token ids";
                     return false; }
-    if (!im.staged) { im.err = "begin: prev_x is a staged-only ring carry"; return false; }
-    if (n < 2 || n > (int) im.S || pos0 < 0) {
-        im.err = "begin: a staged ring carry takes 2.." + std::to_string(im.S) +
-                 " pass rows at a position at or above 0 (got " + std::to_string(n) + " at position " +
-                 std::to_string(pos0) + ", window " + std::to_string(im.S) + ")";
-        return false;
-    }
-    if (im.cand_src_prev && im.cand_src_cap != im.S) {
-        im.err = "stage reads another stage's candidate column, whose writer aligns to a window of " +
-                 std::to_string(im.cand_src_cap) + " columns but this stage's window is " + std::to_string(im.S) +
-                 ": the pass would read the producer's column at the wrong offset";
-        return false;
-    }
-    // WHERE THE PASS'S ROWS GO, AND WHY THEY FIT.  The map gives this pass a column and the pass owes it col0 + n <= NC: S
-    // divides the column count and n <= S, so a pass that respects its window always fits, and asking the map with `n` is how
-    // a run learns that before committing.  The carry changes nothing about the columns: the row the pass re-computes is its
-    // FIRST row and it occupies the column the map assigns that position, like any other row.
-    //
-    // prev_x IS NOT READ, AND CANNOT BE.  Stage 0 is the stage that turns TOKENS into state, so the row it carries arrives as
-    // a token id (tids[0]) and it computes that row itself; a copied x_state column is what a LATER stage carries, through
-    // relay_write_in.  The argument stays as the flag that marks a carrying pass - the run's signal that tids reaches one
-    // token below its slice - and taking a value nobody reads is the honest shape of "this entry means a carry happened".
-    // The run names the pass's first row with set_pass_row; prev_x is the SAME signal seen from this side (a carrying pass is
-    // exactly a pass that arrives with the row below it).  The two are made to agree: a run that named a pass row but sent no
-    // carry region, or the other way round, is refused rather than writing tables one column off.
-    if (prev_x && p_->pass_pos0 < 0) p_->pass_pos0 = pos0 - 1;   // "carry" without naming the row: it is the one below the slice
-    if (!prev_x && p_->pass_pos0 >= 0 && p_->pass_pos0 < pos0) {
-        p_->err = "begin: the run named a pass row below the slice but sent no carry region";
-        return false;
-    }
-    (void) prev_x;
-    // (The pass's obligation is stated inside the staged block below, where the run's named pass row is known: a carrying pass is
-    // one row wider than the block the map gives the slice - Impl::carry.)
-    return im.begin_impl(tids, n, pos0);
-}
-
-bool Ds41Dense::Impl::begin_impl(const int * tids, int n, int pos0) {
-    Impl & im = *this;
     // P5.3b: a STAGED run cycles the state columns: the run feeds a prompt in passes of at most the window (im.S
     // columns), pass k at column (pos0 / S) % (NC / S), and the token positions the graphs see are the run's own
     // (pos0 + t) - NOT the column.  The rings are position-indexed (slot = pos % RAW for the window ring, row =
@@ -2299,16 +2073,6 @@ bool Ds41Dense::Impl::begin_impl(const int * tids, int n, int pos0) {
     // position SWA tokens back and therefore outside every later query's reach.  Unsplit, this is pos0 at column 0.
     int64_t p0 = pos0;
     if (im.staged) {
-        // WHERE THE PASS GOES, AND WHETHER IT FITS.  The run names the pass's FIRST ROW with pass_pos0; a carrying pass's first row
-        // is the position BELOW the tokens it feeds and it writes the columns one below the map's own (Impl::carry_fits).  A pass the
-        // map cannot place is refused HERE rather than writing rows nobody will read.
-        im.carry = im.pass_pos0 >= 0 && im.pass_pos0 < p0;
-        if (!(im.carry ? im.carry_fits(p0, n) : im.pass_fits(im.pass_pos0, n))) {  // carry_fits states the obligation itself
-            im.err = "begin: a pass of " + std::to_string(n) + " rows at position " + std::to_string(im.pass_pos0) +
-                     (im.carry ? " carrying the row below" : "") + " does not fit this stage's window " +
-                     std::to_string(im.S) + " / " + std::to_string(im.NC) + " state columns";
-            return false;
-        }
         if (n < 1 || n > im.S || pos0 < 0) {
             im.err = "begin: a staged pass takes 1.." + std::to_string(im.S) + " tokens (got " +
                      std::to_string(n) + " at position " + std::to_string(pos0) + ")";
@@ -2320,14 +2084,7 @@ bool Ds41Dense::Impl::begin_impl(const int * tids, int n, int pos0) {
                      ": the pass would read the producer's column at the wrong offset";
             return false;
         }
-        // WHERE THE PASS RUNS.  A position owns a column inside the window it falls in, so a pass of at most the window's
-        // width begun at a position uses the columns of that position's window; the carry adds no width and no offset (the
-        // carried row IS the pass's row 0 - see Ds41Dense::begin), which is why both sides of a boundary compute the same
-        // columns from the pass's first position and its row count alone.
-        // A carrying pass writes ONE COLUMN BELOW the window its own first row fell in - the column its positions own (it re-
-        // computes the position below the slice, and the map slides a pass to its window's first column).  The relay's two sides
-        // compute the same number from the same two arguments, which is why a payload needs no offsets.
-        im.col0 = im.stage_col0(im.pass_pos0, n);   // the column the pass's first row owns
+        im.col0 = im.stage_col0(pos0, n);
     }
     if (n < 1 || n > im.NC || p0 < 0 || p0 + n > im.cfg.ctx_max) { im.err = "bad pass"; return false; }
     im.pos0 = (int) p0;
@@ -2359,29 +2116,12 @@ bool Ds41Dense::Impl::begin_impl(const int * tids, int n, int pos0) {
 
 bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
     Impl & im = *p_;
-    p_->pass_pos0 = pos0;   // a batch is the run's rows: the pass begins at its slice, no carry
-    p_->carry = false;
     if (im.lb > 0) { im.err = "begin_batch: stage [" + std::to_string(im.lb) + "," + std::to_string(im.le) +
                                        ") has no token embeddings; only the first stage takes token ids";
                      return false; }
     if (B < 1 || B > im.cfg.prompt_batch || B > im.NC || pos0 < 0 || pos0 + B > im.cfg.ctx_max) { im.err = "bad batch"; return false; }
-    // P5.3b: on a STAGED run a batch is a pass, and a pass lives at the map's column for its own first row - not at
-    // column 0.  Stages after the first never call this (they have no embeddings), so "the run's rows, no carry" is right
-    // for the only stage that can: its slice IS its pass's first row.
-    if (im.staged) {
-        if (!im.pass_fits(pos0, B)) {
-            im.err = "begin_batch: a staged batch of " + std::to_string(B) + " rows at position " +
-                     std::to_string(pos0) + " does not fit this stage's window " + std::to_string(im.S) +
-                     " / " + std::to_string(im.NC) + " state columns";
-            return false;
-        }
-        im.col0 = im.stage_col0(pos0, B);
-    } else {
-        im.col0 = 0;
-    }
     if (!im.upload_inputs(tids, B, pos0)) return false;
-    im.pos0 = pos0; im.batch_pos0 = pos0; im.batch = B; im.n = B;
-    im.carry = false;   // a batch is the run's rows, column 0, no ring carry row
+    im.pos0 = pos0; im.batch_pos0 = pos0; im.batch = B; im.n = B; im.col0 = 0;
     // per-sub-batch pass_cap (the compressed rows each sub-batch ranks over) - depends only on (pos0, len)
     const int64_t nb = (B + im.S - 1) / im.S;
     im.span_cap.assign((size_t) nb, { 0, 0, 0 });
@@ -2552,7 +2292,7 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     ggml_context * gc = nullptr;
     const bool cached = n == 1;
     if (cached) {
-        const Impl::GKey key { il, 1, cap, 1, im.staged ? im.col0 : 0 };
+        const Impl::GKey key { il, 1, cap, 1 };
         auto it = im.graphs.find(key);
         if (it == im.graphs.end()) it = im.graphs.emplace(key, build_attn(im, im.gctx, il, 1)).first;
         gf = it->second;
@@ -2706,10 +2446,8 @@ bool Ds41Dense::logits(int row0, int nrows, float * out) {
     Impl & im = *p_;
     if (!im.is_last) { im.err = "logits: this stage is not the last one (no output head)"; return false; }
     if (row0 < 0 || nrows < 1 || row0 + nrows > im.n) { im.err = "bad logits rows"; return false; }
-    // P5.3b: the caller counts rows from the start of the last pass; a staged pass's rows live at im.col0, and the column a
-    // carry adds sits at the TOP of the range (the pass re-computes the position BELOW its slice, so the map moved the whole
-    // pass down - see Impl::stage_col0), which is why the caller's row offsets need no adjustment.
-    const int64_t hrow0 = (im.staged ? im.col0 : 0) + row0;
+    // P5.3b: the caller counts rows from the start of the last pass; a staged pass's rows live at im.col0.
+    const int64_t hrow0 = im.staged ? im.col0 + row0 : row0;
     std::vector<uint8_t> meta(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
     ggml_init_params p = { meta.size(), meta.data(), true };
     ggml_context * gc = ggml_init(p);
@@ -2727,35 +2465,6 @@ bool Ds41Dense::read_state(std::vector<float> & x, std::vector<float> & pre) {
     pre.resize((size_t) (im.HC * im.n));
     ggml_backend_tensor_get(im.x_state, x.data(), 0, x.size() * 4);
     ggml_backend_tensor_get(im.pre_state, pre.data(), 0, pre.size() * 4);
-    return true;
-}
-
-bool Ds41Dense::read_pre_state_cols(int c0, int n, std::vector<float> & pre) {
-    Impl & im = *p_;
-    if (c0 < 0 || n < 1 || c0 + n > im.NC) { im.err = "read_pre_state_cols: bad range"; return false; }
-    pre.resize((size_t) (im.HC * n));
-    ggml_backend_tensor_get(im.pre_state, pre.data(), (size_t) c0 * (size_t) (im.HC * 4), (size_t) n * (im.HC * 4));
-    return true;
-}
-
-int64_t Ds41Dense::pass_column(int64_t pos, int rows, bool carry) const {
-    // The run asks the map the same question the graphs were built with.  A carrying pass's FIRST ROW is the position
-    // below the slice, so the map is asked about that row - and the carry flag exists to make a caller state its intent,
-    // not to change the arithmetic (see Impl::stage_col0).
-    (void) carry;
-    return p_->stage_col0(pos, rows);
-}
-
-bool Ds41Dense::has_candidate_column() const { return p_->cand_region_owned(); }
-
-bool Ds41Dense::read_cand_col(int c0, std::vector<int32_t> & cand) {
-    Impl & im = *p_;
-    if (c0 < 0 || c0 >= (int) im.NC) { im.err = "read_cand_col: bad column"; return false; }
-    if (!im.cand_region_owned()) { im.err = "read_cand_col: this stage reads another stage's candidates in place"; return false; }
-    const size_t ncb = (size_t) im.CB;
-    cand.resize(ncb);
-    ggml_backend_synchronize(im.backend);
-    ggml_backend_tensor_get(im.cand, cand.data(), (size_t) c0 * ncb * sizeof(int32_t), ncb * sizeof(int32_t));
     return true;
 }
 
