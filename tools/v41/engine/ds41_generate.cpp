@@ -380,60 +380,6 @@ struct StagedRun {
 //   experts(l, ids, wts, fn, n, routed)
 //               fill routed with layer l's routed experts' weighted sum.  The tier is the CALLER's and stays on its own
 //               card: at this engine's seam it is host-in / host-out, so which card the layers ran on does not matter.
-static bool staged_stage_layers(StagedRun & sr, int s, int n, int * ids, float * wts, float * routed,
-                                const std::function<bool(int l, const int * ids, const float * wts, const float * fn,
-                                                          int n, float * out)> & experts,
-                                std::string & err) {
-    Ds41Dense & d = *sr.stage[(size_t) s];
-    // The stage's own range, layer by layer (see StagedRun::run_le for why the loop reads run_le).
-    for (int64_t l = sr.lb[(size_t) s]; l < sr.run_le[(size_t) s]; ++l) {
-        const float * fn = nullptr;
-        if (!d.attn_router((int) l, ids, wts, &fn)) { err = d.last_error(); return false; }
-        if (!experts((int) l, ids, wts, fn, n, routed)) { err = "tier refused at layer " + std::to_string(l); return false; }
-        if (!d.finish((int) l, routed)) { err = d.last_error(); return false; }
-    }
-    return true;
-}
-
-/// The ggml GPU devices this build sees, counted in the SAME order --gpus indexes: the owner's dense backend is
-/// init_by_type(GPU), which takes the first GPU of this enumeration, so index 0 here is index 0 there.
-static size_t gpu_backend_count() {
-    size_t n = 0;
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i)
-        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) ++n;
-    return n;
-}
-
-/// A backend on the idx-th GPU device - a SECOND card, since the owner already holds the first.  The run owns the
-/// returned backend and must keep it alive past every stage that runs on it (StagedRun::extra_be).
-static ggml_backend_t gpu_backend_at(int idx) {
-    int seen = 0;
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t d = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
-        if (seen++ == idx) return ggml_backend_dev_init(d, nullptr);
-    }
-    return nullptr;
-}
-
-/// How the user would name a same-device split of n_stage stages on the first card ("0,0", "0,0,0", ...), for the
-/// refusal message of a split across cards: the example has to match the stage count the user actually asked for.
-static std::string same_device_example(int n_stage) {
-    std::string r;
-    for (int i = 0; i < n_stage; ++i) r += (i ? ",0" : "0");
-    return r;
-}
-
-// One staged pass of n tokens at positions [pos0, pos0+n): every stage runs its own layers over the same tokens, and at
-// each boundary the producer's finished columns go through one staging slot to the stage after it.  The staging is the
-// caller's (StagedRun::st), so a sequence of passes shares the double-buffered slots and the driver's rotation.
-//
-//   run_stage(s, n)   the CALLER's layer loop for stage s over this pass's tokens.  The MoE tier is the caller's, so the
-//                     routed half stays with the engine (splitting it is P5.4).
-//   finish_head(n)    the last stage's head over this pass's rows (its own state, as unsplit).
-//
-// The pass's whole payload (n * slab bytes) must fit the staging: relay_stage_pass says so before any stage runs, and
-// the caller splits a longer prompt into passes (see --relay-chunk).
 // STRATA_DUMP_STATE=PREFIX (opt-in, default off): dump one instance's state COLUMNS through the relay seam -
 // x_state / pre_state (+ cand when the geometry carries it) for the first ncols columns at the column the instance
 // ran its last pass in (relay_read_out: staged col0 = the pass window, unsplit byte 0; the witness's positions 0..22
@@ -447,15 +393,17 @@ static std::string same_device_example(int n_stage) {
 static void dump_state_cols(Ds41Dense & d, const char * prefix, const char * tag, const char * who) {
     const size_t slab = d.relay_slab_bytes();
     if (!slab) return;
-    int ncols = 144;
-    std::vector<uint8_t> buf;
-    bool ok = false;
-    while (ncols >= 1 && !ok) {
-        buf.assign(slab * (size_t) ncols, 0);
-        ok = d.relay_read_out(ncols, buf.data(), buf.size());
-        if (!ok) ncols /= 2;
-    }
-    if (!ok) return;
+    // EXACTLY the instance's column count (Ds41Dense::columns()).  The first version of this dumped a GUESSED
+    // width and HALVED on refusal; do not "fix" it back: relay_read_out's capacity check is about the caller's
+    // buffer, not about NC, so an oversized read can SUCCEED anyway, and mixing one file that holds 2048 columns
+    // with another that holds 36 silently compares different column sets and reports phantom divergence.
+    // (What that guessing produced: a 36-column "pre" dump against a 144-column "postrelay" dump, both said to
+    // hold column 0 - they did not.)
+    const int ncols = std::min(d.columns(), 144);   // the ring's reach at the witness geometry (RAW = SWA + 16);
+    // the run's NC is the full 2048-column store and the dump stays small by taking only the window region.
+    if (ncols < 1) return;
+    std::vector<uint8_t> buf((size_t) slab * (size_t) ncols);
+    if (!d.relay_read_out(ncols, buf.data(), buf.size())) return;
     char nb[512];
     std::snprintf(nb, sizeof nb, "%s.st.%s.%s.bin", prefix, tag, who);
     std::ofstream fs(nb, std::ios::binary);
@@ -555,6 +503,72 @@ const auto stage_in = [&](int s, const uint8_t * slot, size_t slot_bytes, std::s
 
 }  // namespace
 
+static bool staged_stage_layers(StagedRun & sr, int s, int n, int * ids, float * wts, float * routed,
+                                const std::function<bool(int l, const int * ids, const float * wts, const float * fn,
+                                                          int n, float * out)> & experts,
+                                std::string & err) {
+    Ds41Dense & d = *sr.stage[(size_t) s];
+    // The stage's own range, layer by layer (see StagedRun::run_le for why the loop reads run_le).
+    for (int64_t l = sr.lb[(size_t) s]; l < sr.run_le[(size_t) s]; ++l) {
+        const float * fn = nullptr;
+        if (!d.attn_router((int) l, ids, wts, &fn)) { err = d.last_error(); return false; }
+        if (!experts((int) l, ids, wts, fn, n, routed)) { err = "tier refused at layer " + std::to_string(l); return false; }
+        if (!d.finish((int) l, routed)) { err = d.last_error(); return false; }
+        // STRATA_DUMP_STATE: the state columns at the layer-19 boundary of a STAGED pass (stage 0's last layer).
+        // Byte-identical to the boundary payload by construction; dumped so the probe can line it up against the
+        // unsplit control's own layer-19 mid-pass dump below - the only way to see whether stage 0's DECODE-pass
+        // output equals what an unsplit pass's first 20 layers produce (unsplit never otherwise exposes that depth:
+        // layers 20-39 overwrite the columns inside the same pass).
+        static const char * bs_mid = std::getenv("STRATA_DUMP_STATE");
+        if (bs_mid && l == 19) {
+            char who[32], tag[48];
+            std::snprintf(tag, sizeof tag, "midL19.p%d", (int) sr.pos_of);
+            std::snprintf(who, sizeof who, "s%d", s);
+            dump_state_cols(d, bs_mid, tag, who);
+        }
+    }
+    return true;
+}
+
+/// The ggml GPU devices this build sees, counted in the SAME order --gpus indexes: the owner's dense backend is
+/// init_by_type(GPU), which takes the first GPU of this enumeration, so index 0 here is index 0 there.
+static size_t gpu_backend_count() {
+    size_t n = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i)
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) ++n;
+    return n;
+}
+
+/// A backend on the idx-th GPU device - a SECOND card, since the owner already holds the first.  The run owns the
+/// returned backend and must keep it alive past every stage that runs on it (StagedRun::extra_be).
+static ggml_backend_t gpu_backend_at(int idx) {
+    int seen = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        if (seen++ == idx) return ggml_backend_dev_init(d, nullptr);
+    }
+    return nullptr;
+}
+
+/// How the user would name a same-device split of n_stage stages on the first card ("0,0", "0,0,0", ...), for the
+/// refusal message of a split across cards: the example has to match the stage count the user actually asked for.
+static std::string same_device_example(int n_stage) {
+    std::string r;
+    for (int i = 0; i < n_stage; ++i) r += (i ? ",0" : "0");
+    return r;
+}
+
+// One staged pass of n tokens at positions [pos0, pos0+n): every stage runs its own layers over the same tokens, and at
+// each boundary the producer's finished columns go through one staging slot to the stage after it.  The staging is the
+// caller's (StagedRun::st), so a sequence of passes shares the double-buffered slots and the driver's rotation.
+//
+//   run_stage(s, n)   the CALLER's layer loop for stage s over this pass's tokens.  The MoE tier is the caller's, so the
+//                     routed half stays with the engine (splitting it is P5.4).
+//   finish_head(n)    the last stage's head over this pass's rows (its own state, as unsplit).
+//
+// The pass's whole payload (n * slab bytes) must fit the staging: relay_stage_pass says so before any stage runs, and
+// the caller splits a longer prompt into passes (see --relay-chunk).
 int main(int argc, char ** argv) {
     if (!std::getenv("DS41_GGML_DEBUG"))
         ggml_log_set([](ggml_log_level lv, const char * text, void *) { if (lv != GGML_LOG_LEVEL_DEBUG) std::fputs(text, stderr); }, nullptr);
@@ -1414,6 +1428,15 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                 have_pred = true;
             } else if (!dense.finish(l, rsum)) { ferr = dense.last_error(); return false; }
             if (dprof) { const double t = now_ms(); dp[4] += t - ta; ta = t; }
+            // STRATA_DUMP_STATE: the UNSPLIT control's mid-pass dump after layer 19 - the reference for stage 0's
+            // DECODE-pass output (see staged_stage_layers).  Tagged by position so the first decode pass (the
+            // witness's failing row) survives the later iterations.
+            static const char * bs_dec = std::getenv("STRATA_DUMP_STATE");
+            if (bs_dec && l == 19) {
+                char tag[48];
+                std::snprintf(tag, sizeof tag, "midL19.p%d", pos);
+                dump_state_cols(dense, bs_dec, tag, "full");
+            }
             for (int j = 0; dump_main && j < 3; ++j) {
                 if (l != dm_layers[j]) continue;
                 dense.read_state(dm_x, dm_pre);   // [n_embd, HC] for the one token

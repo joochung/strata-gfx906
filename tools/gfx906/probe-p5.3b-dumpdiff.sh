@@ -215,6 +215,25 @@ def report(tag, a, b, la, lb):
           + (f", first at byte {first} = column {col}" if first >= 0 else ""))
     return neq
 print("== STATE COLUMNS (x_state then pre_state, columns 0..ncols-1 of the last pass's window) ==")
+# The layer-19 boundary comparison: the unsplit control's mid-pass state after its first 20 layers (a depth it
+# never otherwise exposes) vs stage 0's output at the same depth of the same DECODE pass.  EQUAL -> stage 0 is
+# innocent and the consumer's execution of layers 20-39 is what differs; DIFFER -> stage 0's decode pass is.
+import os as _os
+for p in sorted(_os.listdir(f"{out}.ctrl")) if _os.path.isdir(f"{out}.ctrl") else []:
+    if not p.startswith("state.st.midL19.p"):
+        continue
+    tagw = p[len("state.st.midL19."):][:4]   # e.g. "p14."
+    a = np.fromfile(f"{out}.ctrl/" + p, dtype=np.uint8)
+    q = f"{out}.staged/state.st.midL19.{tagw[:-1]}.s0.bin"
+    if not _os.path.exists(q):
+        continue
+    b = np.fromfile(q, dtype=np.uint8)
+    n = min(len(a), len(b))
+    ncols = n // 81936
+    ax, bx = a[:ncols * 81920].view(np.float32), b[:ncols * 81920].view(np.float32)
+    d = np.abs(ax.astype(np.float64) - bx.astype(np.float64))
+    print(f"  midL19 {tagw[:-1]}: ctrl-after-layer-19 vs stage0-output: {int((d > 0).sum())} floats differ, "
+          f"max {d.max():.3e}  -> " + ("STAGE 0 INNOCENT (bitwise)" if (d == 0).all() else "STAGE 0 DIFFERS"))
 # the post-relay dumps first: the consumer's columns BETWEEN relay_write_in and its own pass.  If these carry the
 # payload's real pre-mix floats, the relay lands and the consumer's EXECUTION is what leaves zeros; if these are
 # already zero, relay_write_in's pre_state copy is the broken edge.
