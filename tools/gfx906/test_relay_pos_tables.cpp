@@ -188,7 +188,10 @@ int main(int argc, char ** argv) {
     fails = 0; cases = 0;
     bool real_fixed = true;
     if (real) {
-        real_fixed = file_contains(real, "im.upload_pos_tables(n, (int) src_pos0)") &&
+        // THE PREDICATE, matched against the ACTUAL tree: does relay_write_in refresh this stage's position tables?
+        // The call's signature grew an `overlap` argument since the fix first landed, so match the seam and the writer
+        // by their stable prefixes rather than by a literal call site.
+        real_fixed = file_contains(real, "im.upload_pos_tables((int) n, (int) src_pos0") &&
                      file_contains(real, "Ds41Dense::Impl::upload_pos_tables");
         std::printf("\n[real tree] %s : relay_write_in refreshes the tables? %s\n", real,
                     real_fixed ? "YES" : "NO (pre-fix: relay does not call upload_pos_tables)");

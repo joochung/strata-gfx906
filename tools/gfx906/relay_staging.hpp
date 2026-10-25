@@ -266,9 +266,22 @@ struct RelayStaging {
 
     /// `want_device_visible`: ask the runtime for mapped + portable host memory (the native relay's choice); on "no"
     /// or on a refusal this is ordinary host memory.  A one-stage plan allocates nothing and succeeds.
-    bool init(int n_stage, uint64_t capacity, uint64_t slab_bytes, std::string & err, bool want_device_visible = true) {
+    /// `extra_bytes` sizes each slot ON TOP of capacity x slab_bytes.  P5.3b's ring overlap uses it: a staged pass
+    /// publishes the state column of the position just BELOW its own (the row that completes the consumer's window
+    /// ring), which is one column rather than one of the pass's n tokens, so the release's per-token layout cannot
+    /// describe it.  It stays `slab_bytes`-per-token arithmetic for every caller that passes 0.
+    bool init(int n_stage, uint64_t capacity, uint64_t slab_bytes, std::string & err, bool want_device_visible = true,
+              uint64_t extra_bytes = 0) {
         if (!relay_plan(n_stage, capacity, slab_bytes, plan, err)) return false;
         if (plan.bytes == 0) return true;   // one stage: no boundary, no buffer (today's run)
+        // P5.3b: a payload that is not a whole multiple of the per-token slab (see the parameter).  Every slot is
+        // widened by the same amount, so slot k's bytes still start where the plan says they do - only the stride
+        // grows, and the per-token arithmetic of window() is untouched inside the slab part of a slot.
+        if (extra_bytes) {
+            plan.slot_bytes += extra_bytes;
+            plan.stride = plan.slot_bytes;
+            plan.bytes = (uint64_t) plan.n_boundaries * (uint64_t) kRelaySlots * plan.stride;
+        }
         mem = relay_alloc(plan.bytes, want_device_visible, backing, note);
         if (!mem) {
             err = "relay: cannot allocate the staging of " + std::to_string((long long) plan.bytes) + " bytes (" + note + ")";

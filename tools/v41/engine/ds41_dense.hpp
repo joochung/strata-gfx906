@@ -170,7 +170,12 @@ public:
     bool relay_read_out(int n, void * dst, size_t dst_bytes);
     /// src_pos0: the ABSOLUTE position the run is feeding (the graphs read it for RoPE and the index maps; the columns
     /// the payload covered are derived from it and this stage's window).  0 = the first unit of a prompt.
-    bool relay_write_in(int n, const void * src, size_t src_bytes, int64_t src_pos0 = 0);
+    /// overlap: this pass CARRIES the row of the position one BELOW src_pos0 (P5.3b's ring overlap; see begin()), so the
+    /// pass the consumer runs is n + 1 rows starting at src_pos0 - 1 and the payload describes THOSE rows: n + 1 columns of
+    /// x_state / pre_state / cand, plus the carried row again LAST so a stage that reads the producer's tensors in place
+    /// and a stage on another card see the same bytes.  The run's own slice therefore lands one column into the pass.
+    /// False = the release's shape, payload rows == the run's rows.
+    bool relay_write_in(int n, const void * src, size_t src_bytes, int64_t src_pos0 = 0, bool overlap = false);
     /// P5.3b: does this instance's relay payload include the candidate column?  True unless it was told the
     /// candidates come from another stage's tensor in place (relay_cand_from).  The ENGINE owns this decision, because
     /// only it knows which stages share a card: it must match relay_slab_bytes() on both sides of a boundary, which
@@ -201,7 +206,46 @@ public:
 
     /// Start a pass: tokens tids[0..n) at positions pos0.., n <= max_pass.  Embeddings + Engram rows (the hash
     /// needs the 3 tokens before pos0: the history is kept by position, so a re-decoded position overwrites it).
-    bool begin(const int * tids, int n, int pos0);
+    ///
+    /// Start a pass for a STAGED run: `n` pass rows whose FIRST row is the absolute position `pos0`.  With the ring carry
+    /// (see the note below) that first row is the position BELOW the slice the run feeds, so `tids` reaches one token below the
+    /// run's slice and `n` counts the pass's rows, not the prompt's.
+    ///
+    /// P5.3b THE RING CARRY, AND WHY A STAGED FEED MUST OVERLAP.  A pass writes the window ring with only the LAST min(n, RAW)
+    /// of its own rows, and a query reaches back SWA, so a pass that begins where the previous one ended leaves SWA - n of the
+    /// rows its queries attend holding something this run never wrote (zero on a fresh buffer - the worst value a graph can
+    /// read).  An unsplit run never hits this: its chunk path refuses a chunk below SWA.  A staged run's pass is capped at one
+    /// relay unit, so a staged feed OVERLAPS its pieces - and the overlap is ONE ROW, at the boundary, because a row is a pure
+    /// function of its position and the recurrent states (the conv window, the attention state) are advanced IN PLACE: running a
+    /// position twice is as wrong as not running it, which is why a piece carries its predecessor's LAST row and never a row the
+    /// predecessor ran inside its own pass.
+    ///
+    /// THE UNIT THE OVERLAP IS WORTH, stated here because both sides of a boundary act on it: a pass can cover at most `n` rows
+    /// of a query's reach, so unless n >= SWA no tiling of passes can cover it, and ds41_generate REFUSES the run at boot rather
+    /// than serve a half-repaired ring.  The shipped --relay-chunk 64 against SWA 128 is exactly that refused geometry.
+    ///
+    /// WHY THE RUN STILL DIVERGES AT unit == SWA, AND WHAT THAT REFUSES (measured by tools/gfx906/gate-relay-ring-cover.sh): with
+    /// a ring exactly as deep as the window (RAW == SWA), a pass that begins at a window boundary writes back the slot of the
+    /// position BELOW its slice - which is the row it carries and the row its queries read from the ring - so the carried row is
+    /// consumed by its own write-back and the ring holds the next window's position instead.  No overlap fixes that: it is a
+    /// property of the ring's depth, not of the tiling, and an UNSPLIT run at the same geometry behaves identically (the gate
+    /// reports the unsplit reference next to the staged number for exactly this reason).  A run at unit >= SWA therefore matches
+    /// an unsplit run row for row, which is what P5.3b requires of it; a run at unit < SWA is refused.
+    ///
+    /// WHERE THE CARRIED ROW LIVES - AND WHY IT IS NOT WHERE THE MAP PUTS IT.  The map (Impl::stage_col0) gives a PASS a column
+    /// from its FIRST row, so a carrying pass begun at position p - 1 would write the row it borrows at a column one BELOW the
+    /// column the position itself owns - and a reader that computes the column from the position (every span graph does) would
+    /// ask somewhere else entirely.  A row is addressed by its POSITION, so a carrying pass writes ONE COLUMN LOWER than its map
+    /// column: its rows land on the columns their own positions own, the carried row on the column the producer wrote, and a pass
+    /// spanning a window edge is covered too.  The column is therefore not derivable from (pos, rows) alone; the run that carries
+    /// says so, and `carry` is that statement (implies pos >= 1, which is what makes col0 - 1 exist).  A payload still carries no
+    /// offsets: both sides call one function with the pass's first position and width and the same flag.
+    ///
+    /// `prev_x` is the flag that this pass carries.  Stage 0 cannot READ a carried row - it is the stage that turns TOKENS into
+    /// state, so it computes the row from `tids[0]` - and a later stage receives it as the payload's first column through
+    /// relay_write_in.  Null is the release's pass: every pass of an unsplit run, which then matches the release byte for byte.
+    /// See the note at Ds41Dense::begin.
+    bool begin(const int * tids, int n, int pos0, const float * prev_x = nullptr);
     /// Layer-major prompt batch (cfg.prompt_batch > 0): the whole batch's inputs are prepared once - embeddings,
     /// positions, window / compressed / indexer index maps, Engram rows and the initial x/pre state - into the state
     /// tensors' columns 0..B-1; then attn_router_span / finish_span walk layer il's sub-batches in order.  B <=
@@ -290,6 +334,20 @@ public:
     /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns
     /// after finish_span (the serve DSpark seed reads its main_hidden there instead of re-running the tail as passes).
     bool read_state_cols(int c0, int n, std::vector<float> & x);
+    /// The candidate column of one state column, for the ring carry: a carrying pass re-runs the position BELOW its
+    /// slice, and on a STAGE THAT RECEIVES ITS STATE BY PAYLOAD that row has to arrive the same way - the payload is
+    /// [x_state][pre_state][cand] per row, so the carried row travels with its candidate or the layout stops meaning one
+    /// thing.  The candidate is I32[CB] per column; it is returned in int32 so no bit pattern is bent.
+    bool read_cand_col(int c0, std::vector<int32_t> & cand);
+    /// Can this stage hand out a candidate column at all?  False when it does not own the candidate source (it was told the
+    /// candidates come from another stage's tensor in place), in which case its payload has no candidate region either.
+    bool has_candidate_column() const;
+    /// The column a pass's rows begin at, for a pass of `rows` rows whose FIRST ROW is at position `pos` (`carry` marks
+    /// a pass that re-runs the row below the slice it feeds).  The run needs it to read a row back.
+    int64_t pass_column(int64_t pos, int rows, bool carry) const;
+    /// P5.3b: the same for pre_state's rows - the run reads a pass's LAST row (x_state and pre_state together) to hand
+    /// to the next pass as begin()'s `prev_x`, and the two halves must be the two halves of the same column.
+    bool read_pre_state_cols(int c0, int n, std::vector<float> & pre);
     /// Give this stage a pass cap of its own, after init.  P5.3b's STAGING limits a pass (one pass's payload goes
     /// through one slot), not the state tensors: the state columns stay the run's size S, so a stage that reads another
     /// stage's tensor in place spans the same columns, and a staged run does not allocate the prefill chunk's scratch.
@@ -300,6 +358,44 @@ public:
     /// is the current count.  A no-op when unchanged.
     bool set_columns(int nc);
     int columns() const;
+    /// P5.3b: the window ring's depth in rows (SWA) and its slot count (RAW = SWA + the draft slack).  A staged run needs
+    /// these to size its carry: a piece shorter than SWA cannot cover its own queries' reach, so consecutive pieces advance
+    /// by its pass cap and each one after the first carries the row below its slice (see Ds41Dense::begin).
+    int64_t window_swa() const;
+    int64_t window_raw() const;
+    /// P5.3b: THE COLUMN A STAGED PASS RUNS IN: (pos / S) % (NC / S) * S for a pass of `rows` rows beginning at position
+    /// `pos`.  A function of the position, the window and the width ALONE - which is the property the relay lives on: the
+    /// stage that wrote a payload, the stage that reads it and the head that reads the run's rows must land on the SAME
+    /// columns without talking to each other, and the numbers all three know are the pass's first position and its width.
+    /// `rows` moves nothing; it is the pass's OBLIGATION (col0 + rows <= NC), checked here rather than assumed, and it is what
+    /// lets a caller ask "would a pass beginning here fit?" before committing to it - which is exactly what a run does when it
+    /// decides whether a piece can carry the row below its slice.  See Impl::stage_col0 for the map and Ds41Dense::begin for
+    /// the carry; the run reads back a pass's last row through this, so it cannot disagree with its stages.
+    /// `carry`: the pass re-computes the position BELOW `pos`, so its rows are written one column lower than the map column
+    /// (see the note above begin).  The obligation the caller must then satisfy is col0 + rows + 1 <= columns().
+    int64_t stage_column(int64_t pos, int rows, bool carry = false) const;
+    /// The column a POSITION's row sits in: the window's head plus the position's offset inside the window.  This is where
+    /// upload_pos_tables writes a position and where every reader looks for it, so it is the number a run compares against
+    /// the column a previous pass ENDED at.  (stage_column names a PASS's base column, which is a different question.)
+    int64_t stage_position(int64_t pos) const;
+
+    /// Can a pass of `rows` rows whose FIRST row is absolute position `pos` be placed at all?  True iff the rows land on the
+    /// columns their own positions own inside one window's block AND fit this stage's state columns (Impl::pass_fits).  This is
+    /// the ONLY question the column map answers about a carry, and both sides of a boundary ask the same function.
+    bool pass_fits(int pos, int rows) const;
+
+    /// Can a pass that RE-COMPUTES the position below `slice` and feeds the run from `slice` be placed?  True iff a window exists
+    /// above the one the run's rows fall in AND the rows fit the state columns with the one row of slack the re-computed row needs
+    /// (Impl::carry_fits).  `slice` is the RUN's first row; the pass's first row is slice - 1.
+    bool carry_fits(int slice, int rows) const;
+
+    /// The number of rows a pass beginning at the run's first row `slice` may run (Impl::pass_room).  The run takes this as its
+    /// piece width; a carrying pass may then run ONE row more, the row below, provided carry_fits says that pass can be placed.
+    int pass_room(int slice) const;
+
+    /// Name the FIRST ROW of the pass about to run, when it is NOT the slice the tokens start at (a carrying pass begins one row
+    /// below, see Impl::pass_carry).  -1 clears it, which is the default and what every unsplit pass and the release use.
+    void set_pass_row(int pos0);
     /// Gate tap: an index source layer's top-k rows of the current pass (n * K ints, token-major; K = min(cap, top-k))
     /// and their visibility mask; empty for other layers.
     bool read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K);
