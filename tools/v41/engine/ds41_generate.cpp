@@ -1055,7 +1055,13 @@ int main(int argc, char ** argv) {
                 rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
                                : (bias_now && a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
                                : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
-            dense.set_route_bias((int) l, rb.data());
+            // P5.3b: on a staged run the layer belongs to a STAGE, and `dense` runs no layers - setting the bias only
+            // there loses it.  The witness showed exactly this: the staged block below only ever rebuilt the PRUNE part,
+            // so a staged decode routed with rbias = 0 while the unsplit control routed with the full
+            // prune + resident-bonus + file-penalty vector (the graph dump: ctrl rbias {-0.6 x157, +1 x58}, staged all
+            // zeros), and the first decode token diverged at layer 0's router.  One bias computation, one owner.
+            Ds41Dense & tgt = sr.stage.empty() ? dense : *sr.stage[(size_t) sr.owner(l)];
+            tgt.set_route_bias((int) l, rb.data());
         }
     };
     apply_bias();   // the prune part now (the prompt routes with it); route_bias again once the VRAM cache is seeded
@@ -1210,15 +1216,11 @@ int main(int argc, char ** argv) {
         sr.cb = sr.slab - sr.xs - sr.ps;   // the candidate bytes a boundary copy moves (accounting only)
         // The route bias is per layer, and on a staged run each layer belongs to a stage: hand it there.  (`dense`
         // still holds the weights the stages share, but it runs no layers, so a bias set only on it would be lost.)
-        {
-            std::vector<float> rb((size_t) TG.n_experts, 0.0f);
-            for (int64_t l = 0; l < TG.n_layers; ++l) {
-                for (int64_t e = 0; e < TG.n_experts; ++e)
-                    rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)])
-                                         ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f) : 0.0f;
-                sr.stage[(size_t) sr.owner(l)]->set_route_bias((int) l, rb.data());
-            }
-        }
+        // P5.3b: this used to be a hand-copied PRUNE-only rebuild that drifted from apply_bias() above - the resident
+        // bonus and the file penalty never reached a staged run, and its first decode token diverged.  apply_bias() is
+        // now stage-aware (it dispatches to sr.owner(l) once stages exist), so the staged run simply calls it again:
+        // same inputs, same values, one implementation.
+        apply_bias();
         // The staging is sized by the UNIT (see StagedRun::unit): one unit's slab bytes per slot.  A prompt longer than
         // a unit is a sequence of units, so a payload never exceeds its slot and no stage subdivides mid-pass - the only
         // way the producer's columns and the consumer's offset stay the SAME token's columns.
