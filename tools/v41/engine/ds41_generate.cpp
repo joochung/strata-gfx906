@@ -380,6 +380,22 @@ struct StagedRun {
 //   experts(l, ids, wts, fn, n, routed)
 //               fill routed with layer l's routed experts' weighted sum.  The tier is the CALLER's and stays on its own
 //               card: at this engine's seam it is host-in / host-out, so which card the layers ran on does not matter.
+/// STRATA_DUMP_STATE=PREFIX: the router seam's host arrays for one layer (ids, wts, fn) - what the EXPERT TIER is
+/// handed, as opposed to what the dense graph holds.  Layer 0's state and Engram inputs are bitwise equal on both
+/// shapes yet its output differs; the tier's host-in seam is the one leg no dump has covered.
+static void dump_router_seam(const char * prefix, const char * tag, const char * who,
+                             const int * ids, size_t nid, const float * wts, size_t nw,
+                             const float * fn, size_t nfn) {
+    // EXACT caller-sized counts: the unsplit decode's ids1/w1 are top_k slots and fn is ONE D-wide row - reading
+    // past either is a heap over-read dressed up as a dump.
+    char nb[512];
+    std::snprintf(nb, sizeof nb, "%s.rt.%s.%s.bin", prefix, tag, who);
+    std::ofstream fs(nb, std::ios::binary);
+    fs.write((const char *) ids, (std::streamsize) (nid * sizeof(int)));
+    fs.write((const char *) wts, (std::streamsize) (nw * sizeof(float)));
+    fs.write((const char *) fn, (std::streamsize) (nfn * sizeof(float)));
+}
+
 /// STRATA_DUMP_STATE=PREFIX: the Engram ROW columns (both slots) for the same window the state dump covers.
 /// The witness's layer 0 has bitwise-equal x_state/pre_state after begin() and still diverges; i_eng is the one
 /// input column region no other dump reads.
@@ -540,6 +556,13 @@ static bool staged_stage_layers(StagedRun & sr, int s, int n, int * ids, float *
     for (int64_t l = sr.lb[(size_t) s]; l < sr.run_le[(size_t) s]; ++l) {
         const float * fn = nullptr;
         if (!d.attn_router((int) l, ids, wts, &fn)) { err = d.last_error(); return false; }
+        static const char * bs_rt = std::getenv("STRATA_DUMP_STATE");
+        if (bs_rt && l == 0) {
+            char who[32], tag[48];
+            std::snprintf(tag, sizeof tag, "L00.p%d", (int) sr.pos_of);
+            std::snprintf(who, sizeof who, "s%d", s);
+            dump_router_seam(bs_rt, tag, who, ids, 256, wts, 256, fn, (size_t) n_embd);
+        }
         if (!experts((int) l, ids, wts, fn, n, routed)) { err = "tier refused at layer " + std::to_string(l); return false; }
         if (!d.finish((int) l, routed)) { err = d.last_error(); return false; }
         // STRATA_DUMP_STATE: the state columns at the layer-19 boundary of a STAGED pass (stage 0's last layer).
@@ -1441,6 +1464,11 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
             if (dprof) { const double t = now_ms(); dp[1] += t - ta; ta = t; }
             const float * fn = nullptr;
             if (!dense.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = dense.last_error(); return false; }
+            if (const char * bs_rt = std::getenv("STRATA_DUMP_STATE")) {   // same seam, unsplit control
+                char tag[48];
+                std::snprintf(tag, sizeof tag, "L00.p%d", pos);
+                dump_router_seam(bs_rt, tag, "full", ids1.data(), ids1.size(), w1.data(), w1.size(), fn, (size_t) n_embd);
+            }
             if (dprof) { const double t = now_ms(); dp[2] += t - ta; ta = t; }
             if (file_pred) {
                 for (int j = 0; j < top_k; ++j) {
