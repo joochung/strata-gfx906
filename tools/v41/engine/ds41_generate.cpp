@@ -434,6 +434,35 @@ static std::string same_device_example(int n_stage) {
 //
 // The pass's whole payload (n * slab bytes) must fit the staging: relay_stage_pass says so before any stage runs, and
 // the caller splits a longer prompt into passes (see --relay-chunk).
+// STRATA_DUMP_STATE=PREFIX (opt-in, default off): dump one instance's state COLUMNS through the relay seam -
+// x_state / pre_state (+ cand when the geometry carries it) for the first ncols columns at the column the instance
+// ran its last pass in (relay_read_out: staged col0 = the pass window, unsplit byte 0; the witness's positions 0..22
+// all live in window 0, so both sides dump columns 0..143 = the ring's reach, RAW = SWA + 16 = 144, for the V41-GSQ
+// geometry).  The P5.3b question this answers: the relay carries EXACTLY x_state + pre_state (+ cand) and nothing
+// else, hap / post_f / comb_f / shexp / o_fn are written and read INSIDE one pass (ds41_dense.cpp:936-938 wrote,
+// :1069 finish reads), so if a staged consumer's columns after a pass differ from the unsplit instance's columns
+// after the same pass, the divergence is NOT in the relayed set - it is in what the pass EXECUTES differently given
+// identical inputs (graphs, spans, ranking maps).  If they are equal, the relayed set itself is wrong.  ncols
+// halves down if the instance has fewer columns than asked.
+static void dump_state_cols(Ds41Dense & d, const char * prefix, const char * tag, const char * who) {
+    const size_t slab = d.relay_slab_bytes();
+    if (!slab) return;
+    int ncols = 144;
+    std::vector<uint8_t> buf;
+    bool ok = false;
+    while (ncols >= 1 && !ok) {
+        buf.assign(slab * (size_t) ncols, 0);
+        ok = d.relay_read_out(ncols, buf.data(), buf.size());
+        if (!ok) ncols /= 2;
+    }
+    if (!ok) return;
+    char nb[512];
+    std::snprintf(nb, sizeof nb, "%s.st.%s.%s.bin", prefix, tag, who);
+    std::ofstream fs(nb, std::ios::binary);
+    fs.write((const char *) buf.data(), (std::streamsize) buf.size());
+}
+
+
 static bool staged_pass(StagedRun & sr, int n, int pos0,
                         const std::function<bool(int stage, int n, int pos)> & run_stage,
                         const std::function<bool(int n)> & finish_head, std::string & err) {
@@ -489,7 +518,7 @@ static bool staged_pass(StagedRun & sr, int n, int pos0,
         return true;
     };
     // the slot straight into the consumer's state region - the region its first layer reads (no landing pad)
-    const auto stage_in = [&](int s, const uint8_t * slot, size_t slot_bytes, std::string & e) -> bool {
+const auto stage_in = [&](int s, const uint8_t * slot, size_t slot_bytes, std::string & e) -> bool {
         const double tr = now_ms();
         // The payload's size is a property of the GEOMETRY, identical on both sides of the boundary by construction
         // (relay_slab_bytes() never looks at a stage's range), so the two sides cannot disagree about where a copy ends.
@@ -498,6 +527,18 @@ static bool staged_pass(StagedRun & sr, int n, int pos0,
         const bool okc = sr.stage[(size_t) s]->relay_write_in(n, slot, slot_bytes, sr.pos_of);
         sr.ms_relay += now_ms() - tr;
         if (!okc) { e = "stage " + std::to_string(s) + ": " + sr.stage[(size_t) s]->last_error(); return false; }
+        // STRATA_DUMP_STATE=PREFIX: the CONSUMER's state columns immediately AFTER the relay landed and BEFORE this
+        // stage runs - the discriminator P5.3b needs: the pre-P5.3b dumps show pre_state reading as ZERO on both
+        // staged instances after every pass (real floats in the unsplit control, and real floats in the same
+        // producer's payload read at the boundary microseconds earlier), while x_state survives bitwise.  Dumping
+        // here separates "the relay never landed the pre-mix region" from "the consumer's own pass erases it".
+        if (const char * bs = std::getenv("STRATA_DUMP_STATE")) {
+            char tag[64];
+            std::snprintf(tag, sizeof tag, "bnd%03d.p%d", (int) sr.n_boundary, (int) sr.pos_of);
+            char who[32];
+            std::snprintf(who, sizeof who, "s%d.postrelay", s);
+            dump_state_cols(*sr.stage[(size_t) s], bs, tag, who);
+        }
         return true;
     };
     // called ONCE per pass, on the LAST stage, after its layers ran: the head, and nothing else.  Each stage's own
@@ -513,34 +554,6 @@ static bool staged_pass(StagedRun & sr, int n, int pos0,
 }
 
 }  // namespace
-
-// STRATA_DUMP_STATE=PREFIX (opt-in, default off): dump one instance's state COLUMNS through the relay seam -
-// x_state / pre_state (+ cand when the geometry carries it) for the first ncols columns at the column the instance
-// ran its last pass in (relay_read_out: staged col0 = the pass window, unsplit byte 0; the witness's positions 0..22
-// all live in window 0, so both sides dump columns 0..143 = the ring's reach, RAW = SWA + 16 = 144, for the V41-GSQ
-// geometry).  The P5.3b question this answers: the relay carries EXACTLY x_state + pre_state (+ cand) and nothing
-// else, hap / post_f / comb_f / shexp / o_fn are written and read INSIDE one pass (ds41_dense.cpp:936-938 wrote,
-// :1069 finish reads), so if a staged consumer's columns after a pass differ from the unsplit instance's columns
-// after the same pass, the divergence is NOT in the relayed set - it is in what the pass EXECUTES differently given
-// identical inputs (graphs, spans, ranking maps).  If they are equal, the relayed set itself is wrong.  ncols
-// halves down if the instance has fewer columns than asked.
-static void dump_state_cols(Ds41Dense & d, const char * prefix, const char * tag, const char * who) {
-    const size_t slab = d.relay_slab_bytes();
-    if (!slab) return;
-    int ncols = 144;
-    std::vector<uint8_t> buf;
-    bool ok = false;
-    while (ncols >= 1 && !ok) {
-        buf.assign(slab * (size_t) ncols, 0);
-        ok = d.relay_read_out(ncols, buf.data(), buf.size());
-        if (!ok) ncols /= 2;
-    }
-    if (!ok) return;
-    char nb[512];
-    std::snprintf(nb, sizeof nb, "%s.st.%s.%s.bin", prefix, tag, who);
-    std::ofstream fs(nb, std::ios::binary);
-    fs.write((const char *) buf.data(), (std::streamsize) buf.size());
-}
 
 int main(int argc, char ** argv) {
     if (!std::getenv("DS41_GGML_DEBUG"))

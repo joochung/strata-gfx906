@@ -215,6 +215,15 @@ def report(tag, a, b, la, lb):
           + (f", first at byte {first} = column {col}" if first >= 0 else ""))
     return neq
 print("== STATE COLUMNS (x_state then pre_state, columns 0..ncols-1 of the last pass's window) ==")
+# the post-relay dumps first: the consumer's columns BETWEEN relay_write_in and its own pass.  If these carry the
+# payload's real pre-mix floats, the relay lands and the consumer's EXECUTION is what leaves zeros; if these are
+# already zero, relay_write_in's pre_state copy is the broken edge.
+for p in sorted(glob.glob(f"{out}.staged/state.st.bnd*.postrelay.bin")):
+    a = np.fromfile(p, dtype=np.float32)
+    ncols = len(a) // 81936
+    pre = a[ncols * 81920 // 4:]
+    print(f"  {os.path.basename(p)}: {ncols} cols, pre_state nonzero {int((pre != 0).sum())}/{len(pre)}, "
+          f"col0 {pre[:4].tolist()}")
 for tag in ("pre", "step001"):
     full = stfile("ctrl", tag, "full")
     s1 = stfile("staged", tag, "s1")
