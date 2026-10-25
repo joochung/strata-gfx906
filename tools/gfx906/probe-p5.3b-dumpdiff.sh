@@ -316,6 +316,19 @@ for _sl in (0, 1):
         _fd = np.abs(_fx.astype(np.float64) - _fy.astype(np.float64))
         print(f"  eng{_sl} {_tag}: {int(_d.sum())}/{_n} bytes differ, max float diff {_fd.max():.3e}")
 
+# ---- ROUTER SEAM at layer 0 (ids, wts, fn as the tier receives them on the host) ----
+print("== ROUTER SEAM L00, first decode pass ==")
+_a = f"{out}.ctrl/state.rt.L00.p{poss[0]}.full.bin" if poss else ""
+_b = f"{out}.staged/state.rt.L00.p{poss[0]}.s0.bin" if poss else ""
+if _a and _os.path.exists(_a) and _os.path.exists(_b):
+    _x = np.fromfile(_a, dtype=np.uint8); _y = np.fromfile(_b, dtype=np.uint8)
+    _n = min(len(_x), len(_y))
+    _d = int((_x[:_n] != _y[:_n]).sum())
+    # layout: 256 ints ids | 256 floats wts | D floats fn (padded by truncation to the common length)
+    _xi = _x[:_n].view(np.int32); _yi = _y[:_n].view(np.int32)
+    _nid = int((_xi[:256] != _yi[:256]).sum()) if _n >= 1024 else -1
+    print(f"  bytes differ: {_d}/{_n}   ids slots differ: {_nid}")
+
 EOF
 rc2=$?
 [ $rc2 -eq 0 ] || rc=$rc2
