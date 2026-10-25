@@ -91,7 +91,7 @@ run_one() {   # run_one <name> <extra args...>
     local name=$1; shift
     echo "=== $name start $(date +%T) ==="
     mkdir -p "$OUT.$name"
-    STRATA_DUMP_STEPS="$OUT.$name/step" STRATA_DUMP_STATE="$OUT.$name/state" STRATA_DUMP_RELAY="$OUT.$name/relay" \
+    STRATA_DUMP_STEPS="$OUT.$name/step" STRATA_DUMP_STATE="$OUT.$name/state" STRATA_DUMP_RELAY="$OUT.$name/relay" STRATA_DUMP_STATE_EACH_LAYER="$OUT.$name/state2" \
         "${ENG[@]}" "${ARGS[@]}" --dump-last "$OUT.$name.P.bin" "$@" \
         >"$OUT.$name.toks" 2>"$OUT.$name.log"
     local rc=$?
@@ -260,6 +260,32 @@ for p in sorted(glob.glob(f"{out}.staged/relay.bnd*.bin")):
     x = a[: len(a) - (len(a) % 1)]
     print(f"  {os.path.basename(p)}: {len(a)*4} B, NaN {int(np.isnan(x).sum())}, "
           f"zeros {int((x == 0).sum())}/{len(x)}, absmax {np.abs(x[np.isfinite(x)]).max() if np.isfinite(x).any() else float('nan'):.3f}")
+
+# ---- which LAYER of the first DECODE pass diverges (STRATA_DUMP_STATE_EACH_LAYER) ----
+# ctrl dumps state columns after EVERY layer of its first decode pass; stage 0 the same.  The first layer whose
+# decode-column output differs is the layer whose staged execution computes a different function.
+import re as _re
+poss = sorted({int(_m.group(1)) for _f in _os.listdir(f"{out}.ctrl")
+               for _m in [_re.match(r"state2\.midL\d\d\.p(\d+)\.full\.bin", _f)] if _m})
+print("== PER-LAYER mid-pass diff, first decode pass ==")
+first_L = None
+for l in range(0, 20):
+    for pv in poss:
+        a_f = f"{out}.ctrl/state2.midL{l:02d}.p{pv}.full.bin"
+        b_f = f"{out}.staged/state2.midL{l:02d}.p{pv}.s0.bin"
+        if pv != poss[0] or not (_os.path.exists(a_f) and _os.path.exists(b_f)):
+            continue
+        a, b = np.fromfile(a_f, dtype=np.uint8), np.fromfile(b_f, dtype=np.uint8)
+        ncols = min(len(a), len(b)) // 81936
+        ax = a[:ncols * 81920].view(np.float32).reshape(ncols, 20480)
+        bx = b[:ncols * 81920].view(np.float32).reshape(ncols, 20480)
+        d0 = np.abs(ax[0].astype(np.float64) - bx[0].astype(np.float64))
+        mark = ""
+        if (d0 > 0).any() and first_L is None:
+            first_L = l; mark = "   <-- FIRST DIVERGENCE"
+        print(f"  L{l:02d}: decode column: {int((d0 > 0).sum()):6d}/20480 differ, max {d0.max():.3e}{mark}")
+print("first diverging layer:", first_L if first_L is not None else "NONE - stage 0 matches to its end")
+
 EOF
 rc2=$?
 [ $rc2 -eq 0 ] || rc=$rc2

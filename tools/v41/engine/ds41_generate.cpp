@@ -520,6 +520,13 @@ static bool staged_stage_layers(StagedRun & sr, int s, int n, int * ids, float *
         // output equals what an unsplit pass's first 20 layers produce (unsplit never otherwise exposes that depth:
         // layers 20-39 overwrite the columns inside the same pass).
         static const char * bs_mid = std::getenv("STRATA_DUMP_STATE");
+        static const char * bs_all = std::getenv("STRATA_DUMP_STATE_EACH_LAYER");
+        if (bs_all && (int) l < sr.le[(size_t) s]) {
+            char who[32], tag[48];
+            std::snprintf(tag, sizeof tag, "midL%02d.p%d", (int) l, (int) sr.pos_of);
+            std::snprintf(who, sizeof who, "s%d", s);
+            dump_state_cols(d, bs_all, tag, who);
+        }
         if (bs_mid && l == 19) {
             char who[32], tag[48];
             std::snprintf(tag, sizeof tag, "midL19.p%d", (int) sr.pos_of);
@@ -1432,6 +1439,12 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
             // DECODE-pass output (see staged_stage_layers).  Tagged by position so the first decode pass (the
             // witness's failing row) survives the later iterations.
             static const char * bs_dec = std::getenv("STRATA_DUMP_STATE");
+            static const char * bs_all = std::getenv("STRATA_DUMP_STATE_EACH_LAYER");
+            if (bs_all && (bs_dec || pos == (int) prompt.size())) {   // every layer of the FIRST decode pass only
+                char tag[48];                           // prompt length is the first decode token's position)
+                std::snprintf(tag, sizeof tag, "midL%02d.p%d", l, pos);
+                dump_state_cols(dense, bs_all, tag, "full");
+            }
             if (bs_dec && l == 19) {
                 char tag[48];
                 std::snprintf(tag, sizeof tag, "midL19.p%d", pos);
