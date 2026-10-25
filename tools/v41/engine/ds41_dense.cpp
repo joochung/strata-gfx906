@@ -335,14 +335,22 @@ struct Ds41Dense::Impl {
     ggml_context * gctx = nullptr;        // node structs of the cached (n = 1) graphs
     std::vector<uint8_t> pf_meta;         // node structs of a pass graph with n > 1 (built per pass)
     Allo allo_dec, allo_pass;
-    struct GKey { int il, kind; int64_t cap, n; bool operator<(const GKey & o) const {
-        return std::tie(il, kind, cap, n) < std::tie(o.il, o.kind, o.cap, o.n); } };
+    // P5.3b ROOT CAUSE #3: `col` (the column the graph was BUILT for) is part of the key.  A cached graph's ggml
+    // views carry the column as a baked-in byte offset, so a graph first built at window 0 silently reads and writes
+    // column 0 no matter where the pass runs; the relay, which computes stage_col0(pos) at RUNTIME, then serves the
+    // next stage from a column the graphs never wrote (the DS4.1 witness's first decode at pos 64 = column 64).  With
+    // the column in the key, a pass at a new window gets a graph of its own, exactly as begin()'s cycling rule says.
+    // Unsplit, col is 0 for every pass, so the default path keeps exactly one entry per (il, kind, cap, n) as before.
+    struct GKey { int il, kind; int64_t cap, n, col; bool operator<(const GKey & o) const {
+        return std::tie(il, kind, cap, n, col) < std::tie(o.il, o.kind, o.cap, o.n, o.col); } };
     std::map<GKey, ggml_cgraph *> graphs;
     std::map<int, ggml_tensor *> logits_out;   // decode head graph output, by nrows
-    std::map<int, ggml_tensor *> predict_out;  // predict graph output, by layer
-    std::map<std::pair<int, int>, ggml_tensor *> predict_out_n;   // predict_multi output, by (layer, pass width)
-    std::map<int, ggml_tensor *> fpredict_out; // finish_predict graph output, by the predicted layer
-    std::map<std::pair<int, int>, std::vector<ggml_tensor *>> fpredict_ahead; // finish_predict_ahead extra outputs
+    // the output tensor of each cached graph, keyed the SAME way as the graph (the output is a view of that graph's
+    // own scratch, so it belongs to one column too - see GKey's `col`)
+    std::map<std::pair<int, int64_t>, ggml_tensor *> predict_out;                // by (layer, column)
+    std::map<std::tuple<int, int, int64_t>, ggml_tensor *> predict_out_n;        // by (layer, pass width, column)
+    std::map<std::pair<int, int64_t>, ggml_tensor *> fpredict_out;               // by (predicted layer, column)
+    std::map<std::tuple<int, int, int64_t>, std::vector<ggml_tensor *>> fpredict_ahead;  // extras, (layer, ahead, column)
 
     ~Impl() {
         if (nbuf) ggml_backend_buffer_free(nbuf);
@@ -1050,7 +1058,9 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
-    ggml_tensor * x = ggml_dsv4_hc_pre(gc, b.cols3(im.x_state, D, HC, n), b.cols2(im.pre_state, HC, n));
+    // P5.3b: the state lives at the PASS's column (im.col0 when staged), not at byte 0 - see pass_col0.
+    const int64_t col0 = pass_col0(im, 0);
+    ggml_tensor * x = ggml_dsv4_hc_pre(gc, b.cols3(im.x_state, D, HC, n, col0), b.cols2(im.pre_state, HC, n, col0));
     ggml_tensor * rl = ggml_mul_mat(gc, im.BLpred(il), b.rms_w(x, im.BL(il, "ffn_norm.weight")));
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
     ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(il, "exp_probs_b.bias")),
@@ -1080,12 +1090,14 @@ static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * g
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 128, false);
     const int64_t D = im.D, HC = im.HC;
-    ggml_tensor * out = ggml_add(gc, b.cols2(im.shexp, D, 1, 0), b.cols2(im.routed, D, 1, 0));
-    ggml_tensor * x = ggml_dsv4_hc_post(gc, out, b.cols3(im.hap, D, HC, 1, 0), b.cols2(im.post_f, HC, 1, 0),
-                                        b.cols3(im.comb_f, HC, HC, 1, 0));
-    ggml_tensor * st = ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, 1, 0));
+    // P5.3b: every state view sits at the pass's column (see pass_col0 / build_predict).
+    const int64_t col0 = pass_col0(im, 0);
+    ggml_tensor * out = ggml_add(gc, b.cols2(im.shexp, D, 1, col0), b.cols2(im.routed, D, 1, col0));
+    ggml_tensor * x = ggml_dsv4_hc_post(gc, out, b.cols3(im.hap, D, HC, 1, col0), b.cols2(im.post_f, HC, 1, col0),
+                                        b.cols3(im.comb_f, HC, HC, 1, col0));
+    ggml_tensor * st = ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, 1, col0));
     ggml_build_forward_expand(gf, st);
-    ggml_tensor * xp = ggml_dsv4_hc_pre(gc, st, b.cols2(im.pre_state, HC, 1));
+    ggml_tensor * xp = ggml_dsv4_hc_pre(gc, st, b.cols2(im.pre_state, HC, 1, col0));
     ggml_tensor * rl = ggml_mul_mat(gc, im.BLpred(next_il), b.rms_w(xp, im.BL(next_il, "ffn_norm.weight")));
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
     ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(next_il, "exp_probs_b.bias")),
@@ -2181,8 +2193,8 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
     const bool cached = n == 1;
     std::vector<uint8_t> meta;
     if (cached) {
-        auto it = im.graphs.find({ -1, 0, 0, 1 });
-        if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 0, 0, 1 }, build_init(im, im.gctx, 1)).first;
+        auto it = im.graphs.find({ -1, 0, 0, 1, im.col0 });
+        if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 0, 0, 1, im.col0 }, build_init(im, im.gctx, 1)).first;
         gf = it->second;
     } else {
         meta.resize(ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(64, false));
@@ -2429,7 +2441,7 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     ggml_context * gc = nullptr;
     const bool cached = n == 1;
     if (cached) {
-        const Impl::GKey key { il, 1, cap, 1 };
+        const Impl::GKey key { il, 1, cap, 1, im.col0 };
         auto it = im.graphs.find(key);
         if (it == im.graphs.end()) it = im.graphs.emplace(key, build_attn(im, im.gctx, il, 1)).first;
         gf = it->second;
@@ -2449,9 +2461,11 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     // is still not dumped.  This settles which.
     if (cached && il == 0) dump_graph_once(im, gf, "L00");
     // one sync for the three readbacks (was one per tensor_get: 3 x 40 stream syncs per decode token)
-    ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data(), 0, (size_t) (im.D * n) * 4);
-    ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data(), 0, (size_t) (im.NU * n) * 4);
-    ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data(), 0, (size_t) (im.NU * n) * 4);
+    // P5.3b: the pass's fn / ids / wts live at the PASS's column (the cached graph's views write o_* at im.col0,
+    // exactly like attn_router_span reads them at its own col0); host still lands at 0, the caller reads one pass.
+    ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data(), (size_t) im.col0 * im.D * 4, (size_t) (im.D * n) * 4);
+    ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data(), (size_t) im.col0 * im.NU * 4, (size_t) (im.NU * n) * 4);
+    ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data(), (size_t) im.col0 * im.NU * 4, (size_t) (im.NU * n) * 4);
     ggml_backend_synchronize(im.backend);
     std::memcpy(ids, im.host_ids.data(), (size_t) (im.NU * n) * 4);
     std::memcpy(wts, im.host_wts.data(), (size_t) (im.NU * n) * 4);
@@ -2464,17 +2478,17 @@ bool Ds41Dense::predict(int il, int * top_ids, int n_top) {
     Impl & im = *p_;
     if (!im.owns_layer(il)) { im.err = "predict: layer " + std::to_string(il) + " is not this stage's [" + std::to_string(im.lb) + "," + std::to_string(im.le) + ")"; return false; }
     if (im.n != 1 || n_top < 1 || n_top > 16) return false;
-    const Impl::GKey key { il, 3, 0, 1 };
+    const Impl::GKey key { il, 3, 0, 1, im.col0 };
     auto it = im.graphs.find(key);
     if (it == im.graphs.end()) {
         ggml_tensor * o = nullptr;
         ggml_cgraph * gf = build_predict(im, im.gctx, il, &o);
         it = im.graphs.emplace(key, gf).first;
-        im.predict_out[il] = o;
+        im.predict_out[{ il, im.col0 }] = o;
     }
     if (!im.compute(it->second, true)) return false;
     int32_t buf[16];
-    ggml_backend_tensor_get(im.predict_out[il], buf, 0, sizeof(buf));
+    ggml_backend_tensor_get(im.predict_out[{ il, im.col0 }], buf, 0, sizeof(buf));
     for (int i = 0; i < n_top; ++i) top_ids[i] = buf[i];
     return true;
 }
@@ -2485,15 +2499,15 @@ bool Ds41Dense::predict_multi(int il, int * top_ids) {
     const int64_t n = im.n;
     if (n < 1) return false;
     if (n == 1) return predict(il, top_ids, 16);
-    const Impl::GKey key { il, 3, 0, (int) n };   // one graph per (layer, pass width): verify passes reuse a few widths
+    const Impl::GKey key { il, 3, 0, (int) n, im.col0 };   // one graph per (layer, pass width, column)
     auto it = im.graphs.find(key);
     ggml_tensor * o = nullptr;
     if (it == im.graphs.end()) {
         ggml_cgraph * gf = build_predict(im, im.gctx, il, &o, n);
         it = im.graphs.emplace(key, gf).first;
-        im.predict_out_n[{ il, (int) n }] = o;
+        im.predict_out_n[{ il, (int) n, im.col0 }] = o;
     }
-    o = im.predict_out_n[{ il, (int) n }];
+    o = im.predict_out_n[{ il, (int) n, im.col0 }];
     if (!im.compute(it->second, true)) return false;
     ggml_backend_tensor_get(o, top_ids, 0, sizeof(int32_t) * 16 * (size_t) n);
     return true;
@@ -2504,14 +2518,15 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
     (void) il;
     if (!im.owns_layer(il)) { im.err = "finish: layer " + std::to_string(il) + " is not this stage's [" + std::to_string(im.lb) + "," + std::to_string(im.le) + ")"; return false; }
     const int64_t n = im.n;
-    if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) (im.D * n) * 4);
+    // P5.3b: the host-computed routed sum lands in the columns the pass's finish graph reads them from (im.col0).
+    if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, (size_t) im.col0 * im.D * 4, (size_t) (im.D * n) * 4);
     ggml_cgraph * gf = nullptr;
     ggml_context * gc = nullptr;
     const bool cached = n == 1;
     std::vector<uint8_t> meta;
     if (cached) {
-        auto it = im.graphs.find({ -1, 2, 0, 1 });
-        if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 2, 0, 1 }, build_finish(im, im.gctx, 1)).first;
+        auto it = im.graphs.find({ -1, 2, 0, 1, im.col0 });
+        if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 2, 0, 1, im.col0 }, build_finish(im, im.gctx, 1)).first;
         gf = it->second;
     } else {
         meta.resize(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
@@ -2533,18 +2548,19 @@ bool Ds41Dense::finish_predict(int il, const float * routed_sum, int next_il, in
     // layer the successor call will ask this stage to run, i.e. inside [lb, wle).  A staged loop's last layer of
     // a stage calls with next_il == le, which is exactly why wle is le + 1.
     if (next_il < im.lb || next_il >= im.wle) return false;
-    if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) im.D * 4);
-    const Impl::GKey key { next_il, 5, 0, 1 };
+    // P5.3b: routed is read by the graph at the pass column (see finish); the host upload matches it.
+    if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, (size_t) im.col0 * im.D * 4, (size_t) im.D * 4);
+    const Impl::GKey key { next_il, 5, 0, 1, im.col0 };
     auto it = im.graphs.find(key);
     if (it == im.graphs.end()) {
         ggml_tensor * o = nullptr;
         ggml_cgraph * gf = build_finish_predict(im, im.gctx, next_il, &o);
         it = im.graphs.emplace(key, gf).first;
-        im.fpredict_out[next_il] = o;
+        im.fpredict_out[{ next_il, im.col0 }] = o;
     }
     if (!im.compute(it->second, true)) return false;
     int32_t buf[16];
-    ggml_backend_tensor_get(im.fpredict_out[next_il], buf, 0, sizeof(buf));
+    ggml_backend_tensor_get(im.fpredict_out[{ next_il, im.col0 }], buf, 0, sizeof(buf));
     for (int i = 0; i < n_top; ++i) top_ids[i] = buf[i];
     return true;
 }
@@ -2557,8 +2573,8 @@ bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_
     if (ahead <= 0 || !ahead_ids) return finish_predict(il, routed_sum, next_il, top_ids, n_top);
     if (im.n != 1 || n_top < 1 || n_top > 16) return false;
     if (next_il < im.lb || next_il >= im.wle) return false;   // P5.3b: as in finish_predict
-    if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) im.D * 4);
-    const Impl::GKey key { next_il, 6, ahead, 1 };
+    if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, (size_t) im.col0 * im.D * 4, (size_t) im.D * 4);   // P5.3b: pass column, see finish_predict
+    const Impl::GKey key { next_il, 6, ahead, 1, im.col0 };
     auto it = im.graphs.find(key);
     if (it == im.graphs.end()) {
         ggml_tensor * o = nullptr;
@@ -2566,10 +2582,10 @@ bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_
         ggml_cgraph * gf = build_finish_predict(im, im.gctx, next_il, &o, ahead, &ao);
         it = im.graphs.emplace(key, gf).first;
         ao.insert(ao.begin(), o);   // [0] = next_il's prediction, [1 + a] = next_il + 1 + a's
-        im.fpredict_ahead[{ next_il, ahead }] = ao;
+        im.fpredict_ahead[{ next_il, ahead, im.col0 }] = ao;
     }
     if (!im.compute(it->second, true)) return false;
-    const auto & ao = im.fpredict_ahead[{ next_il, ahead }];   // [0] = the output, then one entry per extra row
+    const auto & ao = im.fpredict_ahead[{ next_il, ahead, im.col0 }];   // [0] = the output, then one entry per extra row
     // argsort_top_k is a VIEW of the full argsort: row r starts at r * nb[1] (NE ids apart), not r * 16 - one copy of
     // the span covering every row's first 16
     const int rows = (int) ao.size();
