@@ -1872,16 +1872,19 @@ void Ds41Dense::release_pass() {
 }
 
 // pass_cap (per ratio) of a pass of n tokens ending at pos0+n: the visible compressed rows it ranks over.
-// P5.3b: on a STAGED run the stage's rings hold only its own range's rows - the sources at or below its range were
-// produced below the split and are NOT part of this instance's state - so the rows it can rank over are the model's
-// span MINUS floor(lb/r).  Subtracting here rather than at each call site means begin(), the layer-major spans and a
-// relayed stage's window all agree by construction.
+// P5.3b: IDENTICAL to the unsplit rule, deliberately.  An earlier version subtracted floor(lb / r) here on the theory
+// that a stage's ring "holds only its own range's rows" - that theory was wrong twice over.  (1) A compressed ring is
+// re-derived by ITS OWN stage's source layer for EVERY pass (all tokens flow through all stages), at MODEL row
+// coordinates, so stage 1's ring is as full as the unsplit one - there is nothing to subtract.  (2) The subtraction
+// broke the divisibility the cand-block pooling requires: caps are next_pow2(...), hence multiples of CBS, and
+// next_pow2(x) - lb/r is not (measured: cap 32 - 20 = 12 with CBS 8 tripped GGML_ASSERT(cap % im.CBS == 0) at
+// ds41_dense.cpp:804 on the fourth decode token of witness run3, logs/p5.3b-run3-20261024-213054.log).  The split's
+// real constraint is the READER'S RULE (which layer's ring, not how many rows), enforced at build_stages.
 static void span_pass_caps(const Ds41Dense::Impl & im, int pos0, int n, int64_t out[3]) {
     out[0] = 0;
     for (int r = 1; r <= 2; ++r) {
         const int64_t nvis_last = (pos0 + n) / r;
         out[r] = nvis_last == 0 ? 0 : std::min<int64_t>(next_pow2(std::max<int64_t>(nvis_last, im.CBS)), im.cmax[r]);
-        out[r] = std::max<int64_t>(0, out[r] - im.lb / r);
     }
 }
 
