@@ -464,8 +464,12 @@ static bool staged_pass(StagedRun & sr, int n, int pos0,
         const double tr = now_ms();
         // The producer writes the state regions and, when the candidates cross a card, its candidate column too.
         // The bytes this boundary moves are the same on both sides, with ONE exception explained below.
-        (void) slot_bytes;   // the instance sizes the copy by its OWN slab (see relay_read_out's comment)
-        const bool okc = sr.stage[(size_t) s]->relay_read_out(n, slot, sr.slab);
+        // The COPY is sized by the instance's own slab (relay_read_out multiplies slab x n itself); the CAPACITY it
+        // checks against must be the real slot capacity (capacity x slab), not the per-token slab.  Passing sr.slab
+        // here made every prefill pass of n > 1 tokens refuse its own staging (witness 2026-10-24 21:16: "the staging
+        // slot holds 81936 bytes, the pass needs 1147104" - one token's slab vs fourteen tokens' payload).  GLM's
+        // equivalent (glm_generate.cpp:313) passes slot_bytes; this line had drifted from it.
+        const bool okc = sr.stage[(size_t) s]->relay_read_out(n, slot, slot_bytes);
         sr.ms_relay += now_ms() - tr;
         if (!okc) { e = "stage " + std::to_string(s) + ": " + sr.stage[(size_t) s]->last_error(); return false; }
         sr.n_boundary++;
@@ -477,10 +481,9 @@ static bool staged_pass(StagedRun & sr, int n, int pos0,
         const double tr = now_ms();
         // The payload's size is a property of the GEOMETRY, identical on both sides of the boundary by construction
         // (relay_slab_bytes() never looks at a stage's range), so the two sides cannot disagree about where a copy ends.
-        (void) slot_bytes;   // the instance sizes the copy by its OWN slab, which is the same number
-        // pos0 is the unit index; the position the payload lands at is the run's, and the caller passes it in via
-        // sr.pos_of (set by staged_feed / staged_step just before the pass).
-        const bool okc = sr.stage[(size_t) s]->relay_write_in(n, slot, sr.slab, sr.pos_of);
+        // Capacity: the real slot capacity, not the per-token slab - see stage_out for why that distinction is load-
+        // bearing (and glm_generate.cpp:323, which this mirrors).
+        const bool okc = sr.stage[(size_t) s]->relay_write_in(n, slot, slot_bytes, sr.pos_of);
         sr.ms_relay += now_ms() - tr;
         if (!okc) { e = "stage " + std::to_string(s) + ": " + sr.stage[(size_t) s]->last_error(); return false; }
         return true;
