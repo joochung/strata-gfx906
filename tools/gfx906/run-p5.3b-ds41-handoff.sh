@@ -194,6 +194,15 @@ for r in run3 run4 run5; do
         echo "P5.3b WITNESS: FAIL - ${r} moved the candidate column across a boundary; the reader's rule no longer holds"
         exit 1
     fi
+    # enc-skip is layer-major-only: its phase-A/B slice indexes absolute columns, which a staged run's cycling
+    # window ((pos / cap) % windows) has no defined relation to.  ds41_generate now forces it off for staged runs
+    # (witness 2026-10-24 21:50: with the flag silently ON, both staged variants diverged from BOTH controls at
+    # the FIRST token, while an unsplit chunk-path run reproduced the controls exactly).  A staged log carrying
+    # the plan line means the flag is back - the token verdict would then measure the wrong thing, so refuse.
+    if grep -q "enc-skip: cut at layer" "logs/p5.3b-${r}-${TS}.log"; then
+        echo "P5.3b WITNESS: FAIL - ${r} ran with enc-skip ON (staged runs must force it off; see ds41_generate)"
+        exit 1
+    fi
 done
 echo "[run3/4/5] candidates: stayed inside the producer's stage (reader's rule held; payload = x_state + pre_state)"
 

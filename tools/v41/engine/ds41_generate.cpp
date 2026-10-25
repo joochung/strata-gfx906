@@ -611,7 +611,20 @@ int main(int argc, char ** argv) {
     // columns sub-batch by sub-batch (begin_batch / attn_router_span / finish_span) and the relay has no seam for that
     // shape - the producer's columns would be written by another stage's graphs.  A staged run therefore takes the
     // sequential chunk path (a pass of at most --relay-chunk tokens through every stage, which is what the relay was
-    // built for): PB was zeroed above, which turns enc-skip off through the PB > 1 default and the check just above.
+    // built for).  It KEEPS --prompt-batch (the staged state columns are sized from it - see the column-budget comment
+    // in the staged setup), which is why this flag needs its own clause here: an earlier comment claimed PB was
+    // zeroed for staged runs and that that disabled enc-skip through the default above; it was not, so every staged
+    // run silently ran with enc-skip ON.  The phase-A/phase-B slice indexes ABSOLUTE layer-major columns; a staged
+    // run's columns CYCLE ((pos / cap) % windows), so the slice classifies columns it was never defined over and
+    // layers 21+ skip the wrong tokens.  Measured: witness run3 (2026-10-24 21:50, logs/p5.3b-run3-20261024-215051.log)
+    // diverged from BOTH controls at the FIRST token, deterministically (both staged variants share token 455), while
+    // a chunk-path UNSPLIT run (--prompt-batch 0, enc-skip off through the check above, same ids) reproduced the
+    // layer-major controls exactly (logs/p5.3b-probe-sequnsplit.toks) - the prefill path was innocent; this flag was
+    // the only remaining difference the staged runs carried.
+    if (enc_skip && a.split.n_stage > 1) {
+        if (a.enc_skip == 1) std::fprintf(stderr, "note: --enc-skip disabled (a staged run is a chunk-path run; the layer-major slice has no meaning over cycling columns)\n");
+        enc_skip = false;
+    }
     int64_t ER = enc_skip ? (int64_t) a.enc_replay : 0;
     dc.engram_dirs = a.engram;
     dc.act_quant = a.act_quant;
@@ -1034,7 +1047,9 @@ int main(int argc, char ** argv) {
             // the producer ran at column 192 would land past a consumer with 128 columns.
             if ((int64_t) c < sr.cols) sr.cols = c;
         }
-        // THE PROMPT BATCH IS A STAGED RUN'S COLUMN BUDGET.  A staged run drops the layer-major batch (PB = 0), so
+        // THE PROMPT BATCH IS A STAGED RUN'S COLUMN BUDGET.  A staged run never EXECUTES the layer-major batch path
+        // (it is a chunk-path run - see the enc-skip clause in the arg section, which is where the stale "PB = 0"
+        // claim was corrected), but it KEEPS the --prompt-batch value here, because
         // without this the state would be sized to ONE window and a pass could never cycle: the run would either stop
         // at the first window or overwrite its own state.  A staged run therefore always allocates the prompt batch's
         // columns (--prompt-batch, the same number an unsplit run sizes its layer-major batch from), and says so.
