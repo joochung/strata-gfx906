@@ -1,0 +1,58 @@
+{
+  "id": "p5.3b-ds41-handoff-pass-2026-10-25",
+  "date": "2026-10-25",
+  "phase": "P5.3b (DeepSeek-V4.1-Flash staged host-relayed hand-off, same-device and cross-device)",
+  "verdict": "PASS",
+  "summary": "Every staged DeepSeek-V4.1 run - one card (--gpus 0,0) and two cards (--gpus 0,1, stage 1 with its own weight copy) - is byte-identical to an unsplit control for all 64 greedy token ids, within this engine's measured cross-process reproducibility (unsplit twins 64/64, cross-device staged twins 64/64). Closing this witness took five root causes, each found on hardware and each gated on the host afterwards; the last was the i_widx upload missing the SWA per-query stride, which made the FIRST column-1 pass (position 64) attend rows the window table never held.",
+  "residency_equalization": {
+    "flag": "--slots 1500 on every run (EXTRA_ARGS), controls included",
+    "why": "the expert VRAM budget is computed from free VRAM after the dense half, and the shapes differ (unsplit ~23.6 GiB, staged --gpus 0,1 ~17.6 GiB on the card the budget reads), so at default budgets a staged run keeps a DIFFERENT set of experts resident than its control. Expert residency changes the tier path and with it the float summation order, which flips greedy argmax at knife-edge rows - witnessed default-budget cross-device at lcp 1/54 and default-budget same-device at 51/54 (the latter was the i_widx bug ON TOP of this). This is a performance/tier characteristic, not a state-seam property: with the budget pinned to one identical ranked head (same rank.bin seed, same cap), a staged cross-device run matched its control bitwise (probe p5.3b-dumpdiff-20261025-184223: P row bitwise, midL19 p14 x_state 0/20480 differ, 54/54 tokens).",
+    "residual": "with slots pinned, decode rows still differ from ~1e-1 down after the first pass because the unsplit tier prefetches ahead while staged skips prefetch (admission TIMING differs, not capacity); 54/54 tokens still agreed and every diff stayed far below the argmax margins."
+  },
+  "engine_build": {
+    "branch": "gfx906/p5.3-relay",
+    "witness_tip_commit": "d370bfe1 (i_widx SWA stride upload, root cause #5)",
+    "root_cause_commits": {
+      "1": "1d18b7d2 - relay_back_copy carried only x/pre/cand; extended to ALL run-scope per-column state (hap, post_f, comb_f, shexp, o_fn, o_ids, o_wts, routed, sel, selm) via column stripes",
+      "2": "a6bfab87 - staged branch applied the prune-only route bias; apply_bias made stage-aware (bias_now is a decode lever)",
+      "3": "ce7e1116 - graph output cache GKey missing the pass column; output-tensor maps keyed by (layer, col)",
+      "4": "carry_forward (with d370bfe1) - per-column carry state copied from the previous window's column at a column transition, in begin() and relay_write_in()",
+      "5": "d370bfe1 - upload_pos_tables wrote i_widx at byte col0*4 while build_attn reads it at col0*SWA*4 ([SWA*NC] layout, SWA=128 rows per query block); identical at col0=0, garbage window rows at every column above 0"
+    },
+    "binary": "build-906/ds41_generate (build-906-gate 16 jobs; ctest 6 failures = 4 baseline + iq_multi_parity + bf16_gemv_parity, both flaky under 16-job load and green when re-run alone)",
+    "model": "/ai/models/hf.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored/V41-GSQ.gguf",
+    "prompt": "14 ids ('What is a mixture-of-experts model? Answer in two sentences.'), greedy, -n 64, --layer-split 20 (the reader's-rule boundary), --relay-chunk 64",
+    "flags": "--backend cuda --experts gpu --engram l1:l14 --rank rank.bin --arena-gib 64 --arena-adapt --vram-margin 1.0 --prefill-chunk 64 --slots 1500"
+  },
+  "hardware": "4x AMD Instinct MI50 32GB (gfx906), ROCm 7.2.0; HIP device 0 = 0000:43:00.0, device 1 = 0000:46:00.0; no other engine alive (SVM one-engine rule), 30+ GiB RAM available at start",
+  "witness_13": {
+    "ts": "20261025-190058",
+    "logs": "logs/p5.3b-run{1..5}-20261025-190058.{log,toks} (repo logs/, gitignored by design; numbers embedded here)",
+    "runs": {
+      "run1": "unsplit control, 64 tokens, decode 14.64 tok/s, decode hit 14949/15122 experts (98.9%), 1500 slots",
+      "run2": "unsplit control twin, 64 tokens",
+      "run3": "staged --gpus 0,0 (owner-shared weights), 64 tokens, decode 14.72 tok/s, 64 hand-offs, relay 17 ms (0.27 ms/pass)",
+      "run4": "staged --gpus 0,1 --relay-copy-weights twin A, 64 tokens, decode 13.73 tok/s, 64 hand-offs, relay 42 ms (0.66 ms/pass), hit 14472/15149 (95.5%)",
+      "run5": "staged --gpus 0,1 twin B, 64 tokens, decode 13.72 tok/s, relay 44 ms (0.69 ms/pass)"
+    },
+    "agreement_longest_common_prefix_of_64": {
+      "run1_vs_run2_unsplit_twins": 64,
+      "run4_vs_run5_cross_device_twins": 64,
+      "run3_vs_controls": 64,
+      "run4_vs_controls": 64,
+      "run5_vs_controls": 64
+    },
+    "gate": "the bar was the measured twin agreement (64/64 this session), not an assumed one; candidates stayed inside the producer's stage (reader's rule held); payload = x_state + pre_state (+ candidate blocks where needed)"
+  },
+  "supporting_probes": {
+    "default_budget_cross_device": "logs/p5.3b-dumpdiff-20261025-181127: lcp 1/54 with staged holding 1979 slots vs ctrl 2661 - residency noise alone, all staged state bitwise at p14 (midL19) is NOT meaningful under a budget mismatch",
+    "slots_pinned_cross_device": "logs/p5.3b-dumpdiff-20261025-184223: lcp 54/54, P row bitwise equal, midL19 p14 0/20480 floats differ (stage 0 bitwise innocent), tiny sub-margin row diffs from p15 up (prefetch admission timing)",
+    "host_gates_after": "gate-relay-pos-tables.sh GREEN incl. new PASS 3 (multi-window byte-offset model: buggy bare-woff upload diverges in ALL 7 column-moving geometries including the witness 14/64, strided upload clean in all 7); gate-device-split.sh GREEN"
+  },
+  "limits": [
+    "one 14-token prompt, greedy, 64 tokens, boundary 20, relay-chunk 64 - exactly the witness geometry; a longer prompt that crosses a mid-prompt column move (prompt > 64) is NOT covered by the token agreement (the byte-offset gate models it, the hardware run does not yet)",
+    "serve snapshot/restore for staged runs is not on the witness path and remains open (task #34 note)",
+    "at DEFAULT budgets a staged run still picks its own greedy tokens under expert-residency float-order noise, exactly as two single-card runs with different budgets would; this receipt does NOT claim default-budget bit-parity",
+    "cross-device staged loses ~6 GiB of slot budget on the card the budget is read from (free-VRAM computation); a budget-from-own-device change would recover it but is out of scope here"
+  ]
+}

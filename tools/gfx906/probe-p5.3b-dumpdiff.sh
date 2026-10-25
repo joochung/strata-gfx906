@@ -92,8 +92,13 @@ run_one() {   # run_one <name> <extra args...>
     local name=$1; shift
     echo "=== $name start $(date +%T) ==="
     mkdir -p "$OUT.$name"
-    STRATA_DUMP_STEPS="$OUT.$name/step" STRATA_DUMP_STATE="$OUT.$name/state" STRATA_DUMP_RELAY="$OUT.$name/relay" STRATA_DUMP_STATE_EACH_LAYER="$OUT.$name/state2" STRATA_DUMP_GRAPHS="$OUT.$name/graphs" \
-        "${ENG[@]}" "${ARGS[@]}" --dump-last "$OUT.$name.P.bin" "$@" \
+    # DUMP_EACH=1 turns on the per-layer dumps; they are 40 layers x every pass x ~12 MB, so they stay off unless asked
+    local each=()
+    [ "${DUMP_EACH:-0}" = "1" ] && each=(STRATA_DUMP_STATE_EACH_LAYER="$OUT.$name/state2")
+    # EXTRA_ARGS goes to BOTH sides so a shape-neutral rerun (--route-bias 0 --route-bias-file 0) is possible
+    local extra=(); read -ra extra <<< "${EXTRA_ARGS:-}"
+    env STRATA_DUMP_STEPS="$OUT.$name/step" STRATA_DUMP_STATE="$OUT.$name/state" STRATA_DUMP_RELAY="$OUT.$name/relay" STRATA_DUMP_GRAPHS="$OUT.$name/graphs" "${each[@]}" \
+        "${ENG[@]}" "${ARGS[@]}" --dump-last "$OUT.$name.P.bin" "${extra[@]}" "$@" \
         >"$OUT.$name.toks" 2>"$OUT.$name.log"
     local rc=$?
     echo "--- $name rc=$rc, $(wc -l < "$OUT.$name.toks") token ids, $(ls "$OUT.$name"/step.step*.bin 2>/dev/null | wc -l) step dumps"

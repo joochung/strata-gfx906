@@ -93,7 +93,7 @@ Not proven at this checkpoint: the DS4.1 engine under staging, staged serve mode
 snapshot/restore is per-instance today), and any scaling number - the 1/2/4-card curve is P5.5 and
 no throughput claim is made here.
 
-#### DS4.1 staged run implemented (2026-10-24, P5.3b); awaiting a hardware witness
+#### DS4.1 staged run WITNESSED PASS (2026-10-25, P5.3b witness 20261025-190058)
 
 The same capability now exists in the DeepSeek-V4.1 engine (`tools/v41`), built from the GLM pattern and
 documented in [P5-RELAY-PATTERN.md section 6b](P5-RELAY-PATTERN.md).  What makes this engine different from GLM is
@@ -142,9 +142,30 @@ literally, and the valid set is re-derived **a third time, in awk, from the orac
 moved a boundary cannot agree with a gate that did not.  Skipped, not failed, where no build or no checkpoint exists.
 (A hand-rolled GGUF
 header parse gave a different, plausible, **wrong** answer here - `cand L10`, `kv_src(l)==l`, "any split is valid" - and
-it is the engine's reader that settles it, so the gate calls the reader rather than trusting a transcription.)  **No GPU run has been performed for this change**;
-the witness is `tools/gfx906/run-p5.3b-ds41-handoff.sh` (five runs, operator-launched, same calibrated
-verdict as GLM's) and it has not been run yet.  Its staged runs use `--layer-split 20` (the only boundary this
+it is the engine's reader that settles it, so the gate calls the reader rather than trusting a transcription.)  The
+witness has since been run and PASSES: witness 20261025-190058, five runs, every staged variant (same-device
+`--gpus 0,0` and both cross-device `--gpus 0,1` twins) byte-identical to an unsplit control for all 64 greedy token
+ids, with the unsplit twins and the cross-device twins themselves agreeing 64/64 that session
+([receipt](../../benchmarks/gfx906/receipts/2026-10-25-p5.3b-ds41-handoff-pass.json)).  Getting there took five
+root causes, each found by hardware measurement and each given a host gate afterwards: the back-relay carried only
+`x_state`/`pre_state`/`cand` and not the per-column run-scope carry state (1d18b7d2); the staged branch applied the
+prune-only route bias while the decode-time bias is a residency lever (a6bfab87); the graph output cache was keyed
+without the pass column (ce7e1116); a column transition did not carry the per-column carry state to the new window
+(carry_forward, with d370bfe1); and `upload_pos_tables` wrote the window index table `i_widx` at byte `col0 * 4`
+while the graph reads it at `col0 * SWA * 4` - a [SWA * NC] layout whose per-query stride of 128 hid under
+`col0 == 0`, so every pass below the window agreed and the FIRST column-1 pass (position 64) attended rows the
+table never held; that is why the failing witness matched its controls for exactly 51 tokens and left at the
+column move (d370bfe1, with a byte-offset pass in `gate-relay-pos-tables.sh` that is red on the buggy stride in all
+seven column-moving geometries it models, the witness's 14/64 among them, and clean on the fixed one).
+One comparison discipline this witness established: the expert VRAM budget is derived from free VRAM and the shapes
+start with different budgets (unsplit ~23.6 GiB, cross-device staged ~17.6 GiB on the card the budget reads), and
+residency changes the tier path and with it the float summation order - at DEFAULT budgets a staged run is expected
+to pick its own greedy tokens under exactly the knife-edge noise the GLM witness calibrated, and that is a
+performance characteristic, not a state-seam property.  The witness therefore pins one identical ranked expert head
+on every run (`--slots 1500`, controls included); with residency equalized the staged cross-device run matches its
+control bitwise at the first decode row (supporting probe p5.3b-dumpdiff-20261025-184223: P row bitwise, midL19 x_state
+0/20480 differ, 54/54 tokens), the only residual being sub-margin row diffs from the unsplit tier's prefetch timing.
+A default-budget bit-parity claim is NOT made.  Its staged runs use `--layer-split 20` (the only boundary this
 model's geometry and `--engram` both allow, a constant the gate keeps honest), gate that the stage really begins at
 20, and FAIL if any staged run moves the candidate column across a boundary -
 the reader's rule holding is what the witness documents.  Also unported, by decision: the layer-major prompt walk
