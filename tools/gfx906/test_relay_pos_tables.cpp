@@ -236,6 +236,80 @@ int main(int argc, char ** argv) {
 
     if (pref != 0) { std::printf("\nGATE INCONCLUSIVE: pre-fix model failed to show the defect in %d cases\n", pref); return 2; }
     if (fails != 0) { std::printf("\nGATE FAIL\n"); return 1; }
-    std::printf("\nGATE PASS: pre-fix diverges everywhere, post-fix matches unsplit everywhere.\n");
+
+    // ================= PASS 3: multi-window BYTE-OFFSET consistency (column-cycling geometry) ================
+    // The first two passes model col0 = 0 only, which is blind to the class of defect where the upload's BYTE offset
+    // and the graph view's byte offset disagree by a per-query stride.  Witness: i_widx is [SWA * NC]; build_attn
+    // reads it at byte col0 * SWA * 4 (ds41_dense.cpp, the get_rows view), and upload_pos_tables wrote at byte
+    // col0 * 4.  Identical at col0 = 0 - so every pass below the window agreed and the FIRST column-1 pass
+    // (position S) attended garbage rows.  This pass simulates the full store and the real byte arithmetic.
+    //
+    // Predicate against the real tree: the upload must carry the SWA stride AND the view must keep it.
+    bool real_offsets = true;
+    if (real) {
+        bool upload_ok = file_contains(real, "im.i_widx, widx.data(), woff * (size_t) SWA * 4");
+        bool view_ok   = file_contains(real, "col0 * SWA * 4");
+        real_offsets = upload_ok && view_ok;
+        std::printf("\n[real tree] i_widx: upload carries the SWA stride? %s; view reads at col0 * SWA * 4? %s\n",
+                    upload_ok ? "YES" : "NO", view_ok ? "YES" : "NO");
+    }
+    // Simulate NC columns x unit-window cycling for a prompt of p tokens + decodes through the first column move.
+    const int64_t NC = 2048;
+    struct Geo { int prompt; int unit; };
+    const Geo geos[] = { {14, 64}, {70, 64}, {100, 64}, {130, 64}, {63, 64}, {200, 128}, {2000, 64} };
+    int p3_cases = 0, p3_buggy = 0, p3_fixed = 0, p3_moved = 0;
+    std::printf("\n[multi-window] full-store byte model, read set vs write set per pass:\n");
+    for (Geo g : geos) {
+        for (int variant = 0; variant < 2; ++variant) {   // 0 = buggy bare-woff upload, 1 = SWA-strided upload
+            const bool strided = variant == 1;
+            // the shared table store, one int32 per window row; -1 = never written (fresh buffer)
+            std::vector<int32_t> widx_store((size_t) (SWA * NC), -1);
+            auto stage_col0 = [&](int64_t pos, int n) {
+                const int64_t s = std::max<int64_t>(1, g.unit), nwin = std::max<int64_t>(1, NC / s);
+                return std::min((pos / s) % nwin * s, std::max<int64_t>(0, NC - n));
+            };
+            bool bad = false;
+            // feed passes of `unit` through the prompt, then decode steps 1 token each up to the first column move + 2
+            std::vector<int64_t> pass_pos;
+            for (int64_t c = 0; c < g.prompt; ) { int m = (int) std::min<int64_t>(g.unit, g.prompt - c); pass_pos.push_back(c); c += m; }
+            const int64_t first_move = ((g.prompt / g.unit) + 1) * (int64_t) g.unit;
+            for (int64_t d = g.prompt; d <= std::min<int64_t>(first_move + 2, (int64_t) g.prompt + 70); ++d) pass_pos.push_back(d);
+            for (int64_t pp : pass_pos) {
+                const int n = (pp < g.prompt) ? (int) std::min<int64_t>(g.unit, g.prompt - pp) : 1;
+                const int64_t col0 = stage_col0(pp, n);
+                if (col0 != 0) p3_moved = 1;
+                // write: upload_pos_tables writes n*SWA rows at byte (strided ? col0*SWA*4 : col0*4) => elements
+                const size_t woff_el = strided ? (size_t) (col0 * SWA) : (size_t) col0;
+                const Tables t = upload_pos_tables(n, pp);
+                if (woff_el + (size_t) (n * SWA) <= widx_store.size())
+                    for (int64_t e = 0; e < n * SWA; ++e) widx_store[woff_el + (size_t) e] = t.i_widx[(size_t) e];
+                // read: build_attn's view takes the pass rows at byte col0 * SWA * 4 => element col0 * SWA
+                for (int tt = 0; tt < n && !bad; ++tt) {
+                    for (int64_t j = 0; j < SWA; ++j) {
+                        const int32_t got = widx_store[(size_t) ((col0 + tt) * SWA + j)];
+                        if (got != t.i_widx[(size_t) (tt * SWA + j)]) { bad = true; break; }
+                    }
+                }
+                if (bad) break;
+            }
+            ++p3_cases;
+            if (variant == 0 && bad) ++p3_buggy;         // the buggy offsets must diverge for geometries that move
+            if (variant == 1 && !bad) ++p3_fixed;        // the fixed offsets must never diverge
+            std::printf("  prompt=%4d unit=%3d %s : %s\n", g.prompt, g.unit, strided ? "[fixed ]"
+                        : "[buggy ]", bad ? "DIVERGES" : "clean");
+        }
+    }
+    // red-control requirements: the buggy model must fail in EVERY geometry that moves columns; the fixed one must
+    // pass every geometry; and at least one geometry must actually move a column (else this pass proves nothing).
+    if (!p3_moved) { std::printf("\nGATE INCONCLUSIVE: no geometry moved a column\n"); return 2; }
+    if (p3_fixed != p3_cases / 2) { std::printf("\nGATE FAIL: fixed-offset model diverged\n"); return 1; }
+    if (real_offsets) {
+        if (p3_buggy != p3_cases / 2) { std::printf("\nGATE INCONCLUSIVE: buggy model unexpectedly clean\n"); return 2; }
+    } else {
+        std::printf("\n[real tree] upload/view offsets NOT both confirmed in the source (pre-fix tree)\n");
+        return 1;
+    }
+
+    std::printf("\nGATE PASS: pre-fix diverges everywhere, post-fix matches unsplit everywhere, byte offsets agree across all %d multi-window geometries.\n", p3_cases / 2);
     return 0;
 }

@@ -318,6 +318,10 @@ struct Ds41Dense::Impl {
     int64_t pass_cap[3] = { 0, 0, 0 };
     // ---- the layer-major prompt batch (begin_batch): S = the dense sub-batch size, batch = B, span_cap per sub-batch
     int64_t S = 1, batch = 0, col0 = 0;
+    // P5.3b: the column this instance's LAST staged pass ran in, or -1 before its first.  When the staged walk moves
+    // to a new column (every S positions - see stage_col0), the per-column carry state at the new column has never
+    // been written; carry_forward() moves it over (see its comment).
+    int64_t last_col0 = -1;
     int batch_pos0 = 0;                             // the batch's first position
     std::vector<std::array<int64_t, 3>> span_cap;   // [sub-batch][ratio] pass_cap
     std::vector<float> host_fn, host_wts, host_logits, host_emb;
@@ -1240,6 +1244,7 @@ bool Ds41Dense::set_columns(int nc) {
     if (im.gctx) ggml_free(im.gctx);
     ggml_init_params gp = { ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(8192, false) * 400, nullptr, true };
     im.gctx = ggml_init(gp);
+    im.last_col0 = -1;   // the column tensors are reallocated below; the remembered carry column is gone with them
     return alloc_cols(im, want, im.err);
 }
 
@@ -1841,6 +1846,42 @@ bool Ds41Dense::relay_read_out(int n, void * dst, size_t dst_bytes) {
 // defined below with the span helpers; declared here so relay_write_in can set the pass's ranking span.
 static void span_pass_caps(const Ds41Dense::Impl & im, int pos0, int n, int64_t out[3]);
 
+// P5.3b: when a STAGED instance moves to a new pass column, copy the per-column CARRY state from its previous column.
+// The unsplit walk never moves columns at its column count (NC/S = 1 window), and where it does reuse a column the
+// previous pass wrote it inside the run; a staged walk cycles NC/S columns every S positions, and the graphs' reads of
+// cross-pass state - the hyper-connection machine (hap / post_f / comb_f), the routed-expert carry (shexp / o_fn /
+// o_ids / o_wts / routed) and the per-layer selection caches (L.sel / L.selm) - then land on a column NOTHING ever
+// wrote, where the unsplit walk reads the previous token's value.  Zero (or uninitialised VRAM) there is what put the
+// first column-1 pass's logits out by hundreds.  Neither relay covers this: the forward payload and relay_back_copy
+// both write x_state / pre_state / cand at the pass column and nothing else.  Those three are deliberately NOT copied
+// here: stage 0 seeds them at its own column (build_init), and every later stage receives them in the payload.
+// Every tensor listed has the column as its outer dimension (same layout relay_back_copy's copy_cols relies on), so a
+// column is one contiguous stripe at col * nb[last_dim].  A no-op unless the instance actually moved.
+static bool carry_forward(Ds41Dense::Impl & im, int64_t from, int64_t to) {
+    if (from < 0 || from >= im.NC || to < 0 || to >= im.NC || from == to) return true;
+    auto move_col = [&](ggml_tensor * t) {
+        if (!t) return;
+        const size_t cb = (size_t) t->nb[ggml_n_dims(t) - 1];
+        std::vector<uint8_t> tmp(cb);
+        ggml_backend_tensor_get(t, tmp.data(), (size_t) from * cb, cb);
+        ggml_backend_tensor_set(t, tmp.data(), (size_t) to * cb, cb);
+    };
+    ggml_backend_synchronize(im.backend);   // the previous pass's writes must be complete before they move
+    move_col(im.hap);
+    move_col(im.post_f);
+    move_col(im.comb_f);
+    move_col(im.shexp);
+    move_col(im.o_fn);
+    move_col(im.o_ids);
+    move_col(im.o_wts);
+    move_col(im.routed);
+    for (int64_t x = im.lb; x < im.le && x < (int64_t) im.ly.size(); ++x) {
+        move_col(im.ly[(size_t) x].sel);
+        move_col(im.ly[(size_t) x].selm);
+    }
+    return true;
+}
+
 bool Ds41Dense::relay_write_in(int n, const void * src, size_t src_bytes, int64_t src_pos0) {
     Impl & im = *p_;
     if (n < 1 || n > (int) im.NC) { im.err = "relay_write_in: pass size out of range"; return false; }
@@ -1867,6 +1908,10 @@ bool Ds41Dense::relay_write_in(int n, const void * src, size_t src_bytes, int64_
         return false;
     }
     const uint8_t * s = (const uint8_t *) src;
+    // P5.3b: the payload may land on a column this stage has never run in (the walk cycles every S positions).
+    // Move this instance's carry state to it FIRST - the payload then overwrites x/pre/cand at the same columns, and
+    // the graphs read carry from state the payload does not cover.
+    if (im.staged && !carry_forward(im, im.last_col0, c0)) return false;
     ggml_backend_synchronize(im.backend);   // whatever was reading this stage's state (or the producer's graphs)
     ggml_backend_tensor_set(im.x_state, s, (size_t) c0 * xs, xs * (size_t) n);
     ggml_backend_tensor_set(im.pre_state, s + xs * (size_t) n, (size_t) c0 * ps, ps * (size_t) n);
@@ -1876,6 +1921,7 @@ bool Ds41Dense::relay_write_in(int n, const void * src, size_t src_bytes, int64_
     im.pos0 = (int) src_pos0;
     im.n = n;
     im.col0 = c0;
+    im.last_col0 = c0;
     // P5.3b THE FIX: refresh THIS stage's position-derived tables for the column the payload landed in.  The state copy
     // above only moves x_state / pre_state / cand; the graphs ALSO read i_pos (RoPE), i_widx / i_wmask (the window rows
     // and their causal mask, into flash_attn_ext), i_wslot (the ring write-back) and the compressed-row maps, all of
@@ -2071,7 +2117,11 @@ bool Ds41Dense::Impl::upload_pos_tables(int n, int pos0) {
     }
     // P5.3b: a staged piece writes its own slice of the window tables (offset = the piece's column); unsplit col0 is 0.
     const size_t woff = (size_t) im.col0;
-    ggml_backend_tensor_set(im.i_widx, widx.data(), woff * 4, widx.size() * 4);
+    // i_widx is [SWA * NC]: one query's row is SWA int32s, so the byte offset of column col0's block is col0 * SWA * 4 -
+    // EXACTLY what build_attn's view reads (ggml_reshape_3d(get_rows(i_widx at col0 * SWA * 4), ...) ~ line 741).  A bare
+    // woff * 4 here hid under col0 = 0 for every pass below the window and made the first column-1 pass (position S)
+    // attend to garbage rows: layer 0 of that pass diverged while everything before it was bitwise equal.
+    ggml_backend_tensor_set(im.i_widx, widx.data(), woff * (size_t) SWA * 4, widx.size() * 4);
     ggml_backend_tensor_set(im.i_wmask, wm.data(), woff * (size_t) SWA * 4, wm.size() * 4);
     {
         const int64_t k = std::min<int64_t>(n, RAW);
@@ -2180,6 +2230,10 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
             return false;
         }
         im.col0 = im.stage_col0(pos0, n);
+        // P5.3b: a stage 0 pass at a new column needs this instance's carry state there before its layers read it
+        // (see carry_forward).  The relayed stages get the same treatment at the end of relay_write_in.
+        if (!carry_forward(im, im.last_col0, im.col0)) return false;
+        im.last_col0 = im.col0;
     }
     if (n < 1 || n > im.NC || p0 < 0 || p0 + n > im.cfg.ctx_max) { im.err = "bad pass"; return false; }
     im.pos0 = (int) p0;
