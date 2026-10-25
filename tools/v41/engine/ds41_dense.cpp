@@ -395,6 +395,16 @@ struct Ds41Dense::Impl {
     }
     bool compute(ggml_cgraph * gf, bool cached);
     bool upload_inputs(const int * tids, int n, int pos0);
+    /// P5.3b: the position-derived per-pass TABLES, without the token embeddings.  upload_inputs computes embeddings +
+    /// these; a relayed stage has no embeddings (only stage 0 owns them) but MUST still refresh the tables for its own
+    /// column window, because the graphs read them per query: i_pos feeds RoPE (build_attn), i_widx / i_wmask select and
+    /// mask the window rows (flash_attn_ext's causal mask), i_wslot is the ring write-back, i_nvis / i_cslot / i_cpos /
+    /// i_lastblk / i_sidx / i_sslot are the compressed-KV ranking maps.  relay_write_in used to copy only x_state /
+    /// pre_state / cand and leave every one of these at whatever a PRIOR pass wrote to that column (a same-backend stage
+    /// shares stage 0's buffer and silently reads stage 0's row; a cross-backend stage reads its own zeroed buffer).
+    /// Splitting the table math out lets both entry points share it verbatim, so a relayed stage's tables match an
+    /// unsplit run's for the same (pos0, col0, n) - which is exactly what makes the staged first decode token agree.
+    bool upload_pos_tables(int n, int pos0);
 };
 
 // ================================================================== weights
@@ -1307,44 +1317,33 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     // verify passes write up to k rejected draft positions; a rejected q evicts q - RAW, which a later query q' (>= the
     // last accepted position, re-fed) needs iff q - RAW >= q' - SWA + 1  ->  safe for k <= RAW - SWA = 16 drafts.
     im.RAW = im.SWA + 16;
-    // P5.3b: THE RUN MUST KEEP THE WINDOW RING WITHIN REACH OF THE NEXT QUERY, AND HERE IS WHERE REACH IS BOUNDED.
+    // P5.3b: A STAGED RUN'S FIRST DECODE TOKEN DIVERGED FROM THE UNSPLIT CONTROLS, AND IT WAS NOT A RING-REACH PROBLEM.
     //
-    // The ring is fed by the graph's write-back only: build_attn reads rows [ring RAW | this pass's n] through i_widx (a
-    // position q below the pass is q % RAW, one inside it is RAW + (q - pos0)) and i_wslot then stores back ONLY THE LAST
-    // min(n, RAW) positions of the pass.  So "what the ring holds" is a property of the sequence of pass widths the run
-    // feeds - the ring is never refilled from the prefix - and a later query whose window (the SWA positions before it)
-    // reaches further back than the ring's oldest stored row reads rows that were never written.  Those rows are not
-    // masked out: they hold ZERO (the buffer is cleared at allocation) and a zero row is a legitimate attention row, so
-    // the damage is a silently wrong attention distribution, not an assert, a NaN or a crash.
+    // The first theory (mine, 2026-10-24) was that a staged run's passes END AT UNIT BOUNDARIES, so the window ring's
+    // write-back (i_wslot stores the pass's LAST min(n, RAW) positions) leaves a reach of (m-1)+(m%SWA) rows, short of the
+    // SWA the first decode query wants.  The witness prompt refutes it: it is 14 tokens (--relay-chunk 64), so the whole
+    // prompt is ONE sub-unit pass that ENDS AT THE PROMPT'S LAST POSITION - exactly like the unsplit sequential path.  The
+    // ring holds positions 0..13 and the first decode query (pos 14) reads them through the SAME position math an unsplit
+    // run uses.  Reach was never the bug, and the fix built on that theory (a post-prompt window re-feed) was a no-op for
+    // n=14 and is reverted.
     //
-    // WHY AN UNSPLIT RUN IS ALWAYS IN REACH.  Its last prompt pass ENDS AT THE PROMPT'S LAST POSITION (both the layer-major
-    // batch and the sequential chunk path cut at min(chunk, n - c0), and n is the prompt length), so the ring holds that
-    // pass's suffix and - because the ring is indexed by POSITION, with the modulus collision evicting exactly the row the
-    // next pass rewrites - the last RAW positions of the prefix are covered by construction.  RAW - SWA = 16 rows of slack,
-    // which is DSpark's rejected-draft allowance (comment above).  Decode passes are 1 token and inherit the coverage.
+    // THE REAL BUG WAS PER-QUERY TABLES THE RELAY NEVER REFRESHED.  build_attn reads, per query column: i_pos (-> RoPE,
+    // :681), i_widx + i_wmask (-> the window rows and their causal mask, into flash_attn_ext, :721/:722/:850), i_wslot
+    // (the ring write-back), and the compressed-KV maps i_nvis / i_cslot / i_cpos / i_lastblk / i_sidx / i_sslot.  EVERY
+    // one of those was written ONLY by Impl::upload_inputs, which only stage 0 calls (it also computes token embeddings,
+    // which only stage 0 has).  Ds41Dense::relay_write_in copied x_state / pre_state / cand and set the scalar im.pos0,
+    // but left every table at whatever a PRIOR pass wrote to that column: a same-backend stage (run3/run5, --gpus 0,0 /
+    // shared weights) silently read stage 0's row for the column, and a cross-backend stage (run4, --gpus 0,1) read its
+    // OWN zeroed buffer.  For the n=14 prompt the divergence is largest on stage 1's ratio>=1 layers, where the compressed
+    // span cap grows per stage and upload_span recomputes i_widx for [cap|pass] rows - while i_wmask, which upload_span
+    // does NOT touch, kept the prefill value: the first decode token then read the WRONG window-row mask.  That fits every
+    // observation: identical prompt pass, wrong first decode read, deterministic, per-position-indexed, payload-innocent.
     //
-    // WHY A STAGED RUN WAS NEVER IN REACH.  StagedRun drives EVERY pass at exactly `unit` tokens (--relay-chunk, 64 in the
-    // witness) and, unlike the unsplit paths, its passes END AT UNIT BOUNDARIES: the tail unit is short, so the ring keeps
-    // the tail's own rows and nothing from the units before it.  Reach = (m - 1) + (m % SWA) with m = P mod unit (unit when
-    // it divides), which for unit 64 is 63 rows against the 128 the first decode query wants - a 65-row hole, and computed
-    // for EVERY prompt length (unit 128 fails half of them, unit 192 a third).  That is witness p5.3b-5/#6 exactly: every
-    // staged variant diverged from BOTH controls at TOKEN 1, deterministically and identically across processes, while a
-    // sequential UNSPLIT run with the same ids reproduced the controls byte-for-byte - the relay's arithmetic was never
-    // wrong, the successor simply started decoding over a ring its producer had never filled.
-    //
-    // THE FIX IS IN THE RUN (ds41_generate.cpp, staged_feed): after the last unit, RE-FEED the last SWA prompt tokens as
-    // one more unit through all stages, so the ring is republished with a pass that ends at the prompt's last position -
-    // making a staged run's ring state identical to an unsplit run's at the moment decode starts.  Re-feeding is sound
-    // because every position's forward pass is a function of the prefix only (causal), so recomputing positions the
-    // earlier units already computed writes the same state again; and it is the same thing the engine's own short-turn
-    // serve path does when it re-feeds a context to seed a decode.
-    //
-    // WHAT init() HAS TO DO ABOUT IT: nothing about the SIZE (RAW's job is the DSpark slack, unchanged), but the widened
-    // pass the run now feeds is wider than a narrow --relay-chunk, so the state columns and the per-pass index maps must
-    // accommodate a window-width pass on every stage.  StagedRun::unit therefore stays at most --relay-chunk for the
-    // staging, and the run caps the window re-feed by the narrowest stage's window.  Asserting the geometry here keeps a
-    // future run that forgets the re-feed from being silently wrong again: RAW must exceed SWA (the ring has to be bigger
-    // than one window) and a staged instance records that the run owes the re-feed.
+    // THE FIX is at the seam (relay_write_in), not here: it now calls Impl::upload_pos_tables, the table math factored out
+    // of upload_inputs so a relayed stage and an unsplit pass compute i_pos / i_widx / i_wmask / i_wslot and the
+    // compressed maps IDENTICALLY for the same (pos0, col0, n).  init() only has to keep the geometry honest: the ring must
+    // be wider than one window (RAW > SWA) so the position-indexed ring never drops a row the causal mask keeps visible -
+    // true by construction at SWA + 16.  No widening; the size was never the problem.
     im.cmax[1] = cfg.ctx_max; im.cmax[2] = cfg.ctx_max / 2;
     if (im.ITOP > im.cmax[2] || im.CBS <= 0 || cfg.ctx_max % 256) { err = "ctx_max must be a multiple of 256 and >= 1024"; return false; }
 
@@ -1863,6 +1862,15 @@ bool Ds41Dense::relay_write_in(int n, const void * src, size_t src_bytes, int64_
     im.pos0 = (int) src_pos0;
     im.n = n;
     im.col0 = c0;
+    // P5.3b THE FIX: refresh THIS stage's position-derived tables for the column the payload landed in.  The state copy
+    // above only moves x_state / pre_state / cand; the graphs ALSO read i_pos (RoPE), i_widx / i_wmask (the window rows
+    // and their causal mask, into flash_attn_ext), i_wslot (the ring write-back) and the compressed-row maps, all of
+    // which upload_inputs writes and relay used NOT to.  Left stale, a same-backend stage reads the row a PRIOR stage 0
+    // pass wrote to this column and a cross-backend stage reads its own zeroed buffer - both silently wrong on the first
+    // decode token (the n=14 witness: prompt = one sub-unit pass that ends at the last position, so the ring REACH is
+    // fine; what differed was these tables).  upload_pos_tables computes them from (pos0, col0, n) exactly as an unsplit
+    // pass does, so the two agree for the same geometry.
+    if (!im.upload_pos_tables(n, (int) src_pos0)) return false;
     // the pass's ranking span, by this stage's rule (span_pass_caps subtracts the rows below its range)
     span_pass_caps(im, (int) src_pos0, n, im.pass_cap);
     return true;
@@ -1941,22 +1949,12 @@ static bool engram_ready(Ds41Dense::Impl & im) {
 
 // Per-token inputs of n tokens at positions pos0.. (embeddings, positions, the window / compressed / indexer index
 // maps, the Engram rows and the per-pass ring slots).  Shared by begin() and begin_batch().
-bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
+bool Ds41Dense::Impl::upload_pos_tables(int n, int pos0) {
     Impl & im = *this;
     im.span_memo_pos0 = -1;   // this writes i_widx / i_wslot / i_sidx / i_sslot: upload_span's memo is stale
     // P5.3b: a staged pass writes the tables of its own column window; it must not run past the allocation.
     if (col0 + n > NC) { err = "internal: a staged pass runs past the state columns"; return false; }
-    const int64_t D = im.D, SWA = im.SWA, RAW = im.RAW;
-    // embeddings (F16 rows on the mmap)
-    im.host_emb.resize((size_t) (D * n));
-    for (int t = 0; t < n; ++t) {
-        if (tids[t] < 0 || tids[t] >= im.g.vocab) { im.err = "token id out of range"; return false; }
-        const uint16_t * row = reinterpret_cast<const uint16_t *>(im.embd) + (size_t) tids[t] * (size_t) D;
-        for (int64_t i = 0; i < D; ++i) im.host_emb[(size_t) (t * D + i)] = ggml_fp16_to_fp32(row[i]);
-    }
-    // P5.3b: the same column offset for the embeddings and the positions (only stage 0 has embeddings at all, and a
-    // staged piece of it lives at col0, so build_init's b.cols2(..., col0) must read the same slice).
-    ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), (size_t) im.col0 * (size_t) D * 4, im.host_emb.size() * 4);
+    const int64_t SWA = im.SWA, RAW = im.RAW;
     std::vector<int32_t> pos(n);
     for (int t = 0; t < n; ++t) pos[t] = pos0 + t;
     ggml_backend_tensor_set(im.i_pos, pos.data(), (size_t) im.col0 * 4, (size_t) n * 4);
@@ -2019,6 +2017,25 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
         ggml_backend_tensor_set(im.i_sidx, si.data(), woff * 2 * 4, si.size() * 4);
         ggml_backend_tensor_set(im.i_sslot, ss.data(), 0, ss.size() * 4);
     }
+    return true;
+}
+
+bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
+    Impl & im = *this;
+    const int64_t D = im.D;
+    // embeddings (F16 rows on the mmap)
+    im.host_emb.resize((size_t) (D * n));
+    for (int t = 0; t < n; ++t) {
+        if (tids[t] < 0 || tids[t] >= im.g.vocab) { im.err = "token id out of range"; return false; }
+        const uint16_t * row = reinterpret_cast<const uint16_t *>(im.embd) + (size_t) tids[t] * (size_t) D;
+        for (int64_t i = 0; i < D; ++i) im.host_emb[(size_t) (t * D + i)] = ggml_fp16_to_fp32(row[i]);
+    }
+    // P5.3b: the same column offset for the embeddings and the positions (only stage 0 has embeddings at all, and a
+    // staged piece of it lives at col0, so build_init's b.cols2(..., col0) must read the same slice).
+    ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), (size_t) im.col0 * (size_t) D * 4, im.host_emb.size() * 4);
+    // The position-derived tables (i_pos, the window ring maps and mask, the compressed-row maps).  Shared verbatim
+    // with relay_write_in so a relayed stage and an unsplit pass disagree about NONE of them.
+    if (!im.upload_pos_tables(n, pos0)) return false;
     // Engram rows: hash the whole pass now and START the (dedup/sort/coalesce) reads; they are waited - and the rows
     // moved to the state tensor - by the first Engram layer's span (engram_ready), so the disk read overlaps the
     // embeddings upload, the init graph and the layers below it.  A tiny batch (decode) still runs on the caller.
