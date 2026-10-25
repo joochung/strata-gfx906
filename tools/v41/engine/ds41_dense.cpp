@@ -1307,6 +1307,44 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     // verify passes write up to k rejected draft positions; a rejected q evicts q - RAW, which a later query q' (>= the
     // last accepted position, re-fed) needs iff q - RAW >= q' - SWA + 1  ->  safe for k <= RAW - SWA = 16 drafts.
     im.RAW = im.SWA + 16;
+    // P5.3b: THE RUN MUST KEEP THE WINDOW RING WITHIN REACH OF THE NEXT QUERY, AND HERE IS WHERE REACH IS BOUNDED.
+    //
+    // The ring is fed by the graph's write-back only: build_attn reads rows [ring RAW | this pass's n] through i_widx (a
+    // position q below the pass is q % RAW, one inside it is RAW + (q - pos0)) and i_wslot then stores back ONLY THE LAST
+    // min(n, RAW) positions of the pass.  So "what the ring holds" is a property of the sequence of pass widths the run
+    // feeds - the ring is never refilled from the prefix - and a later query whose window (the SWA positions before it)
+    // reaches further back than the ring's oldest stored row reads rows that were never written.  Those rows are not
+    // masked out: they hold ZERO (the buffer is cleared at allocation) and a zero row is a legitimate attention row, so
+    // the damage is a silently wrong attention distribution, not an assert, a NaN or a crash.
+    //
+    // WHY AN UNSPLIT RUN IS ALWAYS IN REACH.  Its last prompt pass ENDS AT THE PROMPT'S LAST POSITION (both the layer-major
+    // batch and the sequential chunk path cut at min(chunk, n - c0), and n is the prompt length), so the ring holds that
+    // pass's suffix and - because the ring is indexed by POSITION, with the modulus collision evicting exactly the row the
+    // next pass rewrites - the last RAW positions of the prefix are covered by construction.  RAW - SWA = 16 rows of slack,
+    // which is DSpark's rejected-draft allowance (comment above).  Decode passes are 1 token and inherit the coverage.
+    //
+    // WHY A STAGED RUN WAS NEVER IN REACH.  StagedRun drives EVERY pass at exactly `unit` tokens (--relay-chunk, 64 in the
+    // witness) and, unlike the unsplit paths, its passes END AT UNIT BOUNDARIES: the tail unit is short, so the ring keeps
+    // the tail's own rows and nothing from the units before it.  Reach = (m - 1) + (m % SWA) with m = P mod unit (unit when
+    // it divides), which for unit 64 is 63 rows against the 128 the first decode query wants - a 65-row hole, and computed
+    // for EVERY prompt length (unit 128 fails half of them, unit 192 a third).  That is witness p5.3b-5/#6 exactly: every
+    // staged variant diverged from BOTH controls at TOKEN 1, deterministically and identically across processes, while a
+    // sequential UNSPLIT run with the same ids reproduced the controls byte-for-byte - the relay's arithmetic was never
+    // wrong, the successor simply started decoding over a ring its producer had never filled.
+    //
+    // THE FIX IS IN THE RUN (ds41_generate.cpp, staged_feed): after the last unit, RE-FEED the last SWA prompt tokens as
+    // one more unit through all stages, so the ring is republished with a pass that ends at the prompt's last position -
+    // making a staged run's ring state identical to an unsplit run's at the moment decode starts.  Re-feeding is sound
+    // because every position's forward pass is a function of the prefix only (causal), so recomputing positions the
+    // earlier units already computed writes the same state again; and it is the same thing the engine's own short-turn
+    // serve path does when it re-feeds a context to seed a decode.
+    //
+    // WHAT init() HAS TO DO ABOUT IT: nothing about the SIZE (RAW's job is the DSpark slack, unchanged), but the widened
+    // pass the run now feeds is wider than a narrow --relay-chunk, so the state columns and the per-pass index maps must
+    // accommodate a window-width pass on every stage.  StagedRun::unit therefore stays at most --relay-chunk for the
+    // staging, and the run caps the window re-feed by the narrowest stage's window.  Asserting the geometry here keeps a
+    // future run that forgets the re-feed from being silently wrong again: RAW must exceed SWA (the ring has to be bigger
+    // than one window) and a staged instance records that the run owes the re-feed.
     im.cmax[1] = cfg.ctx_max; im.cmax[2] = cfg.ctx_max / 2;
     if (im.ITOP > im.cmax[2] || im.CBS <= 0 || cfg.ctx_max % 256) { err = "ctx_max must be a multiple of 256 and >= 1024"; return false; }
 

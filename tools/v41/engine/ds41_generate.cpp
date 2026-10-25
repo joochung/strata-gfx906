@@ -1273,6 +1273,66 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
             c0 += m;
             progress(c0);
         }
+        // P5.3b: THE WINDOW RE-FEED.  The ring of window-K rows a decode query reads is fed ONLY by a pass's own
+        // write-back, which stores the pass's LAST min(n, RAW) positions (ds41_dense.cpp, i_wslot / im.RAW).  A staged
+        // run's passes end at UNIT boundaries, not at the prompt's last position, so after the loop above the ring holds
+        // the tail unit's rows and nothing older: a reach of (m - 1) + (m % SWA) rows, 63 for the witness's 64-token unit
+        // against the 128 the first decode query needs.  The missing rows are ZERO (cleared at allocation), and a zero row
+        // is a valid attention row - which is why every staged run of witnesses p5.3b-5/#6 produced a wrong token 1 with no
+        // assert anywhere, identically across processes (the hole is arithmetic, not a race), while a sequential unsplit
+        // run - whose last pass ENDS at the prompt's last position - reproduced the controls exactly.
+        //
+        // So re-feed the last window's worth of prompt tokens as one more pass through every stage, ending at the prompt's
+        // last position.  That republishes those rows into the ring and leaves a staged run's ring state IDENTICAL to an
+        // unsplit run's at the moment decode starts.  Re-feeding is sound because a forward pass over positions [a, P] is a
+        // function of those positions alone (causal, and the rings are position-indexed), so the recomputed rows are the
+        // same rows; the state columns it lands in are the ones that pass's own window, and the next decode pass runs in a
+        // different window, so nothing live is clobbered.  It costs SWA tokens of dense work once per prompt.
+        //
+        // Sizing: the re-feed is a pass like any other, so it must fit the narrowest stage's window (staged_pass refuses a
+        // pass over sr.pcap).  A pass of `rf` tokens writes min(rf, RAW) ring rows, so rf >= SWA is enough ONLY when
+        // RAW >= SWA; the ring is RAW = SWA + 16 (ds41_dense.cpp), so a SWA-wide pass is exactly wide enough.  If the
+        // stage window is narrower than a window, no single pass can republish the ring and the hole cannot be closed this
+        // way - say so loudly (naming the real floor, the window) instead of repeating the silent divergence, because at
+        // that --relay-chunk a staged run cannot decode correctly after any prompt.
+        const int64_t SWA = G.n_swa;
+        if (n > 0 && SWA > 0) {
+            const int64_t want = std::min<int64_t>(SWA, n);          // the window the next query reads back
+            if (want > sr.unit) {
+                std::fprintf(stderr, "ds41_generate: staged run: the stage pass window (--relay-chunk %d) is narrower than "
+                                     "the model's %lld-token sliding window, so no single pass can republish the window "
+                                     "ring the first decode token reads; the decode after a prompt will diverge from an "
+                                     "unsplit run.  Raise --relay-chunk to at least %lld.\n",
+                             sr.unit, (long long) SWA, (long long) SWA);
+            } else {
+                // Re-feed whenever the LAST pass was shorter than the window: a pass of tail tokens leaves the ring a
+                // reach of (tail - 1) + (tail % SWA) = tail - 1 rows (tail < SWA), which is short unless the prompt is
+                // itself shorter than a window and every needed position was inside that same pass.
+                const int tail = (int) (((n - 1) % sr.unit) + 1);   // the last pass's width
+                if (tail < SWA && tail < n) {
+                    // Re-feed the widest pass the window and the prompt allow, UP TO THE STAGE WINDOW: a short tail pass
+                    // leaves the ring tail - 1 rows deep, and only a pass ending at the prompt's last position with min(n,
+                    // RAW) >= SWA rows puts the reach back to a full window.  Taking the FULL window (want = SWA), not the
+                    // minimum needed to cover the gap, is deliberate: it makes a staged run's ring contents byte-identical
+                    // to an unsplit run's at decode start, which is what the witness diff needs to prove the fix.
+                    const int rf = (int) want;
+                    const int rc0 = (int) (n - rf);                 // token offset of the re-feed
+                    const auto rf_stage = [&](int s, int nn, int p) -> bool {
+                        return staged_run_stage(s, nn, ids + rc0, p);
+                    };
+                    sr.pos_of = pos0 + rc0;
+                    // The head is not wanted here (the answer the run keeps is the one the loop above took, and the
+                    // re-feed's last row is the same position, so it would be the same logits anyway).  The relay's shape
+                    // calls for a finish_head on the last stage regardless, so this one is a no-op that returns true.
+                    const auto rf_head = [](int) -> bool { return true; };
+                    std::string rerr;
+                    if (!staged_pass(sr, rf, pos0 + rc0, rf_stage, rf_head, rerr)) {
+                        ferr = rerr.empty() ? "staged window re-feed failed" : rerr;
+                        return false;
+                    }
+                }
+            }
+        }
         tier.release_chunk();   // the unsplit feed's lifecycle, mirrored: the chunk scratch goes back after a prompt
         return true;
     };
