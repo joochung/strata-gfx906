@@ -53,6 +53,7 @@ for src in tools/v41/engine/ds41_dense.cpp tools/v41/engine/ds41_generate.cpp to
 done
 # the step-dump instrument must be IN the binary (this probe measures nothing without it)
 strings "$GEN" | grep -q "STRATA_DUMP_STEPS" || { echo "FATAL: $GEN predates the STRATA_DUMP_STEPS instrument"; exit 3; }
+strings "$GEN" | grep -q "STRATA_DUMP_STATE" || { echo "FATAL: $GEN predates the STRATA_DUMP_STATE instrument"; exit 3; }
 # host gates green before the GPU is touched (seconds)
 bash tools/gfx906/gate-relay-pos-tables.sh >/dev/null 2>&1 || { echo "FATAL: gate-relay-pos-tables FAILs"; exit 3; }
 bash tools/gfx906/gate-device-split.sh    >/dev/null 2>&1 || { echo "FATAL: gate-device-split FAILs"; exit 3; }
@@ -90,7 +91,8 @@ run_one() {   # run_one <name> <extra args...>
     local name=$1; shift
     echo "=== $name start $(date +%T) ==="
     mkdir -p "$OUT.$name"
-    STRATA_DUMP_STEPS="$OUT.$name/step" "${ENG[@]}" "${ARGS[@]}" --dump-last "$OUT.$name.P.bin" "$@" \
+    STRATA_DUMP_STEPS="$OUT.$name/step" STRATA_DUMP_STATE="$OUT.$name/state" STRATA_DUMP_RELAY="$OUT.$name/relay" \
+        "${ENG[@]}" "${ARGS[@]}" --dump-last "$OUT.$name.P.bin" "$@" \
         >"$OUT.$name.toks" 2>"$OUT.$name.log"
     local rc=$?
     echo "--- $name rc=$rc, $(wc -l < "$OUT.$name.toks") token ids, $(ls "$OUT.$name"/step.step*.bin 2>/dev/null | wc -l) step dumps"
@@ -181,6 +183,58 @@ else:
         print("  MIXED - read the per-threshold counts above; a whole-row shift is the payload, a few entries are float order.")
 EOF
 rc=$?
+
+# ---- the state-column comparison (STRATA_DUMP_STATE) ------------------------------
+# The relay carries EXACTLY x_state + pre_state (+ cand when the geometry crosses it), and the P row proved the
+# PREFILL output bitwise right.  So the decisive comparison is the state AFTER the passes: the unsplit instance's
+# columns and the staged consumer's (s1) columns describe the same quantity (all 40 layers' output for those
+# positions); if they are equal at "pre" but the step001 row is wrong, the bug is in what the decode pass EXECUTES
+# given identical state, not in what it was handed.  s0 is the producer's mid-depth state - no unsplit reference
+# exists for it (unsplit overwrites layers 0-19's output within the same pass), so it is reported for scale and for
+# NaN/zero triage of stage 0's decode-pass output.  Payload files (STRATA_DUMP_RELAY) are the same bytes s0 shows
+# after a pass, at the boundary itself.
+$PY - "$OUT" <<'EOF'
+import os, sys, glob
+import numpy as np
+out = sys.argv[1]
+XS, PS = 81920, 16   # D*HC*4 and HC*4 bytes per token column (V41-GSQ: 5120 * 4 * 4)
+def stfile(side, tag, who):
+    p = f"{out}.{side}/state.st.{tag}.{who}.bin"
+    return np.fromfile(p, dtype=np.uint8) if os.path.exists(p) else None
+def report(tag, a, b, la, lb):
+    if a is None or b is None:
+        print(f"  {tag}: missing dump ({la if a is None else ''}{lb if b is None else ''})")
+        return None
+    n = min(len(a), len(b))
+    neq = int((a[:n] != b[:n]).sum())
+    af, bf = a[:n].view(np.float32), b[:n].view(np.float32)
+    m = np.abs(af.astype(np.float64) - bf.astype(np.float64))
+    first = int(np.argmax(a[:n] != b[:n])) if neq else -1
+    col = first // XS if first >= 0 else -1
+    print(f"  {tag} vs {la}: {n} B, {neq} differing bytes ({100.0*neq/n:.3f}%), max float diff {m.max():.3e}"
+          + (f", first at byte {first} = column {col}" if first >= 0 else ""))
+    return neq
+print("== STATE COLUMNS (x_state then pre_state, columns 0..ncols-1 of the last pass's window) ==")
+for tag in ("pre", "step001"):
+    full = stfile("ctrl", tag, "full")
+    s1 = stfile("staged", tag, "s1")
+    s0 = stfile("staged", tag, "s0")
+    r1 = report(tag, full, s1, "ctrl-full", "staged-s1")
+    report(tag, full, s0, "ctrl-full", "staged-s0 (mid-depth, scale only)")
+    if r1 is not None and tag == "pre":
+        print(f"  -> prefill state columns {'IDENTICAL' if r1 == 0 else 'DIVERGE'}: "
+              + ("the relayed set is right; the decode pass itself is what differs" if r1 == 0
+                 else "the consumer's state after PREFILL already differs from the control's"))
+print("== RELAY PAYLOADS (staged; boundary = stage 0's decode-pass output) ==")
+for p in sorted(glob.glob(f"{out}.staged/relay.bnd*.bin")):
+    a = np.fromfile(p, dtype=np.float32)
+    xs_n = min(len(a), XS // 4 * (1 if ".n1." in p else 14))
+    x = a[: len(a) - (len(a) % 1)]
+    print(f"  {os.path.basename(p)}: {len(a)*4} B, NaN {int(np.isnan(x).sum())}, "
+          f"zeros {int((x == 0).sum())}/{len(x)}, absmax {np.abs(x[np.isfinite(x)]).max() if np.isfinite(x).any() else float('nan'):.3f}")
+EOF
+rc2=$?
+[ $rc2 -eq 0 ] || rc=$rc2
 echo
 echo "probe-p5.3b-dumpdiff: artifacts in $OUT.* (logs, token ids, row dumps)"
 exit $rc

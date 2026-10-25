@@ -472,6 +472,18 @@ static bool staged_pass(StagedRun & sr, int n, int pos0,
         const bool okc = sr.stage[(size_t) s]->relay_read_out(n, slot, slot_bytes);
         sr.ms_relay += now_ms() - tr;
         if (!okc) { e = "stage " + std::to_string(s) + ": " + sr.stage[(size_t) s]->last_error(); return false; }
+        // STRATA_DUMP_RELAY=PREFIX (opt-in, default off): write every boundary payload, named by boundary index, pass
+        // size and feeding position, so a probe can see WHAT the consumer was handed at each pass - the only witness
+        // of stage 0's decode-pass output, which the unsplit path never exposes (its layers 0-19 output is overwritten
+        // by layers 20-39 inside the same pass).  The bytes are read from the PRODUCER's state at the columns its last
+        // pass ran in (relay_read_out: staged col0, unsplit byte 0), so this dump is also a per-pass state-column dump
+        // of the producer.
+        if (const char * br = std::getenv("STRATA_DUMP_RELAY")) {
+            char nb[512];
+            std::snprintf(nb, sizeof nb, "%s.bnd%03d.n%d.p%d.bin", br, (int) sr.n_boundary, n, (int) sr.pos_of);
+            std::ofstream rf(nb, std::ios::binary);
+            rf.write((const char *) slot, (std::streamsize) (sr.slab * (size_t) n));
+        }
         sr.n_boundary++;
         sr.bytes_relayed += sr.slab * (size_t) n;
         return true;
@@ -501,6 +513,34 @@ static bool staged_pass(StagedRun & sr, int n, int pos0,
 }
 
 }  // namespace
+
+// STRATA_DUMP_STATE=PREFIX (opt-in, default off): dump one instance's state COLUMNS through the relay seam -
+// x_state / pre_state (+ cand when the geometry carries it) for the first ncols columns at the column the instance
+// ran its last pass in (relay_read_out: staged col0 = the pass window, unsplit byte 0; the witness's positions 0..22
+// all live in window 0, so both sides dump columns 0..143 = the ring's reach, RAW = SWA + 16 = 144, for the V41-GSQ
+// geometry).  The P5.3b question this answers: the relay carries EXACTLY x_state + pre_state (+ cand) and nothing
+// else, hap / post_f / comb_f / shexp / o_fn are written and read INSIDE one pass (ds41_dense.cpp:936-938 wrote,
+// :1069 finish reads), so if a staged consumer's columns after a pass differ from the unsplit instance's columns
+// after the same pass, the divergence is NOT in the relayed set - it is in what the pass EXECUTES differently given
+// identical inputs (graphs, spans, ranking maps).  If they are equal, the relayed set itself is wrong.  ncols
+// halves down if the instance has fewer columns than asked.
+static void dump_state_cols(Ds41Dense & d, const char * prefix, const char * tag, const char * who) {
+    const size_t slab = d.relay_slab_bytes();
+    if (!slab) return;
+    int ncols = 144;
+    std::vector<uint8_t> buf;
+    bool ok = false;
+    while (ncols >= 1 && !ok) {
+        buf.assign(slab * (size_t) ncols, 0);
+        ok = d.relay_read_out(ncols, buf.data(), buf.size());
+        if (!ok) ncols /= 2;
+    }
+    if (!ok) return;
+    char nb[512];
+    std::snprintf(nb, sizeof nb, "%s.st.%s.%s.bin", prefix, tag, who);
+    std::ofstream fs(nb, std::ios::binary);
+    fs.write((const char *) buf.data(), (std::streamsize) buf.size());
+}
 
 int main(int argc, char ** argv) {
     if (!std::getenv("DS41_GGML_DEBUG"))
@@ -2694,6 +2734,18 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
         }
     }
 #endif
+    // STRATA_DUMP_STATE: the state columns as the decode loop BEGINS = after the prefill pass(es).  Tag "pre".
+    if (const char * bs = std::getenv("STRATA_DUMP_STATE")) {
+        if (staged) {
+            for (size_t si = 0; si < sr.stage.size(); ++si) {
+                char who[32];
+                std::snprintf(who, sizeof who, "s%zu", si);
+                dump_state_cols(*sr.stage[si], bs, "pre", who);
+            }
+        } else {
+            dump_state_cols(dense, bs, "pre", "full");
+        }
+    }
     for (; !spec && gen < a.n_predict; ++gen) {
         int tok = sample_p(lg.data(), nv, a.temp, 0, 1.0f, 0.0f, rng);
         if (gen < (int) forced.size()) {
@@ -2727,6 +2779,21 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
             // lg just read is the row that WILL produce emitted token gen+1 (token 0's row is --dump-last's P row)
             std::ofstream fs(nb, std::ios::binary);
             fs.write((const char *) lg.data(), (std::streamsize) (lg.size() * 4));
+        }
+        // STRATA_DUMP_STATE: the state columns after THIS decode pass (same index as the step logits file above:
+        // both describe the pass that will produce emitted token gen+1).
+        if (const char * bs = std::getenv("STRATA_DUMP_STATE")) {
+            char tag[32];
+            std::snprintf(tag, sizeof tag, "step%03d", gen + 1);
+            if (staged) {
+                for (size_t si = 0; si < sr.stage.size(); ++si) {
+                    char who[32];
+                    std::snprintf(who, sizeof who, "s%zu", si);
+                    dump_state_cols(*sr.stage[si], bs, tag, who);
+                }
+            } else {
+                dump_state_cols(dense, bs, tag, "full");
+            }
         }
         ++pos;
     }
