@@ -1922,6 +1922,40 @@ bool Ds41Dense::relay_back_copy(Ds41Dense * dst, int n) {
     ggml_backend_tensor_set(od.pre_state, b + xs * (size_t) n, (size_t) d0 * ps, ps * (size_t) n);
     if (cs_src && cs_dst)
         ggml_backend_tensor_set(od.cand, b + (xs + ps) * (size_t) n, (size_t) d0 * cs_dst, cs_dst * (size_t) n);
+
+    // P5.3b: x/pre/cand are NOT the whole end-of-pass state.  A graph dump of the first decode pass, staged vs
+    // unsplit, showed layer 0's graph reading per-column state that the UNSPLIT run had taken from the PREVIOUS pass's
+    // LAST layer: the hyper-connection machine (comb_f / post_f / o_fn), the routed-expert carry (hap / shexp /
+    // routed / o_ids / o_wts), and the index-selection caches (L.sel / L.selm) of the index-source layers.  Every one
+    // of those is per-column state that EVERY layer overwrites and layer 0 reads at pass start; in a staged run the
+    // last writer was a layer of THIS instance's last stage, so the first stage must be given the last stage's copy
+    // or its next pass starts from values that are one stage behind (or, for a source layer it never ran, never
+    // written: the dumped sel entries were uninitialised VRAM, 1050606398 as an "index").  This is what makes the
+    // unsplit single-instance walk self-consistent, and this copy is what reproduces it across stages.
+    //
+    // Every tensor here is laid out with the column as the outer (contiguous-block) dimension, so a pass's columns
+    // are one stripe at col * nb[last_dim].
+    auto copy_cols = [&](ggml_tensor * st, ggml_tensor * dt) {
+        if (!st || !dt) return;
+        const size_t scb = (size_t) st->nb[ggml_n_dims(st) - 1], dcb = (size_t) dt->nb[ggml_n_dims(dt) - 1];
+        std::vector<uint8_t> t(scb * (size_t) n);
+        ggml_backend_tensor_get(st, t.data(), (size_t) c0 * scb, scb * (size_t) n);
+        ggml_backend_tensor_set(dt, t.data(), (size_t) d0 * dcb, dcb * (size_t) n);
+    };
+    copy_cols(im.hap, od.hap);
+    copy_cols(im.post_f, od.post_f);
+    copy_cols(im.comb_f, od.comb_f);
+    copy_cols(im.shexp, od.shexp);
+    copy_cols(im.o_fn, od.o_fn);
+    copy_cols(im.o_ids, od.o_ids);
+    copy_cols(im.o_wts, od.o_wts);
+    copy_cols(im.routed, od.routed);
+    // Selection caches: the layers THIS stage ran wrote their sel/selm this pass; the first stage's readers (a layer
+    // below the boundary whose index source is above it) need those, and only those, refreshed.
+    for (int64_t x = im.lb; x < im.le && x < (int64_t) od.ly.size() && x < (int64_t) im.ly.size(); ++x) {
+        copy_cols(im.ly[(size_t) x].sel, od.ly[(size_t) x].sel);
+        copy_cols(im.ly[(size_t) x].selm, od.ly[(size_t) x].selm);
+    }
     return true;
 }
 
@@ -2370,9 +2404,11 @@ void dump_graph_once(const Ds41Dense::Impl & im, ggml_cgraph * gf, const char * 
             std::vector<uint8_t> bytes(take);
             ggml_backend_synchronize(im.backend);
             ggml_backend_tensor_get(const_cast<ggml_tensor *>(src), bytes.data(), 0, take);
+            char safe[256];
+            std::snprintf(safe, sizeof safe, "%s", src->name);
+            for (char * p = safe; *p; ++p) if (*p == '/' || *p == ' ' || *p == '(') *p = '_';
             char db[560];
-            std::snprintf(db, sizeof db, "%s.data.%s.bin", nb, src->name);
-            for (char * p = db; *p; ++p) if (*p == '/' || *p == ' ' || *p == '(') *p = '_';
+            std::snprintf(db, sizeof db, "%s.data.%s.bin", nb, safe);   // sanitize the NAME only - nb is a path
             std::ofstream df(db, std::ios::binary);
             df.write((const char *) bytes.data(), (std::streamsize) take);
         }
