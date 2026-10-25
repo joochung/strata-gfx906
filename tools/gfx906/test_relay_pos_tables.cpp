@@ -189,9 +189,10 @@ int main(int argc, char ** argv) {
     bool real_fixed = true;
     if (real) {
         // THE PREDICATE, matched against the ACTUAL tree: does relay_write_in refresh this stage's position tables?
-        // The call's signature grew an `overlap` argument since the fix first landed, so match the seam and the writer
-        // by their stable prefixes rather than by a literal call site.
-        real_fixed = file_contains(real, "im.upload_pos_tables((int) n, (int) src_pos0") &&
+        // Two signatures have existed for the seam call (bb4c6871: upload_pos_tables(n, (int) src_pos0); the ring-carry
+        // experiment: ((int) n, (int) src_pos0)), so match the SHORTEST form both share.  A pre-fix tree does not
+        // contain either needle at all - the function itself is the fix - so fail-before is unaffected.
+        real_fixed = file_contains(real, "im.upload_pos_tables(") &&
                      file_contains(real, "Ds41Dense::Impl::upload_pos_tables");
         std::printf("\n[real tree] %s : relay_write_in refreshes the tables? %s\n", real,
                     real_fixed ? "YES" : "NO (pre-fix: relay does not call upload_pos_tables)");
