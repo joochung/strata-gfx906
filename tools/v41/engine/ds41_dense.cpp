@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <fstream>
+#include <set>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -2326,6 +2328,36 @@ const int32_t * Ds41Dense::batch_ids() const { return p_->host_ids.data(); }
 const float * Ds41Dense::batch_wts() const { return p_->host_wts.data(); }
 const float * Ds41Dense::batch_fn() const { return p_->host_fn.data(); }
 
+
+namespace {
+std::set<std::string> g_graph_dumped;   // one dump per (path, stage range, tag) - the flag is GLOBAL because
+                                        // the graph is CACHED: the second submission would print the same object
+void dump_graph_once(const Ds41Dense::Impl & im, ggml_cgraph * gf, const char * tag) {
+    const char * path = std::getenv("STRATA_DUMP_GRAPHS");
+    if (!path) return;
+    char keybuf[256];
+    std::snprintf(keybuf, sizeof keybuf, "%s|%d|%d|%s", path, (int) im.lb, (int) im.le, tag);
+    if (!g_graph_dumped.insert(keybuf).second) return;
+    char nb[512];
+    std::snprintf(nb, sizeof nb, "%s.%s.%s.%d", path, im.staged ? "staged" : "flat", tag, (int) im.lb);
+    std::ofstream fs(nb);
+    fs << "# nodes=" << ggml_graph_n_nodes(gf) << " lb=" << im.lb << " le=" << im.le << " col0=" << im.col0
+       << " pos0=" << im.pos0 << " n=" << im.n << " NC=" << im.NC << " S=" << im.S << "\n";
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * t = ggml_graph_node(gf, i);
+        fs << i << " " << ggml_op_name(t->op) << " name=" << t->name << " ne=[";
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) fs << t->ne[d] << (d < 3 ? "," : "");
+        fs << "] nb=[";
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) fs << t->nb[d] << (d < 3 ? "," : "");
+        fs << "] srcs=";
+        for (int j = 0; j < GGML_MAX_SRC; ++j)
+            if (t->src[j]) fs << t->src[j]->name << "[" << (const void *) t->src[j]->data << "|ne"
+                              << t->src[j]->ne[0] << "," << t->src[j]->ne[1] << "," << t->src[j]->nb[1] << "] ";
+        fs << "\n";
+    }
+}
+}  // namespace
+
 bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_host, ggml_tensor ** fn_dev) {
     Impl & im = *p_;
     if (!im.owns_layer(il)) { im.err = "attn_router: layer " + std::to_string(il) + " is not this stage's [" + std::to_string(im.lb) + "," + std::to_string(im.le) + ")"; return false; }
@@ -2352,6 +2384,12 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     const bool ok = im.compute(gf, cached);
     if (gc) ggml_free(gc);
     if (!ok) return false;
+    // STRATA_DUMP_GRAPHS=FILE (opt-in, one line per node, first time only per (il, cached)): the graph as it is
+    // ABOUT to execute, with every source tensor's name, dims, strides and data address.  The witness's layer 0 has
+    // bitwise-equal dumped state and Engram rows yet produces a different router fn - so either the two shapes'
+    // graphs differ in STRUCTURE (baked column, an inserted wait, a different src tensor), or something they read
+    // is still not dumped.  This settles which.
+    if (cached && il == 0) dump_graph_once(im, gf, "L00");
     // one sync for the three readbacks (was one per tensor_get: 3 x 40 stream syncs per decode token)
     ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data(), 0, (size_t) (im.D * n) * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data(), 0, (size_t) (im.NU * n) * 4);

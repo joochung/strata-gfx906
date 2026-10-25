@@ -91,7 +91,7 @@ run_one() {   # run_one <name> <extra args...>
     local name=$1; shift
     echo "=== $name start $(date +%T) ==="
     mkdir -p "$OUT.$name"
-    STRATA_DUMP_STEPS="$OUT.$name/step" STRATA_DUMP_STATE="$OUT.$name/state" STRATA_DUMP_RELAY="$OUT.$name/relay" STRATA_DUMP_STATE_EACH_LAYER="$OUT.$name/state2" \
+    STRATA_DUMP_STEPS="$OUT.$name/step" STRATA_DUMP_STATE="$OUT.$name/state" STRATA_DUMP_RELAY="$OUT.$name/relay" STRATA_DUMP_STATE_EACH_LAYER="$OUT.$name/state2" STRATA_DUMP_GRAPHS="$OUT.$name/graphs" \
         "${ENG[@]}" "${ARGS[@]}" --dump-last "$OUT.$name.P.bin" "$@" \
         >"$OUT.$name.toks" 2>"$OUT.$name.log"
     local rc=$?
