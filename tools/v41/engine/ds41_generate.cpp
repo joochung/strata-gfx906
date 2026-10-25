@@ -2713,6 +2713,21 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
             std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str());
             return 1;
         }
+        // STRATA_DUMP_STEPS=DIR (opt-in, default off - the file exists only when the variable is set, so the default
+        // path is untouched): write EVERY decode step's full-vocab logits, so a staged run and an unsplit control can
+        // be compared row by row inside the decode chain, not just at its end (P5.3b: witness #7 is right at token 1 -
+        // the prefill row - and wrong at token 2 - the FIRST decode row at position n_prompt; a tokens file cannot say
+        // whether that row differs by 1e-6 (float order, knife edge, the calibrated bar) or by 1e-1 (the state itself
+        // differs, a real seam bug), and the whole debug turns on that magnitude).  File <DIR>.step%03d.bin holds the
+        // logits that produced the generated token of that index (float32, n_vocab).  Works identically staged and
+        // unsplit: this line runs after step() on whichever path the run took.
+        if (const char * ds = std::getenv("STRATA_DUMP_STEPS")) {
+            char nb[512];
+            std::snprintf(nb, sizeof nb, "%s.step%03d.bin", ds, gen + 1);   // the loop is at ++gen at its bottom: the
+            // lg just read is the row that WILL produce emitted token gen+1 (token 0's row is --dump-last's P row)
+            std::ofstream fs(nb, std::ios::binary);
+            fs.write((const char *) lg.data(), (std::streamsize) (lg.size() * 4));
+        }
         ++pos;
     }
     const double dec_ms = now_ms() - td0;
