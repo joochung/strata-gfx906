@@ -185,6 +185,12 @@ public:
     /// measured as the best available on this box (no Infinity Fabric).  The candidate region is copied only when
     /// BOTH instances own a region; a stage reading another's tensor in place needs no copy (they share it).
     bool relay_back_copy(Ds41Dense * dst, int n);
+    /// STRATA_DUMP_STATE debug: copy `ncols` Engram-row columns (slot `slot`, EC*ED floats each, the layout
+    /// build_attn reads at line "rows = b.cols2(im.i_eng[L.eslot], ...)") into dst.  Layer 0 of the witness has
+    /// bitwise-equal x/pre after begin() yet diverges, and the Engram rows are the ONE input column region no
+    /// state dump has ever covered (i_eng is per-instance state, fed at begin() from the Engram tables).
+    bool debug_read_eng(int slot, int ncols, void * dst);
+    size_t debug_eng_col_bytes() const;   // EC * ED * 4, or 0 before init
     /// P5.3b: does this instance's relay payload include the candidate column?  True unless it was told the
     /// candidates come from another stage's tensor in place (relay_cand_from).  The ENGINE owns this decision, because
     /// only it knows which stages share a card: it must match relay_slab_bytes() on both sides of a boundary, which

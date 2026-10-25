@@ -301,6 +301,21 @@ for _pv in poss if 'poss' in dir() else []:
     dx = int((ax != bx).sum()); dp2 = int((ap != bp).sum())
     print(f"  p{_pv}: x_state {dx} bytes differ, pre_state {dp2} bytes differ (of {nc} cols)")
 
+# ---- ENGRAM ROWS at each dump point (the layer-0 input no state dump covered) ----
+print("== ENGRAM ROWS (columns byte-aligned at byte 0 on both sides; min-length compare) ==")
+for _sl in (0, 1):
+    for _tag in ("postbegin.p14", "midL00.p14", "pre"):
+        _a = f"{out}.ctrl/state.eng{_sl}.{_tag}.full.bin"
+        _b = f"{out}.staged/state.eng{_sl}.{_tag}.s0.bin"
+        if not (_os.path.exists(_a) and _os.path.exists(_b)):
+            continue
+        _x, _y = np.fromfile(_a, dtype=np.uint8), np.fromfile(_b, dtype=np.uint8)
+        _n = min(len(_x), len(_y))
+        _d = (_x[:_n] != _y[:_n])
+        _fx = _x[:_n].view(np.float32); _fy = _y[:_n].view(np.float32)
+        _fd = np.abs(_fx.astype(np.float64) - _fy.astype(np.float64))
+        print(f"  eng{_sl} {_tag}: {int(_d.sum())}/{_n} bytes differ, max float diff {_fd.max():.3e}")
+
 EOF
 rc2=$?
 [ $rc2 -eq 0 ] || rc=$rc2

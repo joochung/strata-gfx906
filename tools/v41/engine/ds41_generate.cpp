@@ -380,6 +380,23 @@ struct StagedRun {
 //   experts(l, ids, wts, fn, n, routed)
 //               fill routed with layer l's routed experts' weighted sum.  The tier is the CALLER's and stays on its own
 //               card: at this engine's seam it is host-in / host-out, so which card the layers ran on does not matter.
+/// STRATA_DUMP_STATE=PREFIX: the Engram ROW columns (both slots) for the same window the state dump covers.
+/// The witness's layer 0 has bitwise-equal x_state/pre_state after begin() and still diverges; i_eng is the one
+/// input column region no other dump reads.
+static void dump_eng_cols(Ds41Dense & d, const char * prefix, const char * tag, const char * who) {
+    const size_t cb = d.debug_eng_col_bytes();
+    if (!cb) return;
+    const int ncols = std::min(d.columns(), 144);
+    std::vector<uint8_t> buf(cb * (size_t) ncols);
+    for (int slot = 0; slot < 2; ++slot) {
+        if (!d.debug_read_eng(slot, ncols, buf.data())) return;   // no engram on this instance: no file
+        char nb[512];
+        std::snprintf(nb, sizeof nb, "%s.eng%d.%s.%s.bin", prefix, slot, tag, who);
+        std::ofstream fs(nb, std::ios::binary);
+        fs.write((const char *) buf.data(), (std::streamsize) buf.size());
+    }
+}
+
 // STRATA_DUMP_STATE=PREFIX (opt-in, default off): dump one instance's state COLUMNS through the relay seam -
 // x_state / pre_state (+ cand when the geometry carries it) for the first ncols columns at the column the instance
 // ran its last pass in (relay_read_out: staged col0 = the pass window, unsplit byte 0; the witness's positions 0..22
@@ -408,6 +425,7 @@ static void dump_state_cols(Ds41Dense & d, const char * prefix, const char * tag
     std::snprintf(nb, sizeof nb, "%s.st.%s.%s.bin", prefix, tag, who);
     std::ofstream fs(nb, std::ios::binary);
     fs.write((const char *) buf.data(), (std::streamsize) buf.size());
+    dump_eng_cols(d, prefix, tag, who);   // the same window's Engram rows too (layer 0's one uncovered input)
 }
 
 

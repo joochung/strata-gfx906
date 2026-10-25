@@ -1876,6 +1876,18 @@ bool Ds41Dense::relay_write_in(int n, const void * src, size_t src_bytes, int64_
     return true;
 }
 
+size_t Ds41Dense::debug_eng_col_bytes() const { return (size_t) p_->EC * (size_t) p_->ED * 4u; }
+
+bool Ds41Dense::debug_read_eng(int slot, int ncols, void * dst) {
+    Impl & im = *p_;
+    if (slot < 0 || slot > 1 || ncols < 1 || !dst) { im.err = "debug_read_eng: bad args"; return false; }
+    if (!im.i_eng[slot]) { im.err = "debug_read_eng: no Engram rows (no --engram?)"; return false; }
+    if ((int64_t) ncols > im.NC) { im.err = "debug_read_eng: more columns than the instance has"; return false; }
+    ggml_backend_synchronize(im.backend);
+    ggml_backend_tensor_get(im.i_eng[slot], dst, 0, debug_eng_col_bytes() * (size_t) ncols);
+    return true;
+}
+
 bool Ds41Dense::relay_back_copy(Ds41Dense * dst, int n) {
     Impl & im = *p_;
     if (!dst) { im.err = "relay_back_copy: no destination stage"; return false; }
