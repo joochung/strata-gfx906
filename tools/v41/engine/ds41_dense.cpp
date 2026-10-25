@@ -2355,6 +2355,28 @@ void dump_graph_once(const Ds41Dense::Impl & im, ggml_cgraph * gf, const char * 
                               << t->src[j]->ne[0] << "," << t->src[j]->ne[1] << "," << t->src[j]->nb[1] << "] ";
         fs << "\n";
     }
+    // STRATA_DUMP_GRAPHS=FILE (second half): the DATA of every source tensor this graph reads that is NOT a
+    // loaded weight.  The layer-0 graphs of the two shapes printed IDENTICAL (names, views, 161 nodes - witness
+    // 121232) yet the router outputs differed; the divergence must be in the BYTES of a tensor the graph reads,
+    // so dump exactly what the graph reads: each distinct non-weight src, first min(nbytes, 512 KiB).
+    std::set<std::string> seen;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * t = ggml_graph_node(gf, i);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * src = t->src[j];
+            if (!src || !src->data) continue;
+            if (!seen.insert(src->name).second) continue;
+            const size_t take = std::min<size_t>(ggml_nbytes(src), 512u * 1024u);
+            std::vector<uint8_t> bytes(take);
+            ggml_backend_synchronize(im.backend);
+            ggml_backend_tensor_get(const_cast<ggml_tensor *>(src), bytes.data(), 0, take);
+            char db[560];
+            std::snprintf(db, sizeof db, "%s.data.%s.bin", nb, src->name);
+            for (char * p = db; *p; ++p) if (*p == '/' || *p == ' ' || *p == '(') *p = '_';
+            std::ofstream df(db, std::ios::binary);
+            df.write((const char *) bytes.data(), (std::streamsize) take);
+        }
+    }
 }
 }  // namespace
 
