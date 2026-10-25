@@ -141,7 +141,8 @@ bool parse(int argc, char ** argv, Args & a) {
         // nothing to cap, so naming these flags alone is a mistake worth reporting rather than silently ignoring.
         if (!asked_gpus && (k == "--relay-chunk" || k == "--relay-copy-weights")) {
             std::fprintf(stderr, "ds41_generate: --relay-chunk/--relay-copy-weights only mean something with --gpus "
-                                 "naming more than one stage (--gpus 0,1 [--layer-split 21]).\n");
+                                 "naming more than one stage (--gpus 0,1 [--layer-split <this model's valid "
+                                 "boundaries>; the split validator prints the set]).\n");
             return false;
         }
         if (k == "--relay-chunk") { a.relay_chunk = std::atoi(next().c_str()); continue; }

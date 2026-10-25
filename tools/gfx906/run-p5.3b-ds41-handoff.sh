@@ -114,7 +114,9 @@ SPLIT=${SPLIT:-20}
 ARGS=(-m "$M/V41-GSQ.gguf" --backend cuda --experts gpu
       --engram "$M/engram/l1:$M/engram/l14" --rank "$M/rank.bin"
       --ids-file "$IDS" -n 64 --arena-gib "$ARENA_GIB" --arena-adapt --vram-margin 1.0
-      --prefill-chunk 64 --relay-chunk 64)   # --prompt-batch stays at the engine's 8192: a staged run takes its
+      --prefill-chunk 64)   # --relay-chunk belongs to the STAGED runs only (run3/4/5): the engine refuses a relay
+                                              # cap with no --gpus, and a control must not carry staged flags at all.
+                                              # --prompt-batch stays at the engine's 8192: a staged run takes its
                                               # state columns from it (the layer-major walk never runs), which is
                                               # what lets a prompt of up to 8192 tokens cycle 128 64-token passes
 
@@ -139,13 +141,13 @@ fi
 if ! run_step run2 "${ENG[@]}" "${ARGS[@]}"; then
     echo "P5.3b WITNESS: FAIL at run2 (unsplit repeat) - log logs/p5.3b-run2-${TS}.log"; exit 1
 fi
-if ! run_step run3 "${ENG[@]}" "${ARGS[@]}" --gpus 0,0 --layer-split "$SPLIT"; then
+if ! run_step run3 "${ENG[@]}" "${ARGS[@]}" --gpus 0,0 --layer-split "$SPLIT" --relay-chunk 64; then
     echo "P5.3b WITNESS: FAIL at run3 (staged --gpus 0,0, one card) - log logs/p5.3b-run3-${TS}.log"; exit 1
 fi
-if ! run_step run4 "${ENG[@]}" "${ARGS[@]}" --gpus 0,1 --layer-split "$SPLIT" --relay-copy-weights; then
+if ! run_step run4 "${ENG[@]}" "${ARGS[@]}" --gpus 0,1 --layer-split "$SPLIT" --relay-chunk 64 --relay-copy-weights; then
     echo "P5.3b WITNESS: FAIL at run4 (staged --gpus 0,1, cross-device) - log logs/p5.3b-run4-${TS}.log"; exit 1
 fi
-if ! run_step run5 "${ENG[@]}" "${ARGS[@]}" --gpus 0,1 --layer-split "$SPLIT" --relay-copy-weights; then
+if ! run_step run5 "${ENG[@]}" "${ARGS[@]}" --gpus 0,1 --layer-split "$SPLIT" --relay-chunk 64 --relay-copy-weights; then
     echo "P5.3b WITNESS: FAIL at run5 (cross-device twin) - log logs/p5.3b-run5-${TS}.log"; exit 1
 fi
 
