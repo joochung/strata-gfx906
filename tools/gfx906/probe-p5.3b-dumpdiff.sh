@@ -93,7 +93,7 @@ run_one() {   # run_one <name> <extra args...>
     STRATA_DUMP_STEPS="$OUT.$name/step" "${ENG[@]}" "${ARGS[@]}" --dump-last "$OUT.$name.P.bin" "$@" \
         >"$OUT.$name.toks" 2>"$OUT.$name.log"
     local rc=$?
-    echo "--- $name rc=$rc, $(wc -l < "$OUT.$name.toks") token ids, $(ls "$OUT.$name".step*.bin 2>/dev/null | wc -l) step dumps"
+    echo "--- $name rc=$rc, $(wc -l < "$OUT.$name.toks") token ids, $(ls "$OUT.$name"/step.step*.bin 2>/dev/null | wc -l) step dumps"
     grep -m4 -E "relay: staged run|layer split:|boundary hand-offs|prompt:" "$OUT.$name.log" | sed "s/^/[$name] /"
     [ $rc -eq 0 ] || { echo "PROBE: $name FAILED (rc=$rc) - see $OUT.$name.log"; return 1; }
 }
@@ -121,7 +121,10 @@ print(f"  staged : {tk_s[:12].tolist()}")
 print(f"  longest common prefix {lcp}/{n} (the witness's shape is lcp 1)")
 
 def rows(side, tag):
-    p = f"{out}.{side}.{tag}"
+    # run_one passes STRATA_DUMP_STEPS="$OUT.$name/step", so the engine writes "$OUT.$name/step.stepNNN.bin" INSIDE
+    # the per-side directory; --dump-last is a plain path given to us on the CLI.  (First probe run counted "0 step
+    # dumps" because the count globbed "$OUT.$name.step*.bin" - a sibling of the directory, not inside it.)
+    p = f"{out}.{side}/{tag}" if tag != "P.bin" else f"{out}.{side}.P.bin"
     return np.fromfile(p, dtype=np.float32) if os.path.exists(p) else None
 
 def cmp(tag, c, s, note=""):
