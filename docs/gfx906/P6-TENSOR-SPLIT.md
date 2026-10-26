@@ -224,3 +224,69 @@ framework:
 - The cross-device slot-budget bug (budget read from the wrong card, ~6 GiB, P5.3b receipt
   limits) MUST be fixed before P6.3's default-budget numbers mean anything - a TP run's whole
   point is the freed VRAM, and the budget computation is currently shape-shifty.
+
+## 7. P6.0 measured (2026-10-25): what this board delivers for small collectives
+
+Witness logs: logs/p6.0-probe-20261025-214735.log (kern+bounce, complete), plus refused
+transport attempts in p6.0-probe-20261025-{211652,222006,225139,230428,232407}.log. Tool:
+tools/gfx906/probe-collective.cu (host build in the file header), runner run-p6.0-probe.sh.
+Everything below is a measurement of the collective ALONE (plus its per-iteration host barrier
+in the bounce case); engine-grade graph-segment overhead per seam is NOT in these numbers.
+
+p50 microseconds, 300 iters at <= 40 KiB, 60 above:
+
+| size KiB | bounce 2-way | bounce 4-way | note                       |
+|---------:|-------------:|-------------:|:---------------------------|
+|        4 |         41.1 |         88.0 | decode attn seam (f16 wire)|
+|        6 |         39.0 |         86.9 |                            |
+|       10 |         39.6 |         87.4 | decode seam f16            |
+|       20 |         33.5 |         89.0 | decode seam f32 (D=5120)   |
+|       40 |         35.4 |         89.0 |                            |
+|      320 |         65.5 |        133.8 | prefill n=16               |
+|     1280 |        176.6 |        359.3 | prefill chunk n=64         |
+
+Sanity (bitwise sum-equal to host reference) OK on every bounce row. Single-device fused-add
+kernel cost for reference: 2.6 us at 20 KiB, 9.6 us at 1280 KiB (dev-local, no wire).
+
+Verdict against the section-2 kill gate: at decode seam sizes the measured host-synchronous
+bounce is 33-41 us (2-way) and 87-89 us (4-way), both FAR below the 150 us bar. Multiplied to
+the token (40 layers x 2 seams = 80 reductions): 2-way ~2.7-3.3 ms against the 57.7 ms/token
+budget = 4.6-5.7 percent; 4-way ~7.1 ms = 12.2 percent. THE COLLECTIVE ITSELF DOES NOT KILL
+DECODE TP. The plan's earlier bounce-based NO-GO used 0.33-0.69 ms per hop - but that figure
+is a P5.3 ENGINE RELAY hop (full graph-segment completion + sync around the copy), not the
+collective. Which one a P6.2 seam pays depends on whether the TP reduction rides INSIDE a
+running graph segment or forces one to finish; that is exactly what P6.2 must measure, and
+it, not this table, is where decode-TP lives or dies.
+
+Transport refusals on this board (all witnessed, each a separate run, all with the four cards
+idle and the engine stack stopped):
+- Kernel-initiated peer stores (XFB): first collective never completed (run 211652, 900 s
+  timeout; re-attempted protocol, same). 
+- Copy-engine DMA to peer + local spin: hangs at first iteration (runs 222006, 232407) even
+  after the two real protocol bugs found en route were fixed - legacy-default-stream implicit
+  cross-device sync deadlock, and streams created on the wrong device context. 
+- RCCL single process (ncclCommInitAll): init succeeds, first allreduce SEGFAULTS host-side
+  on both default and SHM transports, in one-thread-per-rank AND sequential-enqueue shapes
+  (225139, 230428).
+- RCCL forked one-process-per-rank: children fail inside RCCL's own pinned host alloc
+  ("host alloc 4 bytes", out of memory) on idle cards with MemAvailable ~100 GiB and
+  RLIMIT_MEMLOCK 16 GiB (232407).
+Consequence for the plan: the transport menu collapses to the host-pinned bounce - the same
+transport P5.3's witnessed relay already uses. Every P6 numeric assumption must be computed
+from the bounce table above, and no P6 phase may assume peer-direct or RCCL latency on this
+box. Reduction dtypes: at decode seam sizes the bounce is latency-dominated (4 KiB 41.1 us vs
+20 KiB 33.5 us - spread larger than the payload delta), so f16/q8 wire savings buy ~nothing
+at decode; they only matter at prefill payload sizes.
+
+## 8. P6.1 host gate (2026-10-26): the section-3 partition as runnable arithmetic
+
+tools/gfx906/p6_tp_algebra.cpp + gate-p6.1-tp-algebra.sh (plain g++, no ggml, no GPU).
+The ownership model is DATA (per-card ranges per tensor) and every invariant plays the
+runtime's check over it; the numerics consume the SAME plan the invariants certified.
+Clean: PASS, 102 checks. Red-controls, each alone: flip-qb-direction RED (units mismatch
+named + induced reduce error 89 caught by the stability bars), straddle-ogroup RED (overlap
++ 4096 uncovered elements), drop-replicate RED (card-1 kv-latent read set), dtype-rounding
+RED (truncation-vs-RNE probe). Usable TP widths re-derived from O_GROUPS=8: {1,2,4}; widths
+{3,5,...} refuse. Induced per-site error vs fp64 reference (host numbers the f16/q8 hardware
+calibration must sanity-check against): f32 max 1.1e-4-2.2e-4; f16 max 2.3e-2-7.0e-2;
+q8 max 0.41-1.11 (attn site / shared-FFN site, 2-way and 4-way).
