@@ -186,6 +186,10 @@ bit-for-bit, so 61/64 is within this engine's own reproducibility and not a plac
 
 ## Checked-in CLI
 
+The tensor-split (model-parallel-by-shard) plan - distinct from P5's layer split, with its own
+collective-latency kill gate before any engine surgery - is [P6-TENSOR-SPLIT.md](P6-TENSOR-SPLIT.md)
+(tasks #35-#39).  It is PLAN ONLY: no code, no measurement beyond what it cites with receipts.
+
 The checked-in gfx906 command entry point is [`tools/gfx906.py`](../../tools/gfx906.py). Run
 `python tools/gfx906.py doctor` without a GPU. In a fresh Python environment, install the pinned schema-test
 dependency with `python -m pip install -r tests/gfx906/requirements-schema.txt`, then run

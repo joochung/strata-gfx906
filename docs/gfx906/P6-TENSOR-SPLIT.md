@@ -1,0 +1,176 @@
+# P6 - tensor split (model parallelism by shard, not by layer)
+
+Status: **PLAN ONLY.** Nothing in this file is implemented or measured on hardware except the
+numbers it cites, each of which carries the receipt it came from. P5 answers "can a staged,
+layer-split run be exact?" (yes - witnessed 2026-10-25). P6 asks a different question: can a
+LAYER be split across cards, so that one GEMM's work is shared instead of the model's depth.
+This plan's first phase is a kill gate, exactly like P2/P3's: it predicts tensor-parallel decode
+is net-negative on this board with the measured transports, and the fastest honest way to spend
+the next GPU slot is to try to refute that prediction cheaply, before any engine surgery.
+
+## 1. What the machine offers (measured, not assumed)
+
+From the P5.1 interconnect probe (receipt 2026-10-22-p5.1-interconnect-probe.json):
+
+- 4x MI50 32G on PCIe Gen4 x16, no downclock, **no Infinity Fabric** (peer never beats a
+  host-pinned bounce: same-complex peer 27 GiB/s ~= staged 25-26.7; cross-complex peer 7.3 GiB/s,
+  i.e. 3.6x SLOWER than bouncing through host-pinned memory).
+- Peer access maps on all 12 pairs, so a future phase CAN do device->device flags/spin barriers;
+  bandwidth is not the problem, small-message LATENCY and sync cost are.
+- A full engine-grade cross-device hand-off of 80 KiB (one way, host-pinned, with sync) costs
+  **0.66-0.69 ms per pass** as measured in the P5.3b witness (run4/run5 relay lines, TS
+  20261025-190058). That is one boundary per pass - tensor parallel needs TWO per LAYER.
+- **RCCL is installed** (`/opt/rocm/lib/librccl.so.1.0.702`), and the build does NOT currently
+  find or link any collective library (configure says "Could NOT find NCCL"). A collective
+  transport is available to evaluate; it is not yet evaluated, and gfx906+PCIe RCCL behaviour is
+  exactly the kind of thing that must be measured here rather than quoted from elsewhere.
+
+P5.1 measured 128 MiB bursts. A tensor-parallel step moves **10-1280 KiB collectives hundreds of
+times per second**. No measurement of that regime exists on this box yet; P6.0 produces it.
+
+## 2. The arithmetic that makes decode the hard case
+
+DS4.1 (engine reader, not a transcription): `D 5120 layers 40 heads 64 d_head 512 rope 64
+q_lora 1280 o 8x1024 swa 128 experts 384/6 ff 2304 hc 4 idx 32x128` (test_ds41_geometry, the
+same oracle P5.3b's gate calls).
+
+A 2-way tensor split of a layer needs one reduction per residual connection. The engine runs a
+hyper-connection machine (`hc 4`), but the mixers consume D-wide rows, so the reduction points
+are the same two per layer as a plain transformer: after the attention output projection, after
+the FFN/down projection. Payload per reduction at batch n: `n x D x 4` bytes (fp32 partials,
+summed once on either card).
+
+| regime | reductions/token-pass | payload at n=1 | at n=64 |
+|---|---|---|---|
+| 40 layers x 2 | 80 per token, 80 per prefill pass | 1.6 MB/token | 102 MB/pass |
+
+Two transport models, both anchored to measurements above:
+
+- **host-pinned bounce, engine-grade sync (0.33-0.69 ms/hop):** decode at n=1 pays
+  80 x ~0.33 ms = **~26-55 ms/token of pure communication** against a whole-token budget of
+  57.7 ms with MTP or 74.6 ms without (receipt 2026-10-25-dspark-mtp-perf). Decode TP is
+  dead on arrival with this transport. The same bounce at n=64 costs (80 x (0.33 ms + 51 us
+  transfer))/64 = **~0.46 ms/token against ~25 ms/token of prefill compute** (39.2 tok/s
+  single-card) - under 4% overhead, where the GEMM itself halves per card. **Prefill TP is
+  plausibly a ~1.8x lever with the transport this repo already has.**
+- **RCCL-class collective (to be measured):** IF decode reductions land in the 50-150 us range,
+  80 reductions cost 4-12 ms/token - 7-20% of the decode step for a ~2x cut in dense-GEMM
+  time, and TP decode becomes a live question with real expert-residency benefits on top (below).
+  If reductions land at bounce-latency values, decode TP is NO-GO and the plan stops at prefill.
+
+**The P6.0 kill gate is therefore: measure small-collective latency (10/20/40/320/1280 KiB,
+2-way and 4-way, RCCL allreduce vs pinned-bounce barrier vs peer-direct spin-flag with a fused
+fp32 add) on THIS box, and only decode-TP survives if the reduction p50 stays below ~150 us at
+20 KiB.** Prefill-TP may proceed on the bounce transport even if decode dies; the two exit
+criteria are separate.
+
+## 3. What this model's geometry actually shards (and what it does not)
+
+This is DS4.1-specific and the reason the plan starts at `tools/v41`, not at a generic TP
+framework:
+
+- **Attention is MLA-shaped, so there is no clean 64-head slice to hand out.** Heads are
+  UP-PROJECTED from a 1280-wide compressed `q_lora`, and the KV side is a compressed latent the
+  rings already store. The shardable seam is the up/down projections: column-shard `q_b` by head
+  groups, row-shard `attn_output_b` along the SAME groups, and replicate the compressed latent
+  read - every card reads the same kv latent rows (they are tiny relative to full-KV) and
+  computes its 512/8-head subset's flash attention. The latent read is a gather from the owner's
+  ring; it must arrive on each card per pass (one extra copy per pass, sized by SWA/compressed
+  windows, not per layer) - P5.3b's `upload_pos_tables` machinery and its byte-offset discipline
+  (the i_widx lesson: view and upload offsets must be modeled in BYTES over the full store, and
+  the gate must simulate the runtime's own arithmetic, not restate the theory) are the pattern
+  this copy inherits.
+- **The output projection is low-rank in 8 groups (`o 8x1024`)** - 2-way and 4-way splits land
+  exactly on group boundaries (8 = 4+4, 2+2+2+2). No straddled group, no fixup.
+- **The indexer (`idx 32x128`, top-512 selection) is replicated, not sharded** - it scores whole
+  keys; 32x128 is small, replicating it is cheaper than synchronizing it. Same decision as
+  Engram: `i_eng` rows are host-uploaded per pass and shape-independent; each card computes its
+  own engram add from the same uploaded rows (verify: engram table reads are file/VRAM reads of
+  identical content; the P5.3b engram-row dumps were bitwise equal across shapes).
+- **MoE FFN: do NOT tensor-shard the routed experts - the tier is the axis that wants splitting.**
+  The expert tier already supports device pinning (`Ds41MoeConfig::device` + TierDev guards,
+  P5.3 step 2) and is host-in/host-out, so an EXPERT-PARALLEL split (384 experts striped across
+  cards, each card's ~9.5k-expert slice cached in its OWN VRAM) is a tier change, not a graph
+  change. 2-card EP roughly doubles expert VRAM (the 2616-slot budget measured post-prompt,
+  witness #13, doubles toward ~5200 per card at unchanged per-card VRAM) - which raises the VRAM
+  hit rate (98.4-98.9% at decode now, worse at prefill: control prefill was 288000 PCIe loads and
+  0 hits in the 1200-token DSpark-perf run) and cuts per-card arena/file traffic. The shared
+  expert (ff 2304) is a plain small FFN: row/col-split like a standard MLP, or just replicate it.
+- **The hyper-connection machine stays per-card and FULL-width.** hap/post_f/comb_f/shexp rows
+  are D-wide state; the carry, carry_forward, and back-relay code P5.3b built all index them by
+  COLUMN. Under TP every card needs the SAME post-mix row - so the allreduce output must be
+  written into each card's hc pipeline before the mix, and the mix itself runs redundantly per
+  card (it is ~4xD elementwise, negligible vs the GEMMs). The per-column state machinery does NOT
+  get sharded; only the weights and the reduction points do. This keeps P5.3b's relay/staged work
+  orthogonal: P6 shards a LAYER, P5 stages DEPTH; they compose as tensor-split-within-stage.
+
+## 4. What "correct" will mean (no bit-parity claim, and residency is still the confounder)
+
+- Splitting a matmul across cards and summing fp32 partials CHANGES SUMMATION ORDER. A TP run is
+  the same model, not a bit-identical one - the same ruling as G8(b) for batching
+  (decision 09eaef93). The bar is the calibrated one: **token agreement against controls must be
+  at least the twin-pair agreement at equal residency**, measured in the same witness.
+- **THE RESIDENCY RULE BINDS P6 HARDER THAN P5 DID**: a TP run frees ~half the dense VRAM per
+  card, which changes the expert budget, which changes argmax knife-edge outcomes. Any P6 parity
+  or performance comparison MUST equalize expert residency with `--slots` on every run it
+  compares (memory: DEFAULT-BUDGET dumps are not comparable across shapes), and any P6 SPEED
+  number must additionally be reported at default budgets with the freed-VRAM-into-expert-slots
+  effect reported as part of the result, not hidden by the pin.
+- Gates first, always: a red-controlled host model of the sharding algebra (which rows/cols of
+  `q_b`/`attn_output_b`/down-projection each card owns, the o_groups boundary divisibility, the
+  replicate sets, the partial-sum fp32 order) that a wrong direction cannot survive - the
+  pattern that killed three ring theories and that PASS 3 of gate-relay-pos-tables.sh proves
+  works when the gate simulates BYTE arithmetic instead of restating a theory.
+
+## 5. Phases, each with its own kill gate
+
+- **P6.0 - collective probe (kills or feeds everything).** A `probe-collective` tool (pattern:
+  probe-p2p.cu, refuses any live engine, no model, minutes not hours): allreduce latency and
+  bandwidth at 10/20/40/320/1280 KiB, 2- and 4-way, three transports (RCCL linked directly;
+  host-pinned bounce with a spin barrier; peer-direct copy + spin-flag + fused fp32 add kernel,
+  same-complex AND cross-complex pairs). Exit: a receipt with the latency table, a chosen
+  transport for prefill-TP, and a GO/NO-GO for decode-TP against the ~150 us bar in section 2.
+  If NO-GO, decode stays single-card-per-token and P6 becomes a prefill-throughput project plus
+  the EP axis (which needs no collective at all).
+- **P6.1 - sharding algebra, host-only gate.** The section-3 partition written as a runnable
+  model: per-card owned slices, replicated reads, partial-sum order, checked against DS4.1's
+  read geometry; a wrong boundary (straddling an `o` group or a head-group) must turn the gate
+  red, and the gate must re-derive the divisibility from the engine reader's own numbers, not a
+  transcription. No ggml, no GPU.
+- **P6.2 - same-device shard spike (plumbing without a second card).** Split one layer's q_b/o
+  into TWO ggml subgraphs with two sliced weight copies ON DEVICE 0 and an explicit fp32 reduce
+  node between them; prove: (a) graph-build cache behaviour with sliced weights (the graph-cache
+  column-key bug ce7e1116 is the cautionary precedent), (b) the reduce node composes with the hc
+  machine and the per-column state (carry_forward still sees one D-wide row), (c) numerics land
+  within the calibration rule, (d) overhead of the extra launch/reduce at n=1 and n=64. Kill
+  gate: if the same-device two-shard overhead is already >10% at n=64, cross-card prefill TP
+  cannot reach its predicted ~1.8x and P6.3 is refused.
+- **P6.3 - two-card prefill TP.** Real second card, transport per P6.0. Scope: attention
+  projections + shared expert sharded; rings/tier/engram/indexer stay owner-card (rings per
+  section 3's per-pass latent copy). Measure against a same-day, same-session layer-split run and
+  an unsplit control: prefill tok/s at 1200/4096-token prompts (the 39.2 tok/s single-card number
+  is the reference), decode tok/s reported unchanged or explicitly refused-to-run, expert hit
+  rates at DEFAULT and pinned budgets. This phase may ALSO test decode at 2 cards if P6.0 came
+  back GO; if P6.0 said NO-GO it measures prefill only and says so.
+- **P6.4 - expert parallel (the axis this engine is actually built for) and the 4-card
+  question.** EP as a tier change only: expert slice per card by device pinning (exists), arena
+  and rank.bin seeding per slice, route-to-remote-expert dispatch through the existing
+  host-in/host-out seam (this is where the real work is: a routed expert on the wrong card
+  currently just costs a PCIe read; EP makes remote fetch structural). Exit: the P5.5-shaped
+  scaling curve, honest either way - including the result "the tier at 4 cards is 4 disjoint
+  caches and the hit rate is what wins, allreduce was never needed".
+
+## 6. Risks this plan cannot retire alone
+
+- RCCL on gfx906/PCIe with wave64 builds is unproven here; P6.0 is its first measurement. If it
+  refuses or underperforms, transports fall back to bounce/peer models P5.1 already bounded.
+- The SVM one-engine-per-host crash rule is respected: TP stays ONE process on N devices (the
+  staged witness already ran one process on two cards cleanly); never two engine processes.
+- DSpark + staged is refused; DSpark + TP is a THIRD combination nobody has thought about -
+  P6.3 must re-audit the draft-verify pass against TP reductions before enabling it, and will
+  default to refusing MTP under TP until it has its own measurement.
+- Serve-layer work (snapshot/restore for TP sessions) inherits the open staged-serve gap; P6
+  does not close it and does not claim to.
+- The cross-device slot-budget bug (budget read from the wrong card, ~6 GiB, P5.3b receipt
+  limits) MUST be fixed before P6.3's default-budget numbers mean anything - a TP run's whole
+  point is the freed VRAM, and the budget computation is currently shape-shifty.
