@@ -78,6 +78,18 @@ struct Ds41DenseConfig {
     /// P5.3b (set by build_stages, not by callers): read the geometry and build the state and graphs but take NO weight
     /// tensors of our own; the owner hands its own over immediately before that init runs.
     bool share_weights = false;
+    /// P6.2 (opt-in spike; 1 = default, the byte-identical single-shard graph): shard the attention output
+    /// projection into tp_shards branches ON THIS ONE DEVICE - q_b column-sharded by head group, attn_output_b
+    /// row-sharded on the SAME groups, per-shard flash-attn on that head subset with the shared K/V as a
+    /// replicated read, and an explicit fp32 add as the reduce node (on a real split run this is the allreduce).
+    /// Spike only: 2 is the only implemented width, and the split is the attention seam alone (the plan doc's
+    /// section-3 algebra, gated host-side by tools/gfx906/p6_tp_algebra.cpp). Slicing is by ggml VIEWS of the
+    /// loaded weights - no weight copies, one device, no transport.
+    int tp_shards = 1;
+    /// P6.2: which layers get the sharded seam.  Empty = every layer (the real TP geometry); a list like
+    /// "0,1,2,3,4,5,6,7,8,9" shards only those, which is how the spike is run inside one card's VRAM (each sharded
+    /// layer adds ~100 MB of sliced weight copies).  Layers outside the list keep the default single-branch attn.
+    std::vector<int> tp_layers;
 };
 
 class Ds41Dense {

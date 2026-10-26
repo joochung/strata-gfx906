@@ -290,3 +290,30 @@ RED (truncation-vs-RNE probe). Usable TP widths re-derived from O_GROUPS=8: {1,2
 {3,5,...} refuse. Induced per-site error vs fp64 reference (host numbers the f16/q8 hardware
 calibration must sanity-check against): f32 max 1.1e-4-2.2e-4; f16 max 2.3e-2-7.0e-2;
 q8 max 0.41-1.11 (attn site / shared-FFN site, 2-way and 4-way).
+
+## 9. P6.2 same-device shard spike: the seam in the engine (2026-10-26, code; hardware witness pending)
+
+`--tp-shards 2 [--tp-layers 0,1,...]` on ds41_generate (opt-in; default tp_shards=1 leaves the graph path
+unchanged, AGENTS.md). One device, no transport: the seam exactly as section 3 and the P6.1 gate certify it -
+q column-sharded by HEAD GROUP (heads [0,32)/[32,64) as a 4D view of the roped q, the same strides the default
+branch's reshape+permute produces), per-shard flash-attn over the SAME K/V and mask (the replicated read),
+per-shard sliced output-LoRA weights, and ONE ggml_add (f32) as the reduce node - the allreduce stand-in.
+The sliced weights are real copies made at load, next to the STRATA_PRED_ROUTER copies and uploaded the same
+way (extend convert_upload with an explicit source row stride): q_b rows [0, NH/2*DH) / [NH/2*DH, NH*DH),
+output_a batches [0, OG/2) / [OG/2, OG), output_b the first/second HALF of each row's reduction axis
+(block-aligned at 4096 for every quantized type; the upload dequantizes row-halves and requantizes). ~60 MB
+of sliced copies per sharded layer. A staged run (--gpus) REFUSES the pair: the spike is same-device, and
+tensor-split-within-stage is P6.3, after this kill gate.
+
+Measured in code review, before any hardware: three offset/layout bugs the host algebra cannot see -
+the q head-slice must use the HEAD stride (nb[1]), not the token stride; the flash-attn's 4D query must be a
+view_4d (a ggml_reshape over a strided 3D slice asserts); and the reduction-half upload must carry the FILE's
+full row stride (4352 B at f16 for output_b), not the sliced row's. Each one silently changes values or
+crashes the build, and each survives a green compile.
+
+The witness (tools/gfx906/run-p6.2-tp-shard.sh, launched through the GPU wrapper): same binary, same prompt,
+same --slots pin BOTH runs (the residency rule), control default vs tp 10-of-40 layers; parses the engine's
+own prompt/decode tok/s lines; kills on a wrong sliced-copy count so a flag that did not reach the graph
+cannot be measured twice and called a no-op. Kill gate as planned: >10% overhead at n=64 with only the seam
+plumbing on one device = cross-card prefill TP NO-GO. Status of the numbers: NOT YET RUN - the operator's
+GPU window decides when; no overhead or numerics claim is made until the receipt exists.

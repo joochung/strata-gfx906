@@ -488,7 +488,52 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                 n.compare(n.size() - suf.size(), suf.size(), suf) != 0) return std::string();
             return n.substr(0, n.size() - suf.size()) + "ffn_gate_inp_pred.weight";
         };
-        size_t rq_n = 0, rq_from = 0, rq_to = 0, pq_n = 0;
+        // P6.2 (opt-in, cfg.tp_shards == 2): the sliced weight tensors of the attention output seam, made EXACTLY
+        // where the STRATA_PRED_ROUTER copies above are made, uploaded EXACTLY where those copies are uploaded, and
+        // read by build_attn under the same "the loader made them" rule the pred router follows.  Which ggml axis
+        // halves follows the mul_mat each one feeds (see build_attn's seam):
+        //   attn_q_b.weight    file [NH*DH, RQ] -> ggml [RQ, NH*DH]: shard = a row-range of ne1 (its heads)
+        //   attn_output_a.weight  file [OL, OGD, OG] -> ggml [OGD, OL, OG]: shard = a batch-range of ne2 (its groups)
+        //   attn_output_b.weight  file [D, OL*OG] -> ggml [OL*OG, D]: shard = the first/second HALF of ne0, the
+        //       reduction axis - NOT a whole-row range, so its upload always goes through convert_upload (per-row
+        //       dequantize + requantize), never the same-type memcpy fast path below.
+        // Slice sizes come from the geometry (NH, OG even for every shape that reaches here); file row bytes come
+        // from ti, so no hard-coded element size.  Returns "" for a tensor that is not part of the seam.
+        auto tp_slice_name = [&](const TensorInfo & ti, int s, std::vector<int64_t> * ne, size_t * byte0,
+                                 size_t * srow) -> std::string {
+            if (im.cfg.tp_shards != 2) return std::string();
+            static const std::vector<std::string> suf = { "attn_q_b.weight", "attn_output_a.weight", "attn_output_b.weight" };
+            int which = -1;
+            for (int i = 0; i < 3; ++i)
+                if (ti.name.size() >= suf[i].size() &&
+                    ti.name.compare(ti.name.size() - suf[i].size(), suf[i].size(), suf[i]) == 0) which = i;
+            if (which < 0 || ti.shape.empty()) return std::string();
+            // the same layer gate build_attn's seam applies: off-list layers keep the default branch, so they must
+            // not pay for sliced weight copies either
+            const long ilv = std::strtol(ti.name.c_str() + 4, nullptr, 10);
+            if (!im.cfg.tp_layers.empty() &&
+                std::find(im.cfg.tp_layers.begin(), im.cfg.tp_layers.end(), (int) ilv) == im.cfg.tp_layers.end())
+                return std::string();
+            const int64_t outer = (int64_t) ti.shape[0];   // the file's outermost dim (ggml's last)
+            if (which == 2 && (ti.shape.size() != 2 || ti.shape[1] % 2)) return std::string();
+            if (which != 2 && (ti.shape.empty() || outer % 2)) return std::string();
+            ne->assign(ti.shape.rbegin(), ti.shape.rend());   // ggml order (file order reversed)
+            while (ne->size() < 3) ne->push_back(1);
+            size_t b0 = 0;
+            *srow = 0;
+            if (which == 0) { (*ne)[1] /= 2; b0 = (size_t) s * (size_t) (outer / 2) * ggml_row_size((ggml_type) ti.type, ne->at(0)); }
+            else if (which == 1) { (*ne)[2] /= 2; b0 = (size_t) s * (size_t) (outer / 2) * ggml_row_size((ggml_type) ti.type, (*ne)[0] * (*ne)[1]); }
+            else {
+                // reduction-half: each row's first/second half.  The SOURCE rows stay the file's full width, so the
+                // upload reads them with the full row stride (*srow) starting at byte0 within the first row.
+                const size_t half = ggml_row_size((ggml_type) ti.type, (*ne)[0] / 2);
+                *srow = ggml_row_size((ggml_type) ti.type, (*ne)[0]);
+                (*ne)[0] /= 2;
+                b0 = (size_t) s * half;
+            }   // (*ne)[0] is the FULL reduction width until this line for which == 2
+            return ti.name.substr(0, ti.name.size() - 6) + ".s" + std::to_string(s) + ".weight";
+        };
+        size_t rq_n = 0, rq_from = 0, rq_to = 0, pq_n = 0, tp_n = 0;
         for (size_t s = 0; s < model.size(); ++s)
             for (const auto & ti : model.shard(s).tensors()) {
                 if (skip(ti.name)) continue;
@@ -498,14 +543,27 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                     ggml_set_name(tp, pn.c_str());
                     w.t[pn] = tp;
                 }
+                for (int s = 0; s < 2; ++s) {   // P6.2: the seam's sliced weight copies (see tp_slice_name)
+                    std::vector<int64_t> ne;
+                    size_t b0 = 0, sr = 0;
+                    const std::string sn = tp_slice_name(ti, s, &ne, &b0, &sr);
+                    if (sn.empty()) continue;
+                    int64_t d[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
+                    for (size_t q = 0; q < ne.size() && q < GGML_MAX_DIMS; ++q) d[q] = ne[q];
+                    ggml_tensor * st = ggml_new_tensor(w.ctx, (ggml_type) ti.type, (int) ne.size(), d);
+                    ggml_set_name(st, sn.c_str());
+                    w.t[sn] = st;
+                }
             }
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(w.ctx, ggml_backend_get_default_buffer_type(im.backend));
         if (!buf) { err = "cannot allocate the dense weights on the backend"; return false; }
         w.bufs.push_back(buf);
-        // rows of the file's tensor `ti` (bytes `src`) converted to t->type and uploaded; returns the bytes uploaded
-        auto convert_upload = [&](ggml_tensor * t, const TensorInfo & ti, const uint8_t * src) -> size_t {
+        // rows of the file's tensor `ti` (bytes `src`) converted to t->type and uploaded; returns the bytes uploaded.
+        // srow: the SOURCE row stride when the target rows are a slice of the file's rows (the P6.2 reduction-half
+        // slices); 0 = the default, src rows are as wide as t's (whole-row ranges, the pre-P6.2 use).
+        auto convert_upload = [&](ggml_tensor * t, const TensorInfo & ti, const uint8_t * src, size_t srow = 0) -> size_t {
             const int64_t n0 = t->ne[0], nr = ggml_nrows(t);
-            const size_t src_row = ggml_row_size((ggml_type) ti.type, n0), dst_row = ggml_row_size(t->type, n0);
+            const size_t src_row = srow ? srow : ggml_row_size((ggml_type) ti.type, n0), dst_row = ggml_row_size(t->type, n0);
             std::vector<uint8_t> dst((size_t) nr * dst_row);
             const int nth = (int) std::max(1u, std::thread::hardware_concurrency());
             std::vector<std::thread> th;
@@ -531,6 +589,14 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                     convert_upload(w.t[pn], ti, src);
                     ++pq_n;
                 }
+                for (int s = 0; s < 2; ++s) {   // P6.2: upload the seam slices (whole-row range for q_b/output_a,
+                    std::vector<int64_t> ne;    // per-row reduction half for output_b; srow says which
+                    size_t b0 = 0, sr = 0;
+                    const std::string sn = tp_slice_name(ti, s, &ne, &b0, &sr);
+                    if (sn.empty()) continue;
+                    convert_upload(w.t[sn], ti, src + b0, sr);
+                    ++tp_n;
+                }
                 if ((int) t->type == (int) ti.type) {
                     ggml_backend_tensor_set(t, src, 0, ggml_nbytes(t));
                     continue;
@@ -542,6 +608,7 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
         if (rq_n) std::fprintf(stderr, "dense requant: %zu Q8_0 matrices -> %s, %.2f -> %.2f GB\n", rq_n, ggml_type_name(rq),
                                rq_from / 1e9, rq_to / 1e9);
         if (pq_n) std::fprintf(stderr, "prediction routers: %zu F32 copies as %s\n", pq_n, ggml_type_name(pq));
+        if (tp_n) std::fprintf(stderr, "p6.2 tp seam: %zu sliced weight copies (tp_shards=2)\n", tp_n);
     }
     // The token embeddings are read from the GGUF mmap on the HOST (upload_inputs), never uploaded: only the first
     // stage looks tokens up, so only it maps the rows.  share_weights (a stage that borrowed the whole load) keeps the
@@ -870,8 +937,46 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         M += pad;
     }
     ggml_tensor * k4 = ggml_cast(gc, ggml_reshape_4d(gc, Kall, DH, M, 1, n), GGML_TYPE_F16);
-    ggml_tensor * q4 = ggml_permute(gc, ggml_reshape_4d(gc, q, DH, NH, 1, n), 0, 2, 1, 3);    // [DH, 1, NH, n]
     ggml_tensor * m4 = ggml_cast(gc, ggml_reshape_4d(gc, Mall, M, 1, 1, n), GGML_TYPE_F16);
+    ggml_tensor * attn = nullptr;
+    // P6.2 (opt-in): the sharded seam.  Same algebra as the certified plan in tools/gfx906/p6_tp_algebra.cpp, in ggml:
+    // the queries are column-sharded by HEAD GROUP (heads [s*NH/2, (s+1)*NH/2) as a strided slice of q - rope reads
+    // strides - and the slice aligns with output_a's batch groups because o is a column-major flatten of [DH, NH]),
+    // each shard runs its OWN flash-attn over the SAME K/V and mask (the replicated read of a real split), its own
+    // sliced output-LoRA weights (the loader's .s0/.s1 copies), and the two partials meet at ONE ggml_add - the
+    // reduce node, f32, which on a real split run is the allreduce.  A layer whose sliced weights the loader did
+    // not make (off-list layer, odd geometry) keeps the single-branch path below, by the pred-router's rule.
+    const bool tp_here = im.cfg.tp_shards == 2 && NH % 2 == 0 && im.OG % 2 == 0 &&
+                         (im.cfg.tp_layers.empty() ||
+                          std::find(im.cfg.tp_layers.begin(), im.cfg.tp_layers.end(), (int) il) != im.cfg.tp_layers.end()) &&
+                         im.w.t.count("blk." + std::to_string(il) + ".attn_output_b.s0.weight") == 1;
+    if (tp_here) {
+        const int64_t NHS = NH / 2, OGS = im.OG / 2;   // heads / groups per shard
+        ggml_tensor * sinks = im.BL(il, "attn_sinks.weight");
+        ggml_tensor * partial[2] = { nullptr, nullptr };
+        for (int s = 0; s < 2; ++s) {
+            ggml_tensor * qs = ggml_view_3d(gc, q, DH, NHS, n, q->nb[1], q->nb[2], (size_t) s * (size_t) NHS * q->nb[1]);
+            // the flash-attn wants [DH, 1, heads, tokens]: build it as a 4D VIEW of q directly (a reshape of the
+            // strided 3D slice would assert - the slice is not contiguous), with the SAME axis strides the default
+            // branch's reshape+permute produces: dim1 is the singleton (stride = the token stride, harmless), dim2
+            // steps heads (q's nb[1]), dim3 steps tokens (q's nb[2]).
+            ggml_tensor * q4s = ggml_view_4d(gc, q, DH, 1, NHS, n, q->nb[2], q->nb[1], q->nb[2],
+                                             (size_t) s * (size_t) NHS * q->nb[1]);   // [DH, 1, NH/2, n]
+            ggml_tensor * os = ggml_flash_attn_ext(gc, q4s, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
+            ggml_flash_attn_ext_add_sinks(os, ggml_view_1d(gc, sinks, NHS, (size_t) s * (size_t) NHS * sinks->nb[0]));
+            os = ggml_reshape_3d(gc, os, DH, NHS, n);   // the FA output is contiguous, so this is a view
+            (void) qs;
+            os = b.rope(os, pos, r, true);                                   // de-RoPE the output, this shard's heads
+            os = ggml_permute(gc, ggml_reshape_4d(gc, os, im.OGD, OGS, 1, n), 0, 2, 1, 3);   // [OGD, n, OG/2, 1]
+            ggml_tensor * wo_a_s = ggml_reshape_3d(gc, im.BL(il, "attn_output_a.s" + std::to_string(s) + ".weight"),
+                                                   im.OGD, im.OL, OGS);
+            ggml_tensor * oa_s = ggml_permute(gc, ggml_mul_mat(gc, wo_a_s, os), 0, 2, 1, 3);   // [OL, OG/2, n]
+            partial[s] = ggml_mul_mat(gc, im.BL(il, "attn_output_b.s" + std::to_string(s) + ".weight"),
+                                      b.flat2(oa_s, im.OL * OGS, n));                          // [D, n]
+        }
+        attn = ggml_add(gc, partial[0], partial[1]);   // the reduce node (allreduce stand-in; f32)
+    } else {
+    ggml_tensor * q4 = ggml_permute(gc, ggml_reshape_4d(gc, q, DH, NH, 1, n), 0, 2, 1, 3);    // [DH, 1, NH, n]
     ggml_tensor * o = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
     ggml_flash_attn_ext_add_sinks(o, im.BL(il, "attn_sinks.weight"));
     o = ggml_reshape_3d(gc, o, DH, NH, n);
@@ -880,7 +985,8 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     o = ggml_permute(gc, ggml_reshape_3d(gc, o, im.OGD, im.OG, n), 0, 2, 1, 3);               // [OGD, n, OG]
     ggml_tensor * wo_a = ggml_reshape_3d(gc, im.BL(il, "attn_output_a.weight"), im.OGD, im.OL, im.OG);
     ggml_tensor * oa = ggml_permute(gc, ggml_mul_mat(gc, wo_a, o), 0, 2, 1, 3);              // [OL, OG, n]
-    ggml_tensor * attn = ggml_mul_mat(gc, im.BL(il, "attn_output_b.weight"), b.flat2(oa, im.OL * im.OG, n));   // [D, n]
+    attn = ggml_mul_mat(gc, im.BL(il, "attn_output_b.weight"), b.flat2(oa, im.OL * im.OG, n));   // [D, n]
+    }
 
     // ---- hc_post(attention) -> FFN hc: its mixes give the next layer's pre-mix; its input uses the attention's
     ggml_tensor * h = ggml_dsv4_hc_post(gc, attn, x, a_post, a_comb);                       // [D, HC, n]

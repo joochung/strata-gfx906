@@ -106,6 +106,13 @@ struct Args {
     // split across cards the stages on other cards load their own range either way (tensors do not live on two cards);
     // this flag opts the SAME-card stages out of the sharing, to measure what the sharing costs and buys.
     bool relay_copy_weights = false;
+    // P6.2 (opt-in spike): --tp-shards 2 splits the attention output projection of every layer (or of --tp-layers'
+    // list) into two ggml branches on ONE device - head-group-column-sharded q_b, same-group-row-sharded
+    // attn_output_b, per-shard flash-attn with the shared K/V replicated, and an explicit f32 add as the reduce node.
+    // It measures the seam's extra launch/reduce overhead and its numerics; it does NOT split devices (that is P6.3).
+    // --tp-layers is a csv of layer indices; empty = every layer.  Default tp_shards=1 leaves the path byte-identical.
+    int tp_shards = 1;
+    std::vector<int> tp_layers;
 };
 
 std::vector<int> parse_csv(const std::string & s) {
@@ -147,6 +154,8 @@ bool parse(int argc, char ** argv, Args & a) {
         }
         if (k == "--relay-chunk") { a.relay_chunk = std::atoi(next().c_str()); continue; }
         if (k == "--relay-copy-weights") { a.relay_copy_weights = true; continue; }
+        if (k == "--tp-shards") { a.tp_shards = std::atoi(next().c_str()); continue; }
+        if (k == "--tp-layers") { a.tp_layers = parse_csv(next()); continue; }
         if (k == "-m" || k == "--model") a.model = next();
         else if (k == "--ids") a.ids_csv = next();
         else if (k == "--ids-file") a.ids_file = next();
@@ -677,6 +686,28 @@ int main(int argc, char ** argv) {
     dc.backend = be;
     dc.n_threads = a.threads > 0 ? a.threads : 8;
     dc.ctx_max = ctx;
+    // P6.2 (opt-in): the sharded-seam spike.  2 is the only width the loader and the graph build; a staged run is
+    // refused for now because the seam inside a stage is a second variable on top of the relay (the spike is
+    // same-device), and P5.3's own gates run before that combination is worth measuring.
+    if (a.tp_shards != 1) {
+        if (a.tp_shards != 2) {
+            std::fprintf(stderr, "ds41_generate: --tp-shards supports 1 (default) or 2 (the P6.2 spike) only.\n");
+            return 1;
+        }
+        if (!a.split.gpus.empty()) {
+            std::fprintf(stderr, "ds41_generate: --tp-shards and --gpus do not combine yet (the spike is same-device; "
+                                 "tensor-split-within-stage is P6.3, after the P6.2 kill gate).\n");
+            return 1;
+        }
+        dc.tp_shards = 2;
+        dc.tp_layers = a.tp_layers;
+        std::string tp_ls = "all";
+        if (!dc.tp_layers.empty()) {
+            tp_ls.clear();
+            for (size_t i = 0; i < dc.tp_layers.size(); ++i) tp_ls += (i ? "," : "") + std::to_string(dc.tp_layers[i]);
+        }
+        std::fprintf(stderr, "p6.2 spike: attention seam sharded into 2 branches on one device, layers %s\n", tp_ls.c_str());
+    }
     // ---- P5.3b (opt-in): the pass the STAGES are sized for, decided before the instance is built because init() is
     // what sizes the state columns.  A staged pass carries the whole pass's payload through one staging slot, so the
     // staging's capacity (--relay-chunk, default 64 tokens) caps the pass and with it every per-token buffer of every
