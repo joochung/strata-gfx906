@@ -44,6 +44,14 @@ summed once on either card).
 |---|---|---|---|
 | 40 layers x 2 | 80 per token, 80 per prefill pass | 1.6 MB/token | 102 MB/pass |
 
+Payload sizes above are F32 (the engine's native activation dtype: `x_state` is F32 hc-wide and
+the hc machine consumes F32 - section 3). **The reduction dtype is a per-run option, not a
+constant**: F32 default, F16 and Q8_0 as opt-in modes (see 2b). They barely move the decode kill
+gate (latency-dominated) but they matter wherever the wire stops being negligible: 4-way ring
+hops (the payload crosses 3 links), large-batch prefill (1.28 MB F32 per hop at n=64), and any
+cross-complex peer-direct leg (7.3 GiB/s: the F32 n=64 payload is 175 us of pure transfer per
+hop; Q8_0 cuts that to ~44 us).
+
 Two transport models, both anchored to measurements above:
 
 - **host-pinned bounce, engine-grade sync (0.33-0.69 ms/hop):** decode at n=1 pays
@@ -63,6 +71,37 @@ Two transport models, both anchored to measurements above:
 fp32 add) on THIS box, and only decode-TP survives if the reduction p50 stays below ~150 us at
 20 KiB.** Prefill-TP may proceed on the bounce transport even if decode dies; the two exit
 criteria are separate.
+
+### 2b. Reduction dtype: F32 default, F16 and Q8_0 opt-in
+
+A reduction carries PARTIAL SUMS - activation-space values - so the checkpoint's weight quants are
+not candidates; the axis is the activation dtype of the partials. Three modes, one flag
+(`--tp-reduce f32|f16|q8`), default `f32` so the default path stays byte-identical to the plan's
+baseline arithmetic:
+
+- **f32 (default):** numerically free - the reduce is a plain fp32 add and the run's parity result
+  attributes to SHARDING, not to the reduction. The correctness baseline every other mode is
+  measured against.
+- **f16:** halves the payload (20 -> 10 KiB/token, 1.28 -> 0.64 MB per n=64 hop). Each partial is
+  rounded at ~5e-4 relative (11-bit mantissa) BEFORE the sum, at 80 sites per token. Industry-
+  standard TP compromise - and the reason it is opt-in HERE is this engine's measured knife edge:
+  state diffs of ~1e-1 move tokens on this model (P5.3b probes), so a systematic ~1e-3 per-site
+  perturbation compounding through 40 layers must be calibrated, not assumed away.
+- **q8 (Q8_0 partials):** blocks of 32 values + fp16 scale -> ~1.06 B/value, payload ~6 KiB/token,
+  384 KiB per n=64 hop. Per-element error is `block_max / 254` - relative to the block's largest
+  value, so small elements in a wide block are the noisy ones; partial-sum blocks (GEMM outputs,
+  near-Gaussian) are the benign case for this format. Each card quantizes ITS partial; the fused
+  add kernel dequantizes both to fp32 and sums, so the error is two quantization roundings plus an
+  exact add. The fused dequant-add replaces the same kernel slot as the f32 add - no extra hop,
+  no extra sync; the whole saving is wire bytes.
+
+Rules binding the opt-ins (both are new features, so the repo's rule applies twice over): each
+dtype mode is a SEPARATE measured configuration - it must pass the calibrated twin-pair parity
+bar at equal residency with its own receipt, at BOTH n=1 decode and n=64 prefill shapes, before
+any doc or serve config may recommend it; and a mode that passes parity may still be NO-GO on
+speed if its wire-time saving is inside the latency floor (P6.0's size table settles which regimes
+even have wire time to save: at 20 KiB on the bounce path, 0.8 us of transfer hides under a
+330-690 us hop, so f16/q8 buy nothing for decode there and must not be sold on it).
 
 ## 3. What this model's geometry actually shards (and what it does not)
 
@@ -128,7 +167,11 @@ framework:
   probe-p2p.cu, refuses any live engine, no model, minutes not hours): allreduce latency and
   bandwidth at 10/20/40/320/1280 KiB, 2- and 4-way, three transports (RCCL linked directly;
   host-pinned bounce with a spin barrier; peer-direct copy + spin-flag + fused fp32 add kernel,
-  same-complex AND cross-complex pairs). Exit: a receipt with the latency table, a chosen
+  same-complex AND cross-complex pairs). The size grid doubles as the dtype grid (section 2b): the
+  F16 payload is the 10 KiB point, the Q8_0 payload ~6 KiB (probe 6 and 384 KiB too), so the
+  receipt can say WHERE each dtype has wire time worth saving; the fused dequant-add variants
+  (f16, q8) are measured as kernels standalone (add cost alone, without a collective) so their
+  compute cost is on the table too. Exit: a receipt with the latency table, a chosen
   transport for prefill-TP, and a GO/NO-GO for decode-TP against the ~150 us bar in section 2.
   If NO-GO, decode stays single-card-per-token and P6 becomes a prefill-throughput project plus
   the EP axis (which needs no collective at all).
@@ -136,7 +179,11 @@ framework:
   model: per-card owned slices, replicated reads, partial-sum order, checked against DS4.1's
   read geometry; a wrong boundary (straddling an `o` group or a head-group) must turn the gate
   red, and the gate must re-derive the divisibility from the engine reader's own numbers, not a
-  transcription. No ggml, no GPU.
+  transcription. The gate also models the THREE reduction dtypes (section 2b): it computes the
+  fp32 two-shard sum exactly, and each opt-in as (round/quantize partial -> dequant -> fp32 add),
+  printing the induced error per site class so the f16/q8 calibration runs have a host-number to
+  sanity-check the hardware result against - the same discipline as the relay byte-offset gate:
+  simulate the arithmetic, don't restate the theory. No ggml, no GPU.
 - **P6.2 - same-device shard spike (plumbing without a second card).** Split one layer's q_b/o
   into TWO ggml subgraphs with two sliced weight copies ON DEVICE 0 and an explicit fp32 reduce
   node between them; prove: (a) graph-build cache behaviour with sliced weights (the graph-cache
@@ -150,7 +197,10 @@ framework:
   section 3's per-pass latent copy). Measure against a same-day, same-session layer-split run and
   an unsplit control: prefill tok/s at 1200/4096-token prompts (the 39.2 tok/s single-card number
   is the reference), decode tok/s reported unchanged or explicitly refused-to-run, expert hit
-  rates at DEFAULT and pinned budgets. This phase may ALSO test decode at 2 cards if P6.0 came
+  rates at DEFAULT and pinned budgets. Reduction dtype: `f32` first as the parity/speed baseline;
+  `f16` and `q8` then as SEPARATE measured modes, each with its own twin-pair calibration at equal
+  residency at both n=1 and n=64, each allowed to be NO-GO (section 2b's rules). This phase may
+  ALSO test decode at 2 cards if P6.0 came
   back GO; if P6.0 said NO-GO it measures prefill only and says so.
 - **P6.4 - expert parallel (the axis this engine is actually built for) and the 4-card
   question.** EP as a tier change only: expert slice per card by device pinning (exists), arena
