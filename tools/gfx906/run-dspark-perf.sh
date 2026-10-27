@@ -86,15 +86,25 @@ run_one() {   # run_one <name> <env assignments...>
     [ $rc -eq 0 ] || { echo "DSPARK-PERF: $name FAILED (rc=$rc) - see $OUT.$name.log"; return 1; }
 }
 
-run_one control || exit 1
-run_one dspark \
-    STRATA_DSPARK="$SIDECAR" \
-    STRATA_DSPARK_KEEP="$PWD/tools/v41/serve/dspark_expert_counts.txt:64" \
-    STRATA_DSPARK_DEPTH="${STRATA_DSPARK_DEPTH:-4}" \
-    STRATA_DSPARK_CONF="${STRATA_DSPARK_CONF:-0.6}" || exit 1
+# ORDER reorders the boots. The first witness (receipt 2026-10-25-dspark-mtp-perf.json) booted control FIRST and
+# reported a DSpark PREFILL regression that was never attributed; a later P6.2 lesson says the first boot after the
+# page cache was evicted runs up to 2.4x slow, so the regression may be an order artifact. ORDER=dspark,control
+# boots the drafter first and says so in the SUMMARY.
+IFS=, read -ra ORD <<< "${ORDER:-control,dspark}"
+for arm in "${ORD[@]}"; do
+    case "$arm" in
+        control) run_one control || exit 1 ;;
+        dspark)  run_one dspark \
+                     STRATA_DSPARK="$SIDECAR" \
+                     STRATA_DSPARK_KEEP="$PWD/tools/v41/serve/dspark_expert_counts.txt:64" \
+                     STRATA_DSPARK_DEPTH="${STRATA_DSPARK_DEPTH:-4}" \
+                     STRATA_DSPARK_CONF="${STRATA_DSPARK_CONF:-0.6}" || exit 1 ;;
+        *) echo "ORDER: unknown arm '$arm' (want control,dspark)"; exit 2 ;;
+    esac
+done
 
 echo
-echo "== SUMMARY ($PROMPT_TARGET-token prompt, $N_TOK decode tokens, one card, unsplit, default budgets) =="
+echo "== SUMMARY ($PROMPT_TARGET-token prompt, $N_TOK decode tokens, one card, unsplit, default budgets; boot order: ${ORDER:-control,dspark}) =="
 for name in control dspark; do
     p=$(grep -m1 -oE "prompt: [0-9]+ tokens in [0-9.]+ s = [0-9.]+ tok/s" "$OUT.$name.log" | grep -oE "[0-9.]+ tok/s")
     d=$(grep -m1 -oE "decode: [0-9]+ tokens in [0-9.]+ s = [0-9.]+ tok/s" "$OUT.$name.log" | grep -oE "[0-9.]+ tok/s")
