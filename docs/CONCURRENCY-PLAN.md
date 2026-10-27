@@ -532,6 +532,25 @@ Exit criterion: a ported engine runs on 2 and 4 MI50s with token-identical greed
 single-card run, and the measured scaling is recorded whatever it turns out to be - a sublinear
 result with numbers closes the phase too (the P1.2 pattern).
 
+**P5 EXIT VERDICT (2026-10-26, #29/#30 closed, receipt `2026-10-26-p5-exit.json`): CONDITIONAL GO,
+by engine and by claim class.** CORRECTNESS: the DS4.1 staged engine is BITWISE-equal to its unsplit
+control - 64/64 at two cards (witness 20261025-190058), 128/128 at four cards, and 48/48 with the
+state column moving MID-PREFILL at a 647-token prompt (witness 20261026-231105); the GLM staged
+engine FAILS its calibrated bar (control pair 64/64 exact, staged diverges at token 16; the admission
+confound is quantified and partial) and carries defect #40 - GLM staged is NO-GO until that closes.
+STATE: every staged geometry claimed by its plan lines was built and witnessed, per-card VRAM spread
+matches the placement design, and the predicted per-stage expert caches are REFUTED with the engine's
+own counters - the tier is one card's by construction (that is #39's territory, not P5's). PERFORMANCE:
+decode is faster on two cards in both paired boots (+85%, +41% - entirely DENSE spread, expert-path
+counters identical across arms); prefill scales 3-5x NEGATIVE under staging with the limiter named
+(4.3x file-tier read amplification; the relay itself costs 2.70 ms/pass warm and is never the limiter);
+the 4-card decode mean is NOT separable from control at n=2 because within-arm boot variance is as
+large as between-arm differences - so no scaling claim stronger than the paired comparison is made.
+BOUNDARIES the checkpoint refuses by design: `--serve` and DSpark on a staged run, Engram boundaries
+above layer 14, and (arithmetically) staged runs past ~26 state-column windows per stage (~1700 tokens
+at cap 64) until the per-stage ggml graph pool grows or evicts. P4b is unblocked for the ported engines'
+per-session caches with the device ownership from #25's inventory.
+
 ## Cross-cutting
 
 - Docs: each phase updates CONCURRENCY-RADIX.md's gap table (gap -> shipped, with the receipt

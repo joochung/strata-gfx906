@@ -348,3 +348,37 @@ fix, allocating the MMQ set at load, is recorded as not shipped
    a surprise 2.57 GiB request (`tools/ds4/ds4_moe.cpp:2153`, `:2190-2206`).
 3. Token and state parity against the authors' reference build.
 4. Phase P5: driving four MI50 for these engines (layer split), per `docs/gfx906/P5-MULTI-GPU-DESIGN.md`.
+
+## Port log - P5 EXIT 2026-10-26: DS4.1 runs on four MI50s, bitwise-equal to its single-card run; GLM does not yet
+
+This is the fork-side feature the top of this file predicted: after the HIP port made these engines run on
+gfx906 at all, phase P5 gave them a layer split across the four MI50s. The full phase ledger is
+`docs/CONCURRENCY-PLAN.md` P5; the exit verdict and the three claim classes are in the plan's **P5 EXIT
+VERDICT** paragraph and `benchmarks/gfx906/receipts/2026-10-26-p5-exit.json`. What it took, in order, each
+with its artifact:
+
+* **Device plumbing (#27, opt-in `--gpus`, default path byte-identical)** and a build gate red-controlled
+  against the pre-fix header (`gate-device-split.sh`, 105 checks).
+* **Interconnect measured before relay code (#26)**: host-pinned bounce chosen over peer-direct at 25-26.7
+  GiB/s, uniform across PCI complexes (witness 20261022-055705). That choice is why a staged run moves its
+  boundary state through host memory and why the cross-device engines need `--relay-copy-weights`.
+* **The relay itself (#28)**, proven same-device first (`--gpus 0,0`), then across two cards. Getting DS4.1
+  to bitwise parity took five root causes, each found by hardware measurement and each given a host gate
+  afterwards; they are listed with their commits in `docs/gfx906/START-HERE.md` (P5.3b). The last one - the
+  window index table `i_widx` uploaded at `col0 * 4` while the graph reads it at `col0 * SWA * 4` - is the
+  one that hid under column 0 and left at the first column move, which is why every witness now runs a
+  prompt long enough to move a column.
+* **Correctness witnesses (2026-10-25/26):** DS4.1 staged == unsplit at 64/64 (2 cards), 128/128 (4 cards),
+  and 48/48 with a mid-prefill column move at 647 tokens. GLM staged FAILS its calibrated bar (control pair
+  64/64 exact, staged diverges at token 16) and is defect #40; part of that gap is the admission confound
+  (a staged decode issues no predicted prefetch: 12.4% vs 20.6% expert hit, and GPU-vs-CPU expert placement
+  changes float summation order), quantified but not eliminated.
+* **Performance (measured, not claimed):** decode faster on two cards in both paired boots (+85%, +41%) from
+  DENSE spread alone; prefill 3-5x NEGATIVE under staging, limiter named as 4.3x file-tier read amplification
+  (8875 vs 2073 expert file reads), not the relay (2.70 ms/pass warm). The full table, and the honesty rule
+  that within-arm boot variance bounds every stronger claim, are in `2026-10-26-p5.5-split-scaling.json`.
+
+Two rules this phase forced on all future work here, because each was paid for: pin expert residency
+(`--slots`) and boot order in any parity or perf comparison - free-VRAM-derived budgets and first-boot-after-
+cache-eviction both move a control more than the design change under test; and never make a bit-parity claim
+at default VRAM budgets across engine shapes.
