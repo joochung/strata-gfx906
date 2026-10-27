@@ -1093,6 +1093,7 @@ int main(int argc, char ** argv) {
         return ex;
     };
     mc.exclude = excl_for(0);
+    if (tcards > 1) { mc.arena_gib = mc.max_arena_gib = a.arena_gib / tcards; }   // shard 0 takes ITS slice too
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
     std::vector<Ds41MoeTier> tier_x((size_t) (tcards > 1 ? tcards - 1 : 0));   // shard k lives at tier_x[k-1]
     if (tcards > 1) {
