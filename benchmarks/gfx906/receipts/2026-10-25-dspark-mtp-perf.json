@@ -1,32 +1,45 @@
 {
-  "id": "dspark-mtp-perf-2026-10-25",
-  "date": "2026-10-25",
-  "phase": "MTP (DSpark) prefill/decode performance, single card, unsplit DS4.1",
-  "verdict": "MEASURED",
-  "question": "What does the checkpoint's MTP (DSpark draft stack) cost and buy on this engine?",
-  "boundary": "DSpark and a staged (--layer-split) run DO NOT COMBINE (ds41_generate.cpp: a draft's k positions cannot span a staged column boundary), so this measures the single-card unsplit shape only. No multi-card or staged MTP number exists or is claimed.",
+ "id": "dspark-mtp-perf-2026-10-25",
+ "date": "2026-10-25",
+ "phase": "MTP (DSpark) prefill/decode performance, single card, unsplit DS4.1",
+ "verdict": "MEASURED",
+ "question": "What does the checkpoint's MTP (DSpark draft stack) cost and buy on this engine?",
+ "boundary": "DSpark and a staged (--layer-split) run DO NOT COMBINE (ds41_generate.cpp: a draft's k positions cannot span a staged column boundary), so this measures the single-card unsplit shape only. No multi-card or staged MTP number exists or is claimed.",
+ "runs": {
+  "control": {
+   "prompt": "1200 tokens in 30.61 s = 39.2 tok/s (experts 0 hit / 0 cpu / 288000 pcie / 5171 file)",
+   "decode": "256 tokens in 19.03 s = 13.40 tok/s (74.6 ms/token), hit 98.4% VRAM",
+   "slots": "2616 experts in VRAM after the prompt (22.26 GiB budget)"
+  },
+  "dspark": {
+   "prompt": "1200 tokens in 58.02 s = 20.7 tok/s (experts 17423 hit / 187 cpu / 270390 pcie / 7646 file)",
+   "decode": "256 tokens in 14.71 s = 17.33 tok/s (57.7 ms/token), hit 97.6% VRAM",
+   "dspark_stats": "129 verify passes, 0.984 accepted drafts/pass = 1.984 tokens/pass, 78.3% full accepts, 16 re-fed; verify 104.0 ms/pass + draft 9.92 ms/pass (depth 4)",
+   "sidecar": "V41-MTP-Vision.Q2_K.gguf, 2.91 GB of weights on the card (loaded 6.2 s, BEFORE the expert cache sizes itself)"
+  }
+ },
+ "headline": {
+  "decode": "+29% tokens/s with MTP (13.40 -> 17.33 tok/s); the verify pass costs 104 ms + 9.9 ms draft but emits 1.984 tokens on average (78.3% of passes take all 4 drafts), netting 57.7 ms/token vs 74.6 ms/token greedy. [SUPERSEDED 2026-10-26 swap repeat: same arm measured 11.18 tok/s vs 17.33 - the +29% did not reproduce; see swap_order_repeat]",
+  "prefill": "-47% (39.2 -> 20.7 tok/s) observed. NOT explained and NOT separated from a run-order effect: this is ONE control-vs-MTP pair, the MTP boot ran second, and the prefill expert-path profiles differ (0 hits/288000 pcie vs 17423 hits/270390 pcie/7646 file), which is cache-state divergence, not obviously the drafter's 2.91 GB VRAM grab. A swap-order repeat is the next measurement before ANY prefill claim is made. [SUPERSEDED 2026-10-26 swap repeat: order artifact; see swap_order_repeat]"
+ },
+ "method": "tools/gfx906/run-dspark-perf.sh (this commit): one tokenized 1200-id prompt from real repo docs (not repeated toy text - repetition flatters the expert cache), greedy, -n 256, default VRAM budgets (no --slots pin: the drafter's VRAM cost is part of what is measured), same serve-engine wrapper and flags as the P5.3b witness; refusal guards for one-HIP-engine and RAM floor; launched via /ai/engines/gfx906/unverbraucht/run-with-free-gpus.sh (stack stopped and restarted by it).",
+ "hardware": "4x AMD Instinct MI50 32GB (gfx906), ROCm 7.2.0; run on HIP device 0; engine TS 20261025-201145, artifacts logs/dspark-perf-20261025-201145.{control,dspark}.{log,toks} (repo logs/, gitignored; numbers embedded here)",
+ "limits": [
+  "n=1 pair per configuration; no swap-order repeat; engine is not bit-deterministic across processes and expert-cache state carries boot history",
+  "1200-token prompt, 256 decode tokens, greedy; serve-mode (spec_accept sampling) not measured here",
+  "single card; staged/multi-card MTP is a refused combination, so P5.5's scaling curve must either report MTP and no-MTP separately or document the refusal as the boundary"
+ ],
+ "swap_order_repeat": {
+  "date": "2026-10-26",
+  "ts": "20261026-233431",
+  "order": "dspark,control (ORDER knob, tools/gfx906/run-dspark-perf.sh @ this branch)",
   "runs": {
-    "control": {
-      "prompt": "1200 tokens in 30.61 s = 39.2 tok/s (experts 0 hit / 0 cpu / 288000 pcie / 5171 file)",
-      "decode": "256 tokens in 19.03 s = 13.40 tok/s (74.6 ms/token), hit 98.4% VRAM",
-      "slots": "2616 experts in VRAM after the prompt (22.26 GiB budget)"
-    },
-    "dspark": {
-      "prompt": "1200 tokens in 58.02 s = 20.7 tok/s (experts 17423 hit / 187 cpu / 270390 pcie / 7646 file)",
-      "decode": "256 tokens in 14.71 s = 17.33 tok/s (57.7 ms/token), hit 97.6% VRAM",
-      "dspark_stats": "129 verify passes, 0.984 accepted drafts/pass = 1.984 tokens/pass, 78.3% full accepts, 16 re-fed; verify 104.0 ms/pass + draft 9.92 ms/pass (depth 4)",
-      "sidecar": "V41-MTP-Vision.Q2_K.gguf, 2.91 GB of weights on the card (loaded 6.2 s, BEFORE the expert cache sizes itself)"
-    }
+   "dspark": "prompt 1200 tokens in 75.44 s = 15.9 tok/s (experts 17423 hit / 187 cpu / 270390 pcie / 7646 file); decode 256 tokens in 22.81 s = 11.18 tok/s; DSpark: 129 verify passes, 0.984 accepted drafts/pass = 1.984 tokens/pass, 78.3% full, 16 re-fed; verify 166.8 ms/pass, draft 9.96 ms/pass",
+   "control": "prompt 1200 tokens in 109.26 s = 11.0 tok/s (experts 0 hit / 0 cpu / 288000 pcie / 5171 file); decode 256 tokens in 17.74 s = 14.37 tok/s"
   },
-  "headline": {
-    "decode": "+29% tokens/s with MTP (13.40 -> 17.33 tok/s); the verify pass costs 104 ms + 9.9 ms draft but emits 1.984 tokens on average (78.3% of passes take all 4 drafts), netting 57.7 ms/token vs 74.6 ms/token greedy.",
-    "prefill": "-47% (39.2 -> 20.7 tok/s) observed. NOT explained and NOT separated from a run-order effect: this is ONE control-vs-MTP pair, the MTP boot ran second, and the prefill expert-path profiles differ (0 hits/288000 pcie vs 17423 hits/270390 pcie/7646 file), which is cache-state divergence, not obviously the drafter's 2.91 GB VRAM grab. A swap-order repeat is the next measurement before ANY prefill claim is made."
-  },
-  "method": "tools/gfx906/run-dspark-perf.sh (this commit): one tokenized 1200-id prompt from real repo docs (not repeated toy text - repetition flatters the expert cache), greedy, -n 256, default VRAM budgets (no --slots pin: the drafter's VRAM cost is part of what is measured), same serve-engine wrapper and flags as the P5.3b witness; refusal guards for one-HIP-engine and RAM floor; launched via /ai/engines/gfx906/unverbraucht/run-with-free-gpus.sh (stack stopped and restarted by it).",
-  "hardware": "4x AMD Instinct MI50 32GB (gfx906), ROCm 7.2.0; run on HIP device 0; engine TS 20261025-201145, artifacts logs/dspark-perf-20261025-201145.{control,dspark}.{log,toks} (repo logs/, gitignored; numbers embedded here)",
-  "limits": [
-    "n=1 pair per configuration; no swap-order repeat; engine is not bit-deterministic across processes and expert-cache state carries boot history",
-    "1200-token prompt, 256 decode tokens, greedy; serve-mode (spec_accept sampling) not measured here",
-    "single card; staged/multi-card MTP is a refused combination, so P5.5's scaling curve must either report MTP and no-MTP separately or document the refusal as the boundary"
-  ]
+  "what_reproduced": "The MTP ALGEBRA: 129 verify passes, 0.984 accepted drafts/pass, 1.984 tokens/pass, 78.3% full, 16 re-fed - BIT-IDENTICAL to the 2026-10-25 session one day and one boot order apart. The prefill expert-path counts are also arm-stable (control 0 hits/288000 pcie/5171 file in BOTH sessions; dspark 17423/187/270390/7646 in BOTH): the drafter's KEEP-list and its 2.91 GB VRAM grab demonstrably change prefill tier admission.",
+  "what_did_not": "BOTH performance claims. (1) The prefill -47%: swapped order, dspark's prefill BEAT control (15.9 vs 11.0 tok/s) - the regression was a boot-order/host-cache artifact, not the drafter. CLAIM DROPPED. (2) The decode +29%: same arm, same acceptance, verify passes cost 166.8 ms today vs 104.0 ms on 2026-10-25 (draft 9.9 both days) - today the same MTP is 22% SLOWER than its control. CLAIM DOWNGRADED to 'accepted 1.984 tokens/pass deterministically; wall-clock benefit not established'.",
+  "pattern": "within each session the FIRST boot's prefill ran faster (39.2 then 15.9) than the SECOND's (20.7 then 11.0) regardless of which arm booted first; between sessions the first boot of 2026-10-26 (15.9) was far slower than 2026-10-25's (39.2, hours after same-model witnesses had warmed the GGUF page cache while vLLM was NOT resident). The box's ~110 GiB vLLM residency poisons the model's page cache between witness days; single-pair n=1 boots cannot separate arm from order from cache state on this engine.",
+  "rule_for_future_perf_witnesses": "any perf claim on this engine needs SAME-SESSION repeated boots per arm (control,arm,control,arm minimum) and must report the within-arm spread alongside the arm means; a single pair supports only the deterministic invariants (counts, acceptance, path statistics), never a rate comparison."
+ }
 }
