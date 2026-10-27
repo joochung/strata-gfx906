@@ -69,12 +69,15 @@ double rel(const std::vector<float> & a, const std::vector<float> & b) {
 }  // namespace
 
 int main(int argc, char ** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: test_ds41_moe <file.gguf> [--layers 0,1] [--tokens 8] [--gpu] [--chunk N] [--chunk-mmq]\n"); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: test_ds41_moe <file.gguf> [--layers 0,1] [--tokens 8] [--gpu] [--chunk N] [--chunk-mmq] [--shards N]\n"); return 2; }
     std::string path = argv[1];
     int nchunk = 0;   // --chunk N: also N tokens at once through run_chunk (the prompt path), each row vs the reference
     std::vector<int> layers = { 0 };
     int ntok = 8;
     bool gpu = false, chunk_mmq = false;
+    int shardN = 0;   // --shards N: P6.4 fan-out gate - mirror the engine's shard_run fan-in (expert e on shard e%N,
+                      // each shard its owned subset via run's n_ent, partials summed in shard order) and require it
+                      // to match the full sum; the two COVERAGE red controls must NOT match.
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--layers" && i + 1 < argc) {
@@ -86,6 +89,7 @@ int main(int argc, char ** argv) {
         else if (a == "--gpu") gpu = true;
         else if (a == "--chunk" && i + 1 < argc) nchunk = std::atoi(argv[++i]);
         else if (a == "--chunk-mmq") chunk_mmq = true;   // the prompt path's MMQ (PTQ1_0 via its Q2_0 transcode)
+        else if (a == "--shards" && i + 1 < argc) shardN = std::atoi(argv[++i]);
     }
     Ds41FileBlobs src(path);
     std::string err;
@@ -152,6 +156,39 @@ int main(int argc, char ** argv) {
             std::printf("%s L%d tok %d classes", ok ? "ok  " : "FAIL", l, t);
             for (int64_t k = 0; k < K; ++k) std::printf(" %d", g.cls(l, ids[(size_t) k]));
             std::printf("  rel %.3e\n", r);
+            // ---- P6.4 shard fan-out (host): the engine's shard_run fan-in, mirrored on this one CPU tier.
+            // The kernel work is per entry; only the FINAL summation grouping differs from the full run, so the
+            // fan-in must track the full sum to f32 noise.  Red controls: dropping or duplicating an entry is a
+            // COVERAGE error and must be caught (the same check would pass silently if the tolerance were loose).
+            if (shardN > 1) {
+                auto fanout = [&](bool red_drop, bool red_dup) {
+                    std::vector<float> tot((size_t) D, 0.0f), part((size_t) D);
+                    for (int s = 0; s < shardN; ++s) {
+                        std::vector<int32_t> si; std::vector<float> sw;
+                        for (int64_t j = 0; j < K; ++j)
+                            if (ids[(size_t) j] % shardN == s) { si.push_back(ids[(size_t) j]); sw.push_back(w[(size_t) j]); }
+                        int nn = (int) si.size();
+                        if (red_drop && nn > 0) --nn;                       // red: this entry reaches NO shard
+                        if (red_dup && nn > 0) { si.push_back(si[0]); sw.push_back(sw[0]); ++nn; }   // red: TWO
+                        if (!nn) continue;
+                        if (!tier.run(l, si.data(), sw.data(), x.data(), part.data(), nn)) {
+                            std::fprintf(stderr, "shard run failed\n"); std::exit(1);
+                        }
+                        for (int64_t i2 = 0; i2 < D; ++i2) tot[(size_t) i2] += part[(size_t) i2];
+                    }
+                    return tot;
+                };
+                const std::vector<float> fan = fanout(false, false);
+                const double r_fan = rel(fan, got);
+                const std::vector<float> fan2 = fanout(false, false);
+                const bool det = std::equal(fan.begin(), fan.end(), fan2.begin());   // deterministic fan-in
+                const double r_drop = rel(fanout(true, false), got);
+                const double r_dup = rel(fanout(false, true), got);
+                const bool sok = r_fan < 1e-5 && det && r_drop > 1e-3 && r_dup > 1e-3;
+                fails += !sok;
+                std::printf("%s L%d tok %d shards %d: rel %.3e det %s red drop %.3e dup %.3e\n",
+                            sok ? "ok  " : "FAIL", l, t, shardN, r_fan, det ? "yes" : "NO", r_drop, r_dup);
+            }
         }
     }
     // ---- prompt path: N tokens per layer through run_chunk (random picks over all experts: every class, mixed)

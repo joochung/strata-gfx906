@@ -4,7 +4,7 @@
 // the server's job: tools/v41/serve/serve_ds41.py).
 //
 //   ds41_generate -m V41-GSQ.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu] [--experts gpu|cpu]
-//                 [--engram DIR:DIR:DIR] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
+//                 [--engram DIR:DIR:DIR] [--slots auto|N] [--tier-cards N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
 //                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--tier-batch-pcie 1.0] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--kv-fp4] [--serve] [--quiet]
 //                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F]
@@ -82,6 +82,7 @@ struct Args {
     int n_predict = 64;
     std::string backend = "cuda", experts = "gpu";
     int64_t slots = 0;            // 0 = auto (free VRAM after the dense half, minus --vram-margin)
+    int tier_cards = 1;           // P6.4: --tier-cards N stripes the expert tier over N cards (1 = today, byte-identical)
     // defaults = the measured best decode config on the 4090 (2026-10-11): --pcie 0.75 --pf-b 1.43 --vram-lru
     double vram_margin_gib = 1.0, pcie = 0.75, arena_gib = 60.0, pf_b = 1.43;
     double tier_batch_pcie = -1.0;   // < 0 = STRATA_TIER_BATCH_PCIE / 1.0
@@ -164,6 +165,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--experts") a.experts = next();
         else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, ':')) a.engram.push_back(d); }
         else if (k == "--slots") { const std::string v = next(); a.slots = v == "auto" ? 0 : std::atoll(v.c_str()); }
+        else if (k == "--tier-cards") a.tier_cards = std::atoi(next().c_str());
         else if (k == "--vram-margin") a.vram_margin_gib = std::atof(next().c_str());
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
         else if (k == "--rank") a.rank = next();
@@ -210,6 +212,18 @@ bool parse(int argc, char ** argv, Args & a) {
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty());
+}
+
+/// P6.4: the idx-th GPU device WITHOUT initialising a backend on it - the per-card free-VRAM read the sharded
+/// tier budgets each shard from (gpu_backend_at initialises and owns the backend; this only names the device).
+static ggml_backend_dev_t gpu_dev_at(int idx) {
+    int seen = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        if (seen++ == idx) return d;
+    }
+    return nullptr;
 }
 
 double now_ms() {
@@ -644,6 +658,9 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "usage: see tools/v41/engine/ds41_generate.cpp\n");
         return 2;
     }
+    if (a.tier_cards < 1) { std::fprintf(stderr, "ds41_generate: --tier-cards must be >= 1\n"); return 2; }
+    if (a.tier_cards > 1 && (a.serve || !a.split.gpus.empty() || a.experts == "cpu"))
+        { std::fprintf(stderr, "ds41_generate: --tier-cards %d refuses --serve, --gpus staging and --experts cpu\n", a.tier_cards); return 2; }
     if (!a.build_mirror.empty()) {   // the second-drive blob mirror (STRATA_BLOB_MIRROR): coldest experts first
         std::string err;
         if (a.mirror_gib < 0) {   // --check-mirror F: open it with every blob compared against the model file
@@ -1043,13 +1060,73 @@ int main(int argc, char ** argv) {
                      a.prune_penalty > 0 ? ("penalised -" + std::to_string(a.prune_penalty)).c_str() : "masked out of routing", a.prune.c_str());
         mc.exclude = pruned;
     }
+    // ---- P6.4 --tier-cards N: the expert tier as N shards, one per card ---------------------------------------
+    // The tier is the ONE component whose working set wants every card while the dense half wants only its own: the
+    // 384-expert-per-layer cache is bytes, not compute.  Expert (l,e) is OWNED by shard (e % N) - a round-robin
+    // stripe, which spreads the contiguous hot head of rank.bin evenly over the cards.  Each shard is a full tier
+    // (its own VRAM cache, its own RAM arena slice of --arena-gib / N, its own CPU pool and file reads) on its own
+    // device, built with the exclude mask "everything I do not own", so no shard ever caches another shard's bytes.
+    // The fan-out/fan-in sits at the engine's host-in/host-out seam (shard_run below): a decode step partitions the
+    // top_k entries into per-shard subsets and sums the partials in FIXED SHARD ORDER.  That summation order
+    // differs from the single-card sum, so a sharded decode can flip a knife-edge token exactly like a CPU-vs-GPU
+    // expert swap does (the engine-wide rule: parity bar = twin pairs at equal residency, never bit-parity vs
+    // single-card).  Chunked prefill stays on shard 0 (its arena is the only host-in path; non-owned experts read
+    // the file tier there).  Refused with N > 1: --serve (per-request cache lifecycle is single-tier), a staged
+    // --gpus run (the tier would need its budget fan-out AND the pass-cap story at once), --experts cpu, DSpark
+    // (drafts verify via run_multi, which shards cannot serve).  N = 1: every line below runs exactly as before.
+    const int tcards = a.tier_cards;
+    if (tcards > 1) {
+        const char * dsp_env = a.serve ? std::getenv("STRATA_SERVE_DSPARK") : std::getenv("STRATA_DSPARK");
+        if (a.serve || staged || mc.cpu_only || (dsp_env && *dsp_env) || tcards < 1)
+            { std::fprintf(stderr, "ds41_generate: --tier-cards %d refuses --serve, --gpus staging, --experts cpu and "
+                                   "DSpark (STRATA_DSPARK); and N must be >= 1\n", tcards); return 2; }
+        if (gpu_dev_at(tcards - 1) == nullptr)
+            { std::fprintf(stderr, "ds41_generate: --tier-cards %d: not enough GPU devices visible\n", tcards); return 2; }
+    }
+    auto excl_for = [&](int k) {
+        if (tcards == 1) return pruned;   // byte-identical: empty unless --prune
+        std::vector<char> ex((size_t) (TG.n_layers * TG.n_experts), 0);
+        for (int64_t l = 0; l < TG.n_layers; ++l)
+            for (int64_t e = 0; e < TG.n_experts; ++e)
+                ex[(size_t) (l * TG.n_experts + e)] =
+                    (char) ((!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) || e % tcards != k);
+        return ex;
+    };
+    mc.exclude = excl_for(0);
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
-    dense.set_oom_hook([&]() { return tier.release_prestage(); });   // a prompt pass that does not fit: prestage gives way
+    std::vector<Ds41MoeTier> tier_x((size_t) (tcards > 1 ? tcards - 1 : 0));   // shard k lives at tier_x[k-1]
+    if (tcards > 1) {
+        for (int k = 1; k < tcards; ++k) {
+            Ds41MoeConfig mk = mc;
+            mk.device = k;                                     // TierDev names the card at every CUDA seam
+            mk.arena_gib = a.arena_gib / tcards;               // the RAM arena, sliced per shard
+            mk.max_arena_gib = mk.arena_gib;
+            mk.exclude = excl_for(k);
+            if (a.slots > 0) mk.slots = a.slots;               // --slots given: the slot count is PER SHARD
+            else {
+                size_t sfr = 0, stot = 0;
+                if (ggml_backend_dev_t dv = gpu_dev_at(k)) ggml_backend_dev_memory(dv, &sfr, &stot);
+                mk.slot_gib = std::max(0.0, ((double) sfr - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
+            }
+            if (!tier_x[(size_t) k - 1].init(TG, &src, mk, err)) {
+                std::fprintf(stderr, "ds41_generate: tier[%d] init: %s\n", k, err.c_str()); return 1;
+            }
+        }
+    }
+    dense.set_oom_hook([&]() { bool any = tier.release_prestage();
+                               for (auto & t : tier_x) any = any | t.release_prestage(); return any; });
     // defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the cache opens into
     // it (measured) - the old fixed --vram-margin had to cover prefill and starved decode of slots.  --serve does this
     // per request: a multi-token prompt closes the cache (release_cache), the decode after it re-seeds (~0.6 s)
     const bool defer_vram = !mc.cpu_only && (a.prefill_chunk > 1 || a.prompt_batch > 1);
     std::vector<std::pair<int32_t, int32_t>> ranked;
+    // the shard's slice of any ranked list: the pairs its stripe owns (identity for tcards == 1)
+    auto ranked_for = [&](int k) {
+        if (tcards == 1) return ranked;
+        std::vector<std::pair<int32_t, int32_t>> r;
+        for (const auto & p : ranked) if (p.second % tcards == k) r.push_back(p);
+        return r;
+    };
     if (!mc.cpu_only) {
         if (!a.rank.empty()) {
             ranked = ds41_read_ranked(a.rank, err);
@@ -1059,6 +1136,7 @@ int main(int argc, char ** argv) {
                 for (int64_t e = 0; e < TG.n_experts; ++e) ranked.emplace_back((int32_t) l, (int32_t) e);
         }
         const double t0 = now_ms();
+        if (tcards == 1) {
         if (defer_vram ? !tier.build_arena_ranked(ranked, err) : !tier.seed_from_ranked(ranked, err)) {
             std::fprintf(stderr, "ds41_generate: seed: %s\n", err.c_str());
             return 1;
@@ -1066,7 +1144,63 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "tier: %lld experts in VRAM, %lld in the RAM arena (%.1f GiB), %lld file tier; seeded in %.1f s\n",
                      (long long) tier.resident(), (long long) tier.arena_experts(), tier.arena_gib(), (long long) tier.file_tier(),
                      (now_ms() - t0) / 1000.0);
+        } else {
+            auto seed_shard = [&](Ds41MoeTier & t, int k) -> bool {
+                const std::vector<std::pair<int32_t, int32_t>> rk = ranked_for(k);
+                return defer_vram ? t.build_arena_ranked(rk, err) : t.seed_from_ranked(rk, err);
+            };
+            if (!seed_shard(tier, 0)) { std::fprintf(stderr, "ds41_generate: seed shard 0: %s\n", err.c_str()); return 1; }
+            for (int k = 1; k < tcards; ++k)
+                if (!seed_shard(tier_x[(size_t) k - 1], k)) {
+                    std::fprintf(stderr, "ds41_generate: seed shard %d: %s\n", k, err.c_str()); return 1;
+                }
+            long long rv = tier.resident(), av = tier.arena_experts(), fv = tier.file_tier();
+            double ag = tier.arena_gib();
+            for (auto & t : tier_x) { rv += t.resident(); av += t.arena_experts(); fv += t.file_tier(); ag += t.arena_gib(); }
+            std::fprintf(stderr, "tier: %d shards (expert e on card e%%%d): %lld experts in VRAM, %lld in the RAM arenas "
+                                 "(%.1f GiB), %lld file tier; seeded in %.1f s\n",
+                         tcards, tcards, rv, av, ag, fv, (now_ms() - t0) / 1000.0);
+        }
     }
+    // ---- P6.4 shard fan-out seam (--tier-cards).  For tcards == 1 every helper is the pass-through it was. ----
+    auto shard_of = [&](int64_t e) -> Ds41MoeTier & {
+        const int64_t k = e % tcards;
+        return k == 0 ? tier : tier_x[(size_t) k - 1];
+    };
+    auto shard_resident = [&](int64_t l, int64_t e) -> bool { return shard_of(e).resident(l, e); };
+    auto shard_in_arena = [&](int64_t l, int64_t e) -> bool { return shard_of(e).in_arena(l, e); };
+    auto shard_prefetch = [&](int64_t l, const int32_t * ids, int n) {
+        if (tcards == 1) { tier.prefetch(l, ids, n); return; }
+        int32_t sub[64];
+        for (int k = 0; k < tcards; ++k) {
+            int nn = 0;
+            for (int i = 0; i < n && nn < 64; ++i)
+                if (ids[i] >= 0 && ids[i] % tcards == k) sub[nn++] = ids[i];
+            if (nn) shard_of(sub[0]).prefetch(l, sub, nn);
+        }
+    };
+    // the fan-in scratch: one partial row, and the per-shard subsets of this token's top_k entries
+    std::vector<float> tsh_part((size_t) n_embd);
+    std::vector<int32_t> tsh_ids((size_t) top_k);
+    std::vector<float> tsh_w((size_t) top_k);
+    auto shard_run = [&](int64_t l, const int32_t * ids, const float * w, const float * x, float * out) -> bool {
+        if (tcards == 1) return tier.run(l, ids, w, x, out);
+        std::memset(out, 0, (size_t) n_embd * sizeof(float));
+        for (int k = 0; k < tcards; ++k) {   // fixed shard order: the fan-in's deterministic summation order
+            int nn = 0;
+            for (int i = 0; i < top_k; ++i)
+                if (ids[i] >= 0 && ids[i] % tcards == k) { tsh_ids[nn] = ids[i]; tsh_w[nn] = w[i]; ++nn; }
+            if (!nn) continue;
+            if (!shard_of(k).run(l, tsh_ids.data(), tsh_w.data(), x, tsh_part.data(), nn)) return false;
+            for (int i = 0; i < n_embd; ++i) out[i] += tsh_part[i];
+        }
+        return true;
+    };
+    // counters across shards (the printed tier line stays one line); advise_file stays shard 0's - the file
+    // readahead it hints serves that shard's paths (chunked prefill, its own CPU-tier misses)
+    auto stats_all = [&]() { Ds41MoeStats s = tier.stats(); for (auto & t : tier_x) s.add(t.stats()); return s; };
+    auto reset_all = [&]() { tier.reset_stats(); for (auto & t : tier_x) t.reset_stats(); };
+    auto resident_all = [&]() { long long r = tier.resident(); for (auto & t : tier_x) r += t.resident(); return r; };
     // the selection-only bias per layer: the prune penalty / mask, + route_bias on the experts resident in VRAM now
     std::vector<char> proxy_res;   // --bias-prompt: the would-be VRAM set (first N ranked) until the real seed
     if (a.bias_prompt > 0) {
@@ -1079,7 +1213,7 @@ int main(int argc, char ** argv) {
         }
     }
     auto resident_now = [&](int64_t l, int64_t e) {
-        return proxy_res.empty() ? tier.resident(l, e) : proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
+        return proxy_res.empty() ? shard_resident(l, e) : proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
     };
     // bias_now: route-bias / file penalty are DECODE levers - before the VRAM seed (the prompt) only the prune part
     // applies, unless --bias-prompt measures them (the prompt's file tier is prefetched; a penalty there buys nothing)
@@ -1094,7 +1228,7 @@ int main(int argc, char ** argv) {
             for (int64_t e = 0; e < TG.n_experts; ++e)
                 rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
                                : (bias_now && a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
-                               : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
+                               : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !shard_in_arena(l, e)) ? -a.route_bias_file : 0.0f;
             // P5.3b: on a staged run the layer belongs to a STAGE, and `dense` runs no layers - setting the bias only
             // there loses it.  The witness showed exactly this: the staged block below only ever rebuilt the PRUNE part,
             // so a staged decode routed with rbias = 0 while the unsplit control routed with the full
@@ -1327,7 +1461,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
     // the routed tensor's device address: re-read after every dense.set_columns (elastic columns reallocate it)
     // P5.3b: the routed-sum device shortcut is the single instance's; a staged run always hands the sums through the
     // host (finish takes routed_host), which is also the bit-identical path of STRATA_DEC_HOSTSUM=1.
-    float * rdev1 = (staged || mc.cpu_only || std::getenv("STRATA_DEC_HOSTSUM"))
+    float * rdev1 = (staged || mc.cpu_only || tcards > 1 || std::getenv("STRATA_DEC_HOSTSUM"))
                         ? nullptr : dense.routed_dev();
     double dp[6] = {0, 0, 0, 0, 0, 0};
     long dp_n = 0;
@@ -1477,7 +1611,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                     if (l + k < n_layer && !dense.predict(l + k, pk, 16)) std::fill(pk, pk + 16, -1);
                     if (l + k < n_layer)   // file-tier candidates = the reads a speculative fetch would issue
                         for (int i = 0; i < 16; ++i)
-                            if (pk[i] >= 0 && !tier.resident(l + k, pk[i]) && !tier.in_arena(l + k, pk[i]))
+                            if (pk[i] >= 0 && !shard_resident(l + k, pk[i]) && !shard_in_arena(l + k, pk[i]))
                                 for (int c = 0; c < 3; ++c) fp_cand[k][c] += i < (4 << c);
                 }
             }
@@ -1488,10 +1622,10 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
             if (mc.pf_b > 0 && !mc.cpu_only) {   // the DMAs run under this layer's attention
                 int t16[16];
                 if (have_pred) {                  // predicted by the previous layer's finish_predict (same state)
-                    tier.prefetch(l, top16, 16);
+                    shard_prefetch(l, top16, 16);
                 } else if (dense.predict(l, t16, 16)) {
                     for (int i = 0; i < 16; ++i) top16[i] = t16[i];
-                    tier.prefetch(l, top16, 16);
+                    shard_prefetch(l, top16, 16);
                 }
                 have_pred = false;
             }
@@ -1507,7 +1641,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
             if (file_pred) {
                 for (int j = 0; j < top_k; ++j) {
                     const int e = ids1[(size_t) j];
-                    if (e < 0 || tier.resident(l, e) || tier.in_arena(l, e)) continue;
+                    if (e < 0 || shard_resident(l, e) || shard_in_arena(l, e)) continue;
                     ++fp_miss[0];
                     for (int k = 1; k <= kFP; ++k) {
                         if (l - k < 0) continue;   // nothing predicted this layer k layers ago
@@ -1522,7 +1656,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                 }
             }
             const bool tok = rdev1 ? tier.run_to_dev(l, ids1.data(), w1.data(), fn, rdev1)
-                                   : tier.run(l, ids1.data(), w1.data(), fn, routed1.data());
+                                   : shard_run(l, ids1.data(), w1.data(), fn, routed1.data());
             if (!tok) { ferr = "tier.run failed"; return false; }
             if (dprof) { const double t = now_ms(); dp[3] += t - ta; ta = t; }
             const float * rsum = rdev1 ? nullptr : routed1.data();   // null: already in the routed tensor
@@ -1606,7 +1740,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
             for (int t = 0; t < m; ++t) {
                 const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
                                                         fn + (size_t) t * n_embd, rdev1 + (size_t) t * n_embd)
-                                      : tier.run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                      : shard_run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
                                                  fn + (size_t) t * n_embd, routed1.data());
                 if (!ok) { ferr = "tier.run failed"; return false; }
                 if (!rdev1) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
@@ -1701,7 +1835,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                 for (int t = 0; t < m; ++t) {
                     const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
                                                             fn + (size_t) t * n_embd, rdev1 + (size_t) t * n_embd)
-                                          : tier.run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                          : shard_run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
                                                      fn + (size_t) t * n_embd, routed1.data());
                     if (!ok) { ferr = "tier.run failed"; return false; }
                     if (!rdev1) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
@@ -1788,11 +1922,12 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
         const double min_gib = 1.0;   // below this the admission traffic is not worth the slots
         const bool explicit_slots = a.slots > 0;
         const bool cache_room = explicit_slots || seed_gib >= min_gib;
+        const double ts = now_ms();
+        if (tcards == 1) {
         tier.set_cache_enabled(cache_room);
         tier.set_slot_gib(explicit_slots ? 0.0 : seed_gib);
         if (!cache_room) std::fprintf(stderr, "serve: VRAM %.2f GiB free (margin %.2f) - no room for the expert cache, "
                                              "the arena + file tier serve the decode\n", seed_free, a.vram_margin_gib);
-        const double ts = now_ms();
         if (!tier.seed_from_ranked(ranked, err)) {
             // the cache's own allocation is what fails on a busy card (the arena is host RAM and is built first):
             // one more try with the cache off, so the request still runs
@@ -1801,6 +1936,30 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                 tier.set_cache_enabled(false);
                 if (!tier.seed_from_ranked(ranked, err)) return false;
             } else return false;
+        }
+        } else {
+            // P6.4: each shard opens its cache into ITS card's free VRAM and seeds its stripe slice (ranked_for).
+            auto open_seed = [&](Ds41MoeTier & t, int k) -> bool {
+                double gib = seed_gib;
+                if (k > 0) {
+                    size_t sfr = 0, stot = 0;
+                    if (ggml_backend_dev_t dv = gpu_dev_at(k)) ggml_backend_dev_memory(dv, &sfr, &stot);
+                    gib = std::max(0.0, ((double) sfr - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
+                }
+                const bool room = explicit_slots || gib >= min_gib;
+                t.set_cache_enabled(room);
+                t.set_slot_gib(explicit_slots ? 0.0 : gib);
+                const std::vector<std::pair<int32_t, int32_t>> rk = ranked_for(k);
+                if (t.seed_from_ranked(rk, err)) return true;
+                if (!room) return false;
+                std::fprintf(stderr, "tier[%d]: cache seed failed (%s) - seeding again with the VRAM cache off\n",
+                             k, err.c_str());
+                t.set_cache_enabled(false);
+                return t.seed_from_ranked(rk, err);
+            };
+            if (!open_seed(tier, 0)) return false;
+            for (int k = 1; k < tcards; ++k)
+                if (!open_seed(tier_x[(size_t) k - 1], k)) return false;
         }
         seed_s = (now_ms() - ts) / 1000.0;
         proxy_res.clear();   // the real VRAM set from here on
@@ -1981,7 +2140,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                     }
                     const double t1 = now_ms();
                     fd_dense += t1 - t0;
-                    const bool ok = m == 1 ? tier.run(l, cids.data(), cw.data(), fn, crouted.data())
+                    const bool ok = m == 1 ? shard_run(l, cids.data(), cw.data(), fn, crouted.data())
                                            : tier.run_chunk(l, m, cids.data(), cw.data(), fn, crouted.data());
                     if (!ok) { ferr = "tier run refused"; return false; }
                     if (dump_dir) {
@@ -2098,7 +2257,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
         const int step_max = std::getenv("STRATA_SERVE_STEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_STEP_MAX")) : 768;
         // STRATA_SERVE_PASS_BIAS=0: those passes route exactly (the decode biases only while decoding)
         const bool pass_bias = !(std::getenv("STRATA_SERVE_PASS_BIAS") && std::getenv("STRATA_SERVE_PASS_BIAS")[0] == '0');
-        std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) tier.resident(),
+        std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) resident_all(),
                     (long long) tier.arena_experts());
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
@@ -2270,7 +2429,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                     if (g >= 0) {
                         kept = true;
                         std::fprintf(stderr, "serve: cache kept for a %d-token batch (%lld tail slots out, %lld experts stay)\n",
-                                     dh, (long long) g, (long long) tier.resident());
+                                     dh, (long long) g, (long long) resident_all());
                     } else if (!kerr.empty()) {
                         std::fprintf(stderr, "serve: keep-cache: %s - releasing the cache\n", kerr.c_str());
                     }
@@ -2294,7 +2453,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                 apply_bias();
             }
             tier.rebalance_begin_prompt();
-            tier.reset_stats();
+            reset_all();
             if (const char* rl = std::getenv("STRATA_ROUTE_LOG")) {   // a turn marker for the route log (see ds41_moe.cpp)
                 if (FILE* f = std::fopen(rl, "a")) { std::fprintf(f, "# turn %d new %d %s\n", n_req, dh, by_step ? "passes" : "batch"); std::fclose(f); }
             }
@@ -2492,7 +2651,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                 bias_now = true;
                 apply_bias();
             }
-            const Ds41MoeStats pst = tier.stats();
+            const Ds41MoeStats pst = stats_all();
             std::fprintf(stderr, "serve: prompt %d tokens (%d reused, %s) in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / "
                                  "%lld pcie / %lld file)\n", total, reused, by_step ? (exact_pass ? "exact passes" : "passes") : "batch", prompt_ms / 1000.0,
                          1000.0 * (total - reused) / std::max(prompt_ms, 1e-9), (long long) pst.hits, (long long) pst.cpu,
@@ -2505,10 +2664,10 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                 }
                 cache_open = true;
                 std::fprintf(stderr, "serve: VRAM %.2f GiB free -> %lld experts in VRAM (seed %.2f s)\n", seed_free,
-                             (long long) tier.resident(), seed_s);
+                             (long long) resident_all(), seed_s);
             }
             if (ok) tier.rebalance_plan();
-            tier.reset_stats();
+            reset_all();
             const double td0 = now_ms();
             int gen = 0, pos = total;
             const char * finish = "length";
@@ -2646,7 +2805,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                 tier.rebalance_tick();
             }
             const double dec_ms = now_ms() - td0;
-            const Ds41MoeStats st = tier.stats();
+            const Ds41MoeStats st = stats_all();
             if (std::strcmp(finish, "error") == 0) {
                 std::fprintf(stderr, "serve: decode failed: %s\n", ferr.c_str());
                 hist.clear();
@@ -2676,7 +2835,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
 
     // ---- one-shot: prompt (+ perplexity), then generate
     if (prompt.empty()) { std::fprintf(stderr, "ds41_generate: empty prompt\n"); return 2; }
-    tier.reset_stats();
+    reset_all();
     const double tp0 = now_ms();
     std::vector<float> all;
     const int dm_tail = dump_main ? std::min<int>(128, (int) prompt.size() - 1) : 0;   // DSpark's window, as steps
@@ -2743,9 +2902,9 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
     if (defer_vram && dm_tail == 0 && !spec) {   // the prompt is done: its buffers go back, the VRAM expert cache opens into the free space
         if (!open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
         std::fprintf(stderr, "\nVRAM after the prompt: %.2f GiB free -> %.2f GiB of expert slots: %lld experts in VRAM (%.1f s)",
-                     seed_free, seed_gib, (long long) tier.resident(), seed_s);
+                     seed_free, seed_gib, (long long) resident_all(), seed_s);
     }
-    const Ds41MoeStats pst = tier.stats();
+    const Ds41MoeStats pst = stats_all();
     std::fprintf(stderr, "\nprompt: %zu tokens in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / %lld pcie / %lld file)\n",
                  prompt.size(), prompt_ms / 1000.0, 1000.0 * prompt.size() / prompt_ms, (long long) pst.hits,
                  (long long) pst.cpu, (long long) pst.pcie, (long long) pst.file_tier);
@@ -2771,7 +2930,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
         std::ofstream f(a.dump_last, std::ios::binary);
         f.write((const char *) last_logits.data(), (std::streamsize) (last_logits.size() * 4));
     }
-    tier.reset_stats();
+    reset_all();
     // STRATA_PROFILE_DECODE=1: nsys --capture-range=cudaProfilerApi captures exactly the decode
     static const bool prof_decode = std::getenv("STRATA_PROFILE_DECODE") != nullptr;
     if (prof_decode) Ds41MoeTier::profiler(true);
@@ -2954,7 +3113,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
     }
     const double dec_ms = now_ms() - td0;
     if (prof_decode) Ds41MoeTier::profiler(false);
-    const Ds41MoeStats st = tier.stats();
+    const Ds41MoeStats st = stats_all();
     std::fprintf(stderr, "decode: %d tokens in %.2f s = %.2f tok/s; experts %lld hit / %lld cpu / %lld pcie / %lld file "
                  "(%.1f%% VRAM hits), cpu %.0f ms, file %.0f ms; spec reads %lld issued / %lld used; prefetch %lld issued / "
                  "%lld outside the arena / %lld used\n",

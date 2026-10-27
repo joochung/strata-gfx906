@@ -1987,9 +1987,10 @@ bool check_pool_batch(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const
     return true;
 }
 
-bool cpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out) {
+bool cpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out,
+             int n_ent = -1) {
     const int64_t H = im.g.n_embd;
-    const int64_t K = im.g.top_k;
+    const int64_t K = n_ent > 0 ? (int64_t) n_ent : im.g.top_k;   // P6.4 shard subset (see Ds41MoeTier::run)
     const double t0 = now_ms();
     std::vector<const uint8_t*> held((size_t) K, nullptr);
     for (int64_t k = 0; k < K; ++k) {
@@ -2170,14 +2171,14 @@ int32_t arena_victim(Ds41MoeImpl& im, int64_t layer, uint64_t need, const int32_
 }
 
 bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x_host,
-             const void* x_dev, float* out, void* out_dev = nullptr) {
+             const void* x_dev, float* out, void* out_dev = nullptr, int n_ent = -1) {
     static const bool prof = std::getenv("DS4_TIER_PROF") != nullptr;
     double tp = prof ? now_ms() : 0;
     auto mark = [&](int i) { if (prof) { const double t = now_ms(); g_prof[i] += t - tp; tp = t; } };
     Gpu& gp = *im.gpu;
     const TierDev td(gp.dev);   // P5.3b: this tier names its device at every GPU seam (see TierDev)
     const int64_t H = im.g.n_embd;
-    const int64_t K = im.g.top_k;
+    const int64_t K = n_ent > 0 ? (int64_t) n_ent : im.g.top_k;   // P6.4: a shard sums its owned prefix of the entries
     const int64_t B = im.blob;                        // staging STRIDE (the largest blob)
     auto BLX = [&](int32_t e) { return im.bl[(size_t) im.g.cls(layer, e)]; };   // an expert's blob (the bytes a DMA moves)
     const bool lru = im.cfg.vram_lru && gp.cache && !im.cfg.no_cache;   // uniform (DS4) too: every slot fits any blob
@@ -4539,26 +4540,27 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
 }
 #endif
 
-bool Ds41MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out) {
+bool Ds41MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out, int n_ent) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids6 || !w6 || !x || !out) return false;
-    rebal_count(*im_, layer, ids6, im_->g.top_k);
+    rebal_count(*im_, layer, ids6, n_ent > 0 ? n_ent : im_->g.top_k);
     if (!im_->g.routed(layer)) return false;
-    if (im_->cfg.cpu_only) return cpu_run(*im_, layer, ids6, w6, x, out);
+    if (im_->cfg.cpu_only) return cpu_run(*im_, layer, ids6, w6, x, out, n_ent);
 #if defined(DS4_MOE_CUDA)
-    return gpu_run(*im_, layer, ids6, w6, x, nullptr, out);
+    return gpu_run(*im_, layer, ids6, w6, x, nullptr, out, nullptr, n_ent);
 #else
     return false;
 #endif
 }
 
-bool Ds41MoeTier::run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev) {
+bool Ds41MoeTier::run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev,
+                             int n_ent) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids6 || !w6 || !x || !out_dev) return false;
-    rebal_count(*im_, layer, ids6, im_->g.top_k);
+    rebal_count(*im_, layer, ids6, n_ent > 0 ? n_ent : im_->g.top_k);
     if (!im_->g.routed(layer) || im_->cfg.cpu_only) return false;
 #if defined(DS4_MOE_CUDA)
-    return gpu_run(*im_, layer, ids6, w6, x, nullptr, nullptr, out_dev);
+    return gpu_run(*im_, layer, ids6, w6, x, nullptr, nullptr, out_dev, n_ent);
 #else
     return false;
 #endif
@@ -4892,14 +4894,15 @@ bool Ds41MoeTier::run_chunk_dev(int64_t layer, int n, const int32_t* ids, const 
     return false;
 }
 
-bool Ds41MoeTier::run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out) {
+bool Ds41MoeTier::run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out,
+                          int n_ent) {
     if (!im_->inited) return false;
     if (!ids6 || !w6 || !x_dev || !out) return false;
-    rebal_count(*im_, layer, ids6, im_->g.top_k);
+    rebal_count(*im_, layer, ids6, n_ent > 0 ? n_ent : im_->g.top_k);
     if (!im_->g.routed(layer)) return false;
     if (im_->cfg.cpu_only) return false;   // there is no device input without a device tier
 #if defined(DS4_MOE_CUDA)
-    return gpu_run(*im_, layer, ids6, w6, nullptr, x_dev, out);
+    return gpu_run(*im_, layer, ids6, w6, nullptr, x_dev, out, nullptr, n_ent);
 #else
     return false;
 #endif

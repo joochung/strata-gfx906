@@ -443,14 +443,16 @@ public:
     /// VRAM-resident nor in the arena into a pinned stash; that layer's run takes them from there.  A hint only.
     void spec_read(int64_t layer, const int32_t* ids, int n, bool d3 = false);
 
-    /// out[i] = sum_k w6[k] * expert_{ids6[k]}(x)[i], with `x` on the host.  Synchronous.
-    bool run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out);
+    /// out[i] = sum_k w6[k] * expert_{ids6[k]}(x)[i], with `x` on the host.  Synchronous.  `n_ent` (default: all
+    /// top_k) computes the sum over the FIRST `n_ent` entries only - the sharded-tier fan-out (P6.4, --tier-cards)
+    /// passes each shard its owned subset.  Entries beyond n_ent are never looked up, fetched or computed.
+    bool run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out, int n_ent = -1);
     /// `run` with the weighted sum computed on the card and written to the device row `out_dev` (n_embd floats, e.g.
     /// the dense half's routed tensor): the same bits as `run`'s host sum, without its parts readback and upload.
     /// GPU tier only (false in cpu_only).
-    bool run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev);
+    bool run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev, int n_ent = -1);
     /// The same with `x` already on the device (the engine's attention output).  CUDA modes only.
-    bool run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out);
+    bool run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out, int n_ent = -1);
 
     void close();
 
