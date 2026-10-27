@@ -80,7 +80,7 @@ run_one() {   # run_one <name> [ENV=k=v ...] [extra engine args...]   (ENV= must
     sleep 10
     local name=$1; shift
     local envkv=()
-    if [ "${1#ENV=}" != "${1:-}" ]; then envkv=("${1#ENV=}"); shift; fi
+    if [ $# -gt 0 ] && [ "${1#ENV=}" != "$1" ]; then envkv=("${1#ENV=}"); shift; fi
     echo "=== $name start $(date +%T) ==="
     env "${envkv[@]}" "${ENG[@]}" "${ARGS[@]}" "$@" >"$OUT.$name.toks" 2>"$OUT.$name.log"
     local rc=$?
@@ -91,27 +91,40 @@ run_one() {   # run_one <name> [ENV=k=v ...] [extra engine args...]   (ENV= must
     [ $rc -eq 0 ] || { echo "P6.2: $name FAILED (rc=$rc) - see $OUT.$name.log"; return 1; }
 }
 
+# WARM: a throwaway short boot first so EVERY measured arm sees the same warm page cache.  Without it the arm order
+# decides: the first boot re-reads the GGUF from NVMe (~6 GB/s) when the previous tenant (vLLM boot) evicted the
+# cache, and that alone moved a control run from 26.9 to 11.0 tok/s between sessions (2026-10-26 20:55 log).
+if [ "${WARM:-1}" = 1 ]; then
+    echo "=== warmup (discarded) start $(date +%T) ==="
+    "${ENG[@]}" "${ARGS[@]}" -n 4 > /dev/null 2>&1
+    echo "=== warmup done $(date +%T) ==="
+fi
+
 run_one control || exit 1
-# the sharded run: its loader MUST report 6 sliced copies per sharded layer (3 tensors x 2 shards), else the flag
-# silently did not reach the graph and the comparison would be a no-op measured twice.  STRATA_TP_NO_FA=1 keeps the
-# same sliced weights and GEMM shape but runs ONE full-head flash-attn - the difference between the two tp arms
-# prices the per-shard FA launches alone (see ds41_dense.cpp's attribution comment).
+# the sharded runs: their loader MUST report 6 sliced copies per sharded layer (3 tensors x 2 shards), else the flag
+# silently did not reach the graph and the comparison would be a no-op measured twice.  Arms (see ds41_dense.cpp's
+# attribution comments): tp = the full seam; tp_nofa = same sliced weights/GEMMs/add but ONE full-head FA (isolates
+# the FA split); tp_b = full FA + full output_a, ONLY the output_b reduction halved + the add (isolates the half-k
+# GEMM path and the reduce node).  Each subtraction prices exactly one layer of the design.
 N_SLICES=$(( $(echo "$TPL" | awk -F, '{print NF}') * 6 ))
-run_one tp --tp-shards 2 --tp-layers "$TPL" || exit 1
-if ! grep -q "p6.2 tp seam: $N_SLICES sliced weight copies" "$OUT.tp.log"; then
-    echo "P6.2: the tp run did not build the expected $N_SLICES sliced weight copies - refusing to compare"; exit 1
-fi
-if [ "${ARM_NO_FA:-1}" = 1 ]; then
-    run_one tp_nofa ENV=STRATA_TP_NO_FA=1 --tp-shards 2 --tp-layers "$TPL" || exit 1
-    if ! grep -q "p6.2 tp seam: $N_SLICES sliced weight copies" "$OUT.tp_nofa.log"; then
-        echo "P6.2: the tp_nofa run did not build the expected $N_SLICES sliced weight copies"; exit 1
+ARM="${ARMS:-tp,tp_nofa}"
+IFS=, read -ra ARMS_ARR <<< "$ARM"
+for arm in "${ARMS_ARR[@]}"; do
+    case "$arm" in
+        tp)      run_one tp      --tp-shards 2 --tp-layers "$TPL" || exit 1 ;;
+        tp_nofa) run_one tp_nofa ENV=STRATA_TP_NO_FA=1 --tp-shards 2 --tp-layers "$TPL" || exit 1 ;;
+        tp_b)    run_one tp_b    ENV=STRATA_TP_B_ONLY=1 --tp-shards 2 --tp-layers "$TPL" || exit 1 ;;
+        *) echo "P6.2: unknown arm '$arm' (ARMS=tp,tp_nofa,tp_b)"; exit 3 ;;
+    esac
+    if ! grep -q "p6.2 tp seam: $N_SLICES sliced weight copies" "$OUT.$arm.log"; then
+        echo "P6.2: $arm did not build the expected $N_SLICES sliced weight copies - refusing to compare"; exit 1
     fi
-fi
+done
 
 echo
 echo "== SUMMARY ($PROMPT_TARGET-token prompt, $N_TOK decode tokens, chunk 64, one card, slots $SLOTS both, ${TPL} sharded) =="
 rate() { grep -m1 -oE "$1: [0-9]+ tokens in [0-9.]+ s = [0-9.]+ tok/s" "$2" | grep -oE "[0-9.]+ tok/s"; }
-for name in control tp tp_nofa; do
+for name in control tp tp_nofa tp_b; do
     [ -f "$OUT.$name.log" ] || continue
     p=$(rate prompt "$OUT.$name.log"); d=$(rate decode "$OUT.$name.log")
     v=$(grep -m1 -oE "[0-9]+ experts in VRAM" "$OUT.$name.log" || echo "?")
@@ -129,12 +142,15 @@ def rate(name, kind):
     return float(m.group(1)) if m else None
 for kind in ("prompt", "decode"):
     c = rate("control", kind)
-    for arm in ("tp", "tp_nofa"):
+    for arm in ("tp", "tp_nofa", "tp_b"):
         t = rate(arm, kind)
         if c and t:
             print(f"  {arm} {kind} overhead vs control: {100*(c-t)/c:+.2f}% (slower is positive)")
 a = open(f"{out}.control.toks").read().split()
-for arm in ("tp", "tp_nofa"):
+for arm in ("tp", "tp_nofa", "tp_b"):
+    import os
+    if not os.path.exists(f"{out}.{arm}.toks"):
+        continue
     b = open(f"{out}.{arm}.toks").read().split()
     n = min(len(a), len(b))
     div = next((i for i in range(n) if a[i] != b[i]), n)

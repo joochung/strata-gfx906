@@ -961,10 +961,14 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         // full-head rope and sinks), the shard's heads/groups taken as a view.  tp-minus-no_fa therefore prices the
         // per-shard FA launches alone; no_fa-minus-control prices the sliced-GEMM/reduce plumbing the real split keeps.
         static const bool no_fa = std::getenv("STRATA_TP_NO_FA") != nullptr;
+        // STRATA_TP_B_ONLY=1 goes one step further: ONE full FA, ONE full batch-OG output_a, and then only the
+        // reduction is split - two half-k output_b mul_mats over row-views of the SAME full operand, plus the add.
+        // If this arm still carries the overhead, the cost lives in the half-k mul_mat path or the reduce node itself.
+        static const bool b_only = std::getenv("STRATA_TP_B_ONLY") != nullptr;
         ggml_tensor * sinks = im.BL(il, "attn_sinks.weight");
         ggml_tensor * partial[2] = { nullptr, nullptr };
         ggml_tensor * o_full = nullptr;
-        if (no_fa) {
+        if (no_fa || b_only) {
             ggml_tensor * q4 = ggml_permute(gc, ggml_reshape_4d(gc, q, DH, NH, 1, n), 0, 2, 1, 3);
             o_full = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
             ggml_flash_attn_ext_add_sinks(o_full, sinks);
@@ -972,7 +976,19 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
             o_full = b.rope(o_full, pos, r, true);
             o_full = ggml_permute(gc, ggml_reshape_4d(gc, o_full, im.OGD, im.OG, 1, n), 0, 2, 1, 3);   // [OGD, n, OG, 1]
         }
+        ggml_tensor * oa_flat_full = nullptr;   // B_ONLY: the single full [OL*OG, n] reduction operand
+        if (b_only) {
+            ggml_tensor * wo_a = ggml_reshape_3d(gc, im.BL(il, "attn_output_a.weight"), im.OGD, im.OL, im.OG);
+            oa_flat_full = b.flat2(ggml_permute(gc, ggml_mul_mat(gc, wo_a, o_full), 0, 2, 1, 3), im.OL * im.OG, n);
+        }
         for (int s = 0; s < 2; ++s) {
+            if (b_only) {
+                ggml_tensor * wb = im.BL(il, "attn_output_b.s" + std::to_string(s) + ".weight");
+                partial[s] = ggml_mul_mat(gc, wb, ggml_view_2d(gc, oa_flat_full, im.OL * OGS, n, oa_flat_full->nb[1],
+                                                               (size_t) s * (size_t) (im.OL * OGS) *
+                                                                   ggml_element_size(oa_flat_full)));
+                continue;
+            }
             ggml_tensor * oa_s = nullptr;
             if (no_fa) {
                 ggml_tensor * wo_a_s = ggml_reshape_3d(gc, im.BL(il, "attn_output_a.s" + std::to_string(s) + ".weight"),

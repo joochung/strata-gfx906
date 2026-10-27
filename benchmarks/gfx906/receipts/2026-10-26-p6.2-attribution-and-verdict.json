@@ -1,0 +1,51 @@
+{
+  "phase": "P6.2 tensor-TP same-device spike - attribution witness and verdict",
+  "date": "2026-10-26",
+  "branch_commit_under_test": "697f0098 + B_ONLY/warmup runner additions on gfx906/p5.3-relay",
+  "hardware": "1x AMD Instinct MI50 32 GB (HIP device 0), ROCm 7.2.0; host 125 GiB; engine ds41_generate build-906",
+  "sessions": {
+    "w1_witness": {
+      "log": "logs/p6.2-tp-20261026-194622.*",
+      "control": { "prompt": 27.2, "decode": 13.78 },
+      "tp_10_of_40": { "prompt": 20.2, "decode": 13.83 },
+      "tokens": "128/128 identical",
+      "note": "pre-fix loader (4 dead indexer slices); runner guard formula bug refused the first attempt"
+    },
+    "w2_attribution": {
+      "log": "logs/p6.2-tp-20261026-203035.*",
+      "control": { "prompt": 26.9, "decode": 13.83 },
+      "tp": { "prompt": 16.4, "decode": 13.81 },
+      "tp_nofa": { "prompt": 16.0, "decode": 13.82 },
+      "tokens": "all arms 128/128 identical",
+      "verdict_input": "FA split costs nothing: tp_nofa (+40.5%) equals tp (+39.0%) within noise"
+    },
+    "w3_bonly_cold_control": {
+      "log": "logs/p6.2-tp-20261026-205554.*",
+      "control": { "prompt": 11.0, "decode": 7.64 },
+      "tp_b": { "prompt": 19.1, "decode": 13.80 },
+      "note": "control here is CONTAMINATED: the intervening vLLM restart evicted the GGUF page cache and the first boot re-read it from NVMe; this session is the witness that first-boot cache warmth alone can move a control run 2.4x. Numbers not used in the verdict; it motivated the throwaway warmup boot now in the runner."
+    },
+    "w4_definitive": {
+      "log": "logs/p6.2-tp-20261026-211027.*",
+      "setup": "throwaway warmup boot, then control, tp, tp_nofa, tp_b, same session, same binary, slots 1500 all arms, 512-token prompt chunk 64, n=128",
+      "control": { "prompt": 19.7, "decode": 13.84 },
+      "tp": { "prompt": 13.8, "decode": 5.90 },
+      "tp_nofa": { "prompt": 10.9, "decode": 13.79 },
+      "tp_b": { "prompt": 11.6, "decode": 13.77 },
+      "tokens": "all arms 128/128 identical to control (three sessions, every arm, zero knife-edge flips)",
+      "decode_instability": "the tp (FA-split) arm decoded at 5.90 tok/s here and 13.81 in w2, same binary, same args, 2nd boot in both sessions; MoE tier counters are identical between the runs (97.7% VRAM hits, same file/cpu ms), so the extra ~96 ms/token sits in the dense/attention path itself. Unexplained; treated as a risk of the FA-split shape, not of the reduce node (tp_nofa/tp_b decodes never moved)."
+    }
+  },
+  "attribution": {
+    "fa_split": "w2: tp - tp_nofa ~ 0 - the two half-head flash-attn launches cost nothing on this device",
+    "gemm_reduce_path": "w4 tp_b: full FA + full output_a, ONLY attn_output_b halved into two mul_mats over row-views plus the single f32 add, still +41.1% at 10/40 layers - the half-k mul_mat path (or the views feeding it) is where prefill TP dies",
+    "noise_hygiene": "control absolute rate is session-dependent (11.0-26.9 tok/s): first-boot page-cache state after another tenant (vLLM) ran between sessions; warmup boot added to the runner. Within sessions arms ran 2nd/3rd/4th behind control; a monotone late-boot drag would FAVOR none of the arms' verdicts, and tp_b ran LAST yet still lost 41% to the first arm."
+  },
+  "kill_gate": {
+    "rule": "same-device 2-shard overhead > 10% at n=64 means GEMM halving cannot win and cross-card prefill TP is NO-GO (P6.2 rule, docs/gfx906/P6-TENSOR-SPLIT.md)",
+    "measured": "tp +26..+45%, tp_nofa +40..+45%, tp_b +41% at 10 of 40 layers, three sessions",
+    "verdict": "PREFILL TENSOR-TP: NO-GO. A cross-card split would put ONE half-k mul_mat per card - exactly the op measured pathological even in the minimal tp_b arm - plus a bounce allreduce on top. Halving the GEMM does not halve its time on this ggml/HIP path; the reduction and the split itself cost more than the GEMM halves save."
+  },
+  "what_still_holds": "The seam ALGEBRA is certified: reduce node composes with the hc machine and per-column carry, 128/128 identical greedy tokens in every arm in every session across 8 chunked-prefill passes and 128 decodes; the graph cache, sliced-weight loader and per-shard flash-attn all build and replay correctly. If a future kernel path makes half-k mul_mats pay their byte-bound share, w4 is the measurement to re-take; the spike code (opt-in, default byte-identical) and the three-arm runner stay on the branch for that day.",
+  "not_tested": "cross-card placement (each card one half-GEMM): the same-device spike measures both halves on one device per the plan's gate design; m-axis (output-column) splits were considered and rejected on paper because every hc_post/rms_norm mixes across D; decode weight-read-split benefit needs cross-card wiring and is NOT answered by any same-device number - the tp decode flakiness (5.90 vs 13.81) is itself a warning there."
+}

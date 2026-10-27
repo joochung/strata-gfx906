@@ -188,7 +188,15 @@ bit-for-bit, so 61/64 is within this engine's own reproducibility and not a plac
 
 The tensor-split (model-parallel-by-shard) plan - distinct from P5's layer split, with its own
 collective-latency kill gate before any engine surgery - is [P6-TENSOR-SPLIT.md](P6-TENSOR-SPLIT.md)
-(tasks #35-#39).  It is PLAN ONLY: no code, no measurement beyond what it cites with receipts.
+(tasks #35-#39).  Status as of 2026-10-26: P6.0 (transport probe: bounce-only, every GPU-direct
+transport refused this board) and P6.1 (sharding-algebra host gate, 102 checks red-controlled) are
+closed; the P6.2 same-device spike ran in four witnessed sessions and its kill gate fired - the
+half-k mul_mat path costs +41% at 10 of 40 layers even in the minimal arm, so PREFILL TENSOR-TP is
+NO-GO on this ggml/HIP path (receipts 2026-10-26-p6.2-tp-shard-same-device.json and
+2026-10-26-p6.2-attribution-and-verdict.json; the seam itself is numerically certified, 128/128
+identical tokens in every arm).  #38 (tensor-split-within-stage) inherits that NO-GO for its
+prefill half; any decode-TP proposal must answer the w4 decode instability and cannot reuse any
+same-device number as its benefit.
 
 The checked-in gfx906 command entry point is [`tools/gfx906.py`](../../tools/gfx906.py). Run
 `python tools/gfx906.py doctor` without a GPU. In a fresh Python environment, install the pinned schema-test

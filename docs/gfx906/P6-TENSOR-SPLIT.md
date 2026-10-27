@@ -291,7 +291,7 @@ RED (truncation-vs-RNE probe). Usable TP widths re-derived from O_GROUPS=8: {1,2
 calibration must sanity-check against): f32 max 1.1e-4-2.2e-4; f16 max 2.3e-2-7.0e-2;
 q8 max 0.41-1.11 (attn site / shared-FFN site, 2-way and 4-way).
 
-## 9. P6.2 same-device shard spike: the seam in the engine (2026-10-26, code; hardware witness pending)
+## 9. P6.2 same-device shard spike: the seam in the engine (2026-10-26, witnessed - prefill TP NO-GO)
 
 `--tp-shards 2 [--tp-layers 0,1,...]` on ds41_generate (opt-in; default tp_shards=1 leaves the graph path
 unchanged, AGENTS.md). One device, no transport: the seam exactly as section 3 and the P6.1 gate certify it -
@@ -315,5 +315,24 @@ The witness (tools/gfx906/run-p6.2-tp-shard.sh, launched through the GPU wrapper
 same --slots pin BOTH runs (the residency rule), control default vs tp 10-of-40 layers; parses the engine's
 own prompt/decode tok/s lines; kills on a wrong sliced-copy count so a flag that did not reach the graph
 cannot be measured twice and called a no-op. Kill gate as planned: >10% overhead at n=64 with only the seam
-plumbing on one device = cross-card prefill TP NO-GO. Status of the numbers: NOT YET RUN - the operator's
-GPU window decides when; no overhead or numerics claim is made until the receipt exists.
+plumbing on one device = cross-card prefill TP NO-GO.
+
+Witnessed 2026-10-26 in four sessions (receipts 2026-10-26-p6.2-tp-shard-same-device.json and
+2026-10-26-p6.2-attribution-and-verdict.json). Numerics: exit criteria (a)-(c) PASS outright - 128/128
+identical greedy tokens, every arm, every session, through 8 chunked-prefill passes and 128 decodes; the
+f32 reduce node composes with the hc machine and the per-column carry with zero knife-edge flips.
+Performance: the kill gate fires with room to spare, and the attribution arms say where the cost lives.
+The flash-attn split costs nothing (tp_nofa, one full-head FA but the same sliced GEMMs and add, matches
+tp within noise). tp_b - full FA, full output_a, ONLY attn_output_b halved into two mul_mats plus the one
+add - still costs +41% at 10 of 40 layers, so the half-k mul_mat path itself, not the seam plumbing, is
+where prefill TP dies: halving the GEMM does not halve its time on this ggml/HIP q8 path, and a cross-card
+split would run exactly that half-k op per card plus a bounce allreduce on top. PREFILL TENSOR-TP: NO-GO.
+Decode side: the seam is free when stable (tp_nofa/tp_b decode +0.4% or less, both sessions they were
+measured), but the FA-split tp arm decoded at 5.90 tok/s in w4 against 13.81 in w2 - same binary, same
+args, MoE tier counters identical - an unexplained instability of that shape and a warning for any
+decode-TP wiring that reuses it. Two hygiene facts the witnesses exposed, both now enforced by the runner:
+a first boot after another tenant evicted the GGUF page cache runs 2.4x slow (throwaway warmup boot added),
+and arm absolute rates are only comparable within a session.
+
+The spike stays on the branch, opt-in and default-path byte-identical: if a future kernel path makes
+half-k mul_mats pay their byte-bound share, w4 is the measurement to re-take with ARMS=tp,tp_nofa,tp_b.
