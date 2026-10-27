@@ -508,6 +508,9 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                 if (ti.name.size() >= suf[i].size() &&
                     ti.name.compare(ti.name.size() - suf[i].size(), suf[i].size(), suf[i]) == 0) which = i;
             if (which < 0 || ti.shape.empty()) return std::string();
+            // the lightning indexer's OWN projection ends with "attn_q_b.weight" too (blk.N.indexer.attn_q_b.weight);
+            // the seam never reads a slice of it, and the witness run proved the suffix collision loads DEAD copies
+            if (ti.name.find("indexer.") != std::string::npos) return std::string();
             // the same layer gate build_attn's seam applies: off-list layers keep the default branch, so they must
             // not pay for sliced weight copies either
             const long ilv = std::strtol(ti.name.c_str() + 4, nullptr, 10);
@@ -952,9 +955,32 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                          im.w.t.count("blk." + std::to_string(il) + ".attn_output_b.s0.weight") == 1;
     if (tp_here) {
         const int64_t NHS = NH / 2, OGS = im.OG / 2;   // heads / groups per shard
+        // ATTRIBUTION knob (host-side spike only, no flag on the default path): STRATA_TP_NO_FA=1 keeps EVERYTHING the
+        // sharded arm does - the same contiguous sliced weights, the same batch-4 output_a, the same two half-k
+        // output_b mul_mats and the same add - and replaces only the flash-attn split: ONE full-head FA (with the
+        // full-head rope and sinks), the shard's heads/groups taken as a view.  tp-minus-no_fa therefore prices the
+        // per-shard FA launches alone; no_fa-minus-control prices the sliced-GEMM/reduce plumbing the real split keeps.
+        static const bool no_fa = std::getenv("STRATA_TP_NO_FA") != nullptr;
         ggml_tensor * sinks = im.BL(il, "attn_sinks.weight");
         ggml_tensor * partial[2] = { nullptr, nullptr };
+        ggml_tensor * o_full = nullptr;
+        if (no_fa) {
+            ggml_tensor * q4 = ggml_permute(gc, ggml_reshape_4d(gc, q, DH, NH, 1, n), 0, 2, 1, 3);
+            o_full = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
+            ggml_flash_attn_ext_add_sinks(o_full, sinks);
+            o_full = ggml_reshape_3d(gc, o_full, DH, NH, n);
+            o_full = b.rope(o_full, pos, r, true);
+            o_full = ggml_permute(gc, ggml_reshape_4d(gc, o_full, im.OGD, im.OG, 1, n), 0, 2, 1, 3);   // [OGD, n, OG, 1]
+        }
         for (int s = 0; s < 2; ++s) {
+            ggml_tensor * oa_s = nullptr;
+            if (no_fa) {
+                ggml_tensor * wo_a_s = ggml_reshape_3d(gc, im.BL(il, "attn_output_a.s" + std::to_string(s) + ".weight"),
+                                                       im.OGD, im.OL, OGS);   // the SAME contiguous slice the sharded arm reads
+                ggml_tensor * os = ggml_view_4d(gc, o_full, im.OGD, n, OGS, 1, o_full->nb[1], o_full->nb[2],
+                                                o_full->nb[3], (size_t) s * (size_t) OGS * o_full->nb[2]);
+                oa_s = ggml_permute(gc, ggml_mul_mat(gc, wo_a_s, os), 0, 2, 1, 3);   // [OL, OG/2, n]
+            } else {
             ggml_tensor * qs = ggml_view_3d(gc, q, DH, NHS, n, q->nb[1], q->nb[2], (size_t) s * (size_t) NHS * q->nb[1]);
             // the flash-attn wants [DH, 1, heads, tokens]: build it as a 4D VIEW of q directly (a reshape of the
             // strided 3D slice would assert - the slice is not contiguous), with the SAME axis strides the default
@@ -970,9 +996,10 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
             os = ggml_permute(gc, ggml_reshape_4d(gc, os, im.OGD, OGS, 1, n), 0, 2, 1, 3);   // [OGD, n, OG/2, 1]
             ggml_tensor * wo_a_s = ggml_reshape_3d(gc, im.BL(il, "attn_output_a.s" + std::to_string(s) + ".weight"),
                                                    im.OGD, im.OL, OGS);
-            ggml_tensor * oa_s = ggml_permute(gc, ggml_mul_mat(gc, wo_a_s, os), 0, 2, 1, 3);   // [OL, OG/2, n]
-            partial[s] = ggml_mul_mat(gc, im.BL(il, "attn_output_b.s" + std::to_string(s) + ".weight"),
-                                      b.flat2(oa_s, im.OL * OGS, n));                          // [D, n]
+            oa_s = ggml_permute(gc, ggml_mul_mat(gc, wo_a_s, os), 0, 2, 1, 3);   // [OL, OG/2, n]
+            }
+            ggml_tensor * wb = im.BL(il, "attn_output_b.s" + std::to_string(s) + ".weight");   // contiguous in BOTH arms
+            partial[s] = ggml_mul_mat(gc, wb, b.flat2(oa_s, im.OL * OGS, n));   // [D, n]
         }
         attn = ggml_add(gc, partial[0], partial[1]);   // the reduce node (allreduce stand-in; f32)
     } else {

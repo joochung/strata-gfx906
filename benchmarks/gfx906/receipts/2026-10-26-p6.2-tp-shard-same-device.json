@@ -1,0 +1,27 @@
+{
+  "receipt": "2026-10-26-p6.2-tp-shard-same-device",
+  "phase": "P6.2 same-device shard spike (docs/gfx906/P6-TENSOR-SPLIT.md section 5), task #37",
+  "status": "MEASURED - numerics PASS, decode overhead NONE, prefill overhead MATERIAL but UNATTRIBUTED; kill-gate verdict HELD pending the attribution run",
+  "date": "2026-10-26 19:46-19:50 EDT",
+  "code": {
+    "branch": "gfx906/p5.3-relay",
+    "commit": "eb23d91c",
+    "flags": "--tp-shards 2 [--tp-layers csv] on ds41_generate (opt-in; default path keeps the single branch)",
+    "runner": "tools/gfx906/run-p6.2-tp-shard.sh",
+    "seam": "attention o-projection in 2 ggml branches on ONE device: q head-group column-shard (view_4d, default-branch strides), per-shard flash-attn over replicated k4/m4, sliced output-LoRA weight copies at load, ONE ggml_add f32 as the reduce node (allreduce stand-in)"
+  },
+  "hardware": "1x MI50 32 GB (device 0 of 4), Threadripper Pro 3975WX, ROCm 7.2.0; vLLM stack stopped by the wrapper for the window, restored after",
+  "runs": {
+    "common": "same binary, same 512-token real-document prompt, -n 128, --prefill-chunk 64, --slots 1500 BOTH runs (residency rule), --experts gpu, arena 64 GiB",
+    "control": { "args": "default (tp_shards=1)", "prompt": "512 tokens in 18.84 s = 27.2 tok/s", "decode": "128 tokens in 9.21 s = 13.78 tok/s (97.7% VRAM expert hits)", "tier": "0 experts VRAM, 7119 arena, 8241 file" },
+    "tp": { "args": "--tp-shards 2 --tp-layers 0-9 (10 of 40 layers sharded)", "loader": "p6.2 tp seam: 64 sliced weight copies (= 10 layers x 6 seam slices + 2 layers x 2 DEAD indexer-attn_q_b slices, never read by any graph)", "prompt": "512 tokens in 25.33 s = 20.2 tok/s", "decode": "128 tokens in 9.18 s = 13.83 tok/s (97.7% VRAM expert hits, expert counters identical to control)", "tier": "identical to control" }
+  },
+  "findings": {
+    "numerics": "control and tp emitted IDENTICAL 128/128 greedy tokens (first difference: none). The f32 reduce-order change flipped ZERO knife-edge argmaxes through 8 chunked-prefill passes + 128 decode steps. Within the P6 section-4 calibration rule (f32 induced error host-bounded ~1e-4, p6_tp_algebra); no bit-identity CLAIMED beyond this prompt - the engine's cross-process reproducibility distribution applies.",
+    "decode_overhead": "13.78 vs 13.83 tok/s = +0.4% with 10/40 layers sharded - the seam (2 extra FA launches, 2 sliced mul_mats, 1 add, per sharded layer) is invisible at n=1, as expected for launch-bound decode inside cached graphs.",
+    "prefill_overhead": "27.2 vs 20.2 tok/s = 25.7% SLOWER with only 10 of 40 layers sharded. Linear extrapolation to 40/40 (~103%) would exceed the kill gate (10%) and outrun the ~1.8x halving the cross-card plan prices - but the spike's implementation is NOT yet exonerated: candidates include ggml-cuda kernel-path choices for the 4096-wide sliced mul_mats or the two half-head FA calls, none of which exist on a real split (each card runs ONE half-k GEMM and ONE half-head FA). The verdict is HELD until the attribution run separates seam algebra from spike plumbing.",
+    "runner_guard_fired_correctly": "the anti-no-op guard refused the comparison because its expected-slice formula (3/layer) was wrong (6/layer + 2 dead indexer slices); the engine lines showed the seam WAS built. Fixed with this receipt: formula 6/layer, loader now refuses to slice indexer.attn_q_b (suffix collision, dead copies)."
+  },
+  "next": "attribution window: control vs --tp-layers 0 (1 layer, slope check) vs the NO-FA-variant at 10 layers (single full FA, only the o-projection GEMM reduced - isolates FA-split cost from GEMM-path cost) - same runner. NO-GO or GO applies only after that run; no cross-card claim in either direction before it.",
+  "limitations": "one prompt, one greedy temperature-0 pass; tokens prove composition (reduce node rides the hc machine and the per-column carry) on THAT trajectory only; the dead indexer slices added a few MB of never-read VRAM to the tp run (too small to explain 25.7%, but they are removed for the attribution run); prompt rate measured on 512 tokens / 8 chunk passes - no separate n=64 single-pass timing yet."
+}

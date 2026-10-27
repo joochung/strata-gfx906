@@ -76,11 +76,13 @@ ARGS=(-m "$M/V41-GSQ.gguf" --backend cuda --experts gpu
       --ids-file "$IDS" -n "$N_TOK" --arena-gib "$ARENA_GIB" --arena-adapt --vram-margin 1.0
       --prefill-chunk 64 --slots "$SLOTS")
 
-run_one() {   # run_one <name> [extra engine args...]
+run_one() {   # run_one <name> [ENV=k=v ...] [extra engine args...]   (ENV= must come first, if any)
     sleep 10
     local name=$1; shift
+    local envkv=()
+    if [ "${1#ENV=}" != "${1:-}" ]; then envkv=("${1#ENV=}"); shift; fi
     echo "=== $name start $(date +%T) ==="
-    "${ENG[@]}" "${ARGS[@]}" "$@" >"$OUT.$name.toks" 2>"$OUT.$name.log"
+    env "${envkv[@]}" "${ENG[@]}" "${ARGS[@]}" "$@" >"$OUT.$name.toks" 2>"$OUT.$name.log"
     local rc=$?
     echo "--- $name rc=$rc, $(wc -l < "$OUT.$name.toks") token ids"
     grep -m1 -E "^prompt: " "$OUT.$name.log" | sed "s/^/[$name] /"
@@ -90,18 +92,27 @@ run_one() {   # run_one <name> [extra engine args...]
 }
 
 run_one control || exit 1
-# the sharded run: its loader MUST report the seam (3 sliced copies per sharded layer), else the flag silently
-# did not reach the graph and the comparison would be a no-op measured twice
-N_SLICES=$(( $(echo "$TPL" | awk -F, '{print NF}') * 3 ))
+# the sharded run: its loader MUST report 6 sliced copies per sharded layer (3 tensors x 2 shards), else the flag
+# silently did not reach the graph and the comparison would be a no-op measured twice.  STRATA_TP_NO_FA=1 keeps the
+# same sliced weights and GEMM shape but runs ONE full-head flash-attn - the difference between the two tp arms
+# prices the per-shard FA launches alone (see ds41_dense.cpp's attribution comment).
+N_SLICES=$(( $(echo "$TPL" | awk -F, '{print NF}') * 6 ))
 run_one tp --tp-shards 2 --tp-layers "$TPL" || exit 1
 if ! grep -q "p6.2 tp seam: $N_SLICES sliced weight copies" "$OUT.tp.log"; then
     echo "P6.2: the tp run did not build the expected $N_SLICES sliced weight copies - refusing to compare"; exit 1
+fi
+if [ "${ARM_NO_FA:-1}" = 1 ]; then
+    run_one tp_nofa ENV=STRATA_TP_NO_FA=1 --tp-shards 2 --tp-layers "$TPL" || exit 1
+    if ! grep -q "p6.2 tp seam: $N_SLICES sliced weight copies" "$OUT.tp_nofa.log"; then
+        echo "P6.2: the tp_nofa run did not build the expected $N_SLICES sliced weight copies"; exit 1
+    fi
 fi
 
 echo
 echo "== SUMMARY ($PROMPT_TARGET-token prompt, $N_TOK decode tokens, chunk 64, one card, slots $SLOTS both, ${TPL} sharded) =="
 rate() { grep -m1 -oE "$1: [0-9]+ tokens in [0-9.]+ s = [0-9.]+ tok/s" "$2" | grep -oE "[0-9.]+ tok/s"; }
-for name in control tp; do
+for name in control tp tp_nofa; do
+    [ -f "$OUT.$name.log" ] || continue
     p=$(rate prompt "$OUT.$name.log"); d=$(rate decode "$OUT.$name.log")
     v=$(grep -m1 -oE "[0-9]+ experts in VRAM" "$OUT.$name.log" || echo "?")
     echo "  $name: prompt $p | decode $d | $v"
@@ -110,19 +121,24 @@ python3 - "$OUT" <<'EOF'
 import sys
 out = sys.argv[1]
 def rate(name, kind):
-    import re
+    import re, os
+    if not os.path.exists(f"{out}.{name}.log"):
+        return None
     s = open(f"{out}.{name}.log", errors="ignore").read()
     m = re.search(rf"{kind}: \d+ tokens in [\d.]+ s = ([\d.]+) tok/s", s)
     return float(m.group(1)) if m else None
 for kind in ("prompt", "decode"):
-    c, t = rate("control", kind), rate("tp", kind)
-    if c and t:
-        print(f"  {kind} overhead (10/40 layers sharded): {100*(c-t)/c:+.2f}% (slower is positive)")
+    c = rate("control", kind)
+    for arm in ("tp", "tp_nofa"):
+        t = rate(arm, kind)
+        if c and t:
+            print(f"  {arm} {kind} overhead vs control: {100*(c-t)/c:+.2f}% (slower is positive)")
 a = open(f"{out}.control.toks").read().split()
-b = open(f"{out}.tp.toks").read().split()
-n = min(len(a), len(b))
-div = next((i for i in range(n) if a[i] != b[i]), n)
-print(f"  tokens: control {len(a)}, tp {len(b)}, identical prefix through decode token {div} "
-      f"({'ALL' if div == n else 'first difference at index ' + str(div)})")
+for arm in ("tp", "tp_nofa"):
+    b = open(f"{out}.{arm}.toks").read().split()
+    n = min(len(a), len(b))
+    div = next((i for i in range(n) if a[i] != b[i]), n)
+    print(f"  {arm} tokens: {len(b)} vs control {len(a)}; identical through index {div} "
+          f"({'ALL' if div == n else 'first difference at ' + str(div)})")
 EOF
 echo "artifacts: $OUT.* (logs, tokens)"
