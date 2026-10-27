@@ -163,6 +163,11 @@ framework:
 
 ## 5. Phases, each with its own kill gate
 
+> Status 2026-10-26: P6.0, P6.1 closed (sections 7, 8). P6.2 witnessed and its gate FIRED - prefill
+> tensor-TP is NO-GO (section 9, receipts 2026-10-26-p6.2-tp-shard-same-device.json and
+> 2026-10-26-p6.2-attribution-and-verdict.json). P6.3 as scoped here is closed on that gate; the live
+> axis that remains is P6.4 (expert-parallel tier caching, task #39).
+
 - **P6.0 - collective probe (kills or feeds everything).** A `probe-collective` tool (pattern:
   probe-p2p.cu, refuses any live engine, no model, minutes not hours): allreduce latency and
   bandwidth at 10/20/40/320/1280 KiB, 2- and 4-way, three transports (RCCL linked directly;
