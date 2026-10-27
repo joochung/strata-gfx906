@@ -1,0 +1,19 @@
+{
+ "id": "p5-exit-2026-10-26",
+ "date": "2026-10-26",
+ "phase": "P5 exit (task #31): 4-GPU layer split for the ported engines",
+ "verdict": "CONDITIONAL GO by engine and claim class. DS4.1: correctness GO (bitwise parity), state GO, performance MIXED-with-named-limiters (decode positive, prefill strongly negative). GLM: staged NO-GO until defect #40 closes.",
+ "claim_classes": {
+  "correctness": {
+   "ds41": "BITWISE greedy parity staged vs unsplit: 64/64 two-card (witness 20261025-190058, receipt 2026-10-25-p5.3b-ds41-handoff-pass.json); 128/128 four-card at 14-tok and 48/48 four-card at 647-tok with the state column moving MID-PREFILL (witnesses 20261026-222534 / -231105, receipt 2026-10-26-p5.4-split-smoke.json). All with --slots pinned both sides and --prefill-chunk 64.",
+   "glm": "FAIL: control pair 64/64 EXACT while staged arms diverge at token 16 (staged twins 30/64); admission confound (--pf-b) moves it to 26 - real, partial. Defect #40 open; witness #8's 2026-10-24 PASS reclassified as knife-edge luck under an uncalibrated protocol."
+  },
+  "state": "Every staged geometry built what its plan lines claimed (structural guards in every witness session); per-card VRAM spread matches placement (4-card peaks 3.78/5.75/26.72/3.79 GiB). PREDICTION REFUTED WITH ENGINE COUNTERS: no per-stage expert caches - the tier is one card's by construction; spreading it is task #39. Cross-process determinism findings (P5.3 era) and the residency rule remain the calibration law for this engine.",
+  "performance": "Six interleaved boots one session (receipt 2026-10-26-p5.5-split-scaling.json): decode 2-card faster in BOTH paired boots (+85%, +41%) - gain is pure DENSE spread (expert-path counters identical across arms); prefill -3x (2c) / -5x (4c), limiter named = 4.3x file-tier read amplification under staged prefill, NOT the relay (2.70 ms/pass warm). Within-arm boot variance (ctl decode 7.72/6.07; 4c decode 12.90/5.86) is as large as between-arm differences: 4-card decode NOT separable at n=2; stronger claims need n>=4 interleaved boots."
+ },
+ "design_transport": "host-pinned bounce at 25-26.7 GiB/s uniform (receipt 2026-10-22-p5.1-interconnect-probe.json; peer-direct refused measurement across 5 P6 witnesses since, bounce is the only transport on this board)",
+ "code_identity": "branch gfx906/p5.3-relay; P5 work spans 9cae302d (step 2) through this commit; key fixes: relay root causes 1d18b7d2/a6bfab87/ce7e1116/carry_forward/d370bfe1, pass-cap default 9674c6d0",
+ "boundaries_refused_by_design": ["--serve on a staged engine (conversation snapshot/restore is per-instance)", "DSpark x staged (a draft's k positions cannot span a column boundary)", "--engram with any boundary above layer 14 (ring feed is stage 0's)", "staged runs past ~26 state-column windows per stage (~1700 tokens at cap 64) until the per-stage ggml graph pool grows or evicts - arithmetic in 2026-10-26-p5.4-split-smoke.json, REQUIRED before long staged serving", "GLM staged of any kind until #40 closes"],
+ "followups": {"#39": "per-stage expert caches (the surviving P6.4 axis; inherits the cross-device slot-budget defect fix as precondition)", "#40": "GLM staged parity root-cause", "P4b": "unblocked for the ported engines' per-session caches with #25's device ownership", "graph-pool": "grow or evict before 4096-token staged serve"},
+ "docs_touched": "docs/CONCURRENCY-PLAN.md P5 EXIT VERDICT paragraph; docs/gfx906/P5-MULTI-GPU-DESIGN.md section 9 (measured table); docs/gfx906/XOLOTL-PORT.md P5 port log; docs/gfx906/START-HERE.md P5.4 section"
+}
