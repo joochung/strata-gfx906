@@ -728,12 +728,21 @@ int main(int argc, char ** argv) {
             // begin_batch / attn_router_span / finish_span.  dc.prompt_batch therefore keeps its value - and if the
             // caller turned the batch off entirely (--prompt-batch 0), the state would be sized to ONE window and a
             // pass could never cycle, so a staged run takes its column budget from the relay unit instead.
-            const int cap_hint = std::min(a.relay_chunk > 0 ? a.relay_chunk : 64, std::max(1, a.prefill_chunk));
+            // The staged chunk default: a staged run with NO --prefill-chunk takes the RELAY UNIT, not 1.  Collapsing
+            // to 1 (what max(1, 0) used to do) puts every token in its own state column with its own CACHED graph, and
+            // ~26 such graphs exhaust a stage's ggml metadata pool - the 2026-10-26 four-stage witness died exactly
+            // there ("ggml_new_object: not enough space ... needed 205986800, available 205676800", the pool's FULL
+            // size, after 14 prompt tokens + 12 decodes each built its own graph).
+            const int chunk_hint = a.prefill_chunk > 0 ? a.prefill_chunk : (a.relay_chunk > 0 ? a.relay_chunk : 64);
+            const int cap_hint = std::min(a.relay_chunk > 0 ? a.relay_chunk : 64, chunk_hint);
             const int cols_hint = std::max(PB, 32 * cap_hint);   // the number dc.prompt_batch gets below
+            if (a.prefill_chunk < 1)
+                std::fprintf(stderr, "relay: no --prefill-chunk given; the staged pass takes the relay unit (%d tokens)\n",
+                             cap_hint);
             std::fprintf(stderr, "relay: the layer-major prompt path is not relayed; running the sequential chunk path "
                                  "in %d-column passes (state columns %d)\n",
                          a.relay_chunk > 0 ? a.relay_chunk : 64, cols_hint);
-            relay_pass_cap = std::min(a.relay_chunk > 0 ? a.relay_chunk : 64, std::max(1, a.prefill_chunk));
+            relay_pass_cap = cap_hint;
         }
     }
     // the dense sub-batch size S: --prefill-chunk, or 512 with a layer-major prompt batch and no chunk size given
