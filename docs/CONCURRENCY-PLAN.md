@@ -536,8 +536,14 @@ result with numbers closes the phase too (the P1.2 pattern).
 by engine and by claim class.** CORRECTNESS: the DS4.1 staged engine is BITWISE-equal to its unsplit
 control - 64/64 at two cards (witness 20261025-190058), 128/128 at four cards, and 48/48 with the
 state column moving MID-PREFILL at a 647-token prompt (witness 20261026-231105); the GLM staged
-engine FAILS its calibrated bar (control pair 64/64 exact, staged diverges at token 16; the admission
-confound is quantified and partial) and carries defect #40 - GLM staged is NO-GO until that closes.
+engine, which first appeared to FAIL that bar (staged diverging at token 16 while the control pair
+matched 64/64), was shown the next day to be a WITNESS-PROTOCOL confound, not a defect: the P5.4 arms
+ran --pcie auto, whose PCIe share is an EMA of MEASURED per-path cost, so the staged shape's (by design)
+different wall time converges the admission to a different cpu/pcie mix - and a CPU-computed expert is
+not bit-identical to a GPU-computed one. With --pcie pinned (deterministic error-diffusion), control,
+same-device relay and cross-card relay are EXACT 64/64 with IDENTICAL path counters (#40 closed,
+receipt 2026-10-27-p5.4c-glm-staged-parity.json): GLM staged is also BITWISE-GO, under the stated rule
+that any cross-topology parity witness must pin every timing-adaptive knob.
 STATE: every staged geometry claimed by its plan lines was built and witnessed, per-card VRAM spread
 matches the placement design, and the predicted per-stage expert caches are REFUTED with the engine's
 own counters - the tier is one card's by construction (that is #39's territory, not P5's). PERFORMANCE:

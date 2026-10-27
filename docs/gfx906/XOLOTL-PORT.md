@@ -349,7 +349,7 @@ fix, allocating the MMQ set at load, is recorded as not shipped
 3. Token and state parity against the authors' reference build.
 4. Phase P5: driving four MI50 for these engines (layer split), per `docs/gfx906/P5-MULTI-GPU-DESIGN.md`.
 
-## Port log - P5 EXIT 2026-10-26: DS4.1 runs on four MI50s, bitwise-equal to its single-card run; GLM does not yet
+## Port log - P5 EXIT 2026-10-26 (corrected 2026-10-27): DS4.1 and GLM both run on multiple MI50s bitwise-equal to their single-card runs
 
 This is the fork-side feature the top of this file predicted: after the HIP port made these engines run on
 gfx906 at all, phase P5 gave them a layer split across the four MI50s. The full phase ledger is
@@ -368,11 +368,11 @@ with its artifact:
   window index table `i_widx` uploaded at `col0 * 4` while the graph reads it at `col0 * SWA * 4` - is the
   one that hid under column 0 and left at the first column move, which is why every witness now runs a
   prompt long enough to move a column.
-* **Correctness witnesses (2026-10-25/26):** DS4.1 staged == unsplit at 64/64 (2 cards), 128/128 (4 cards),
-  and 48/48 with a mid-prefill column move at 647 tokens. GLM staged FAILS its calibrated bar (control pair
-  64/64 exact, staged diverges at token 16) and is defect #40; part of that gap is the admission confound
-  (a staged decode issues no predicted prefetch: 12.4% vs 20.6% expert hit, and GPU-vs-CPU expert placement
-  changes float summation order), quantified but not eliminated.
+* **Correctness witnesses (2026-10-25/26/27):** DS4.1 staged == unsplit at 64/64 (2 cards), 128/128 (4 cards),
+  and 48/48 with a mid-prefill column move at 647 tokens. GLM staged first appeared to FAIL its calibrated bar
+  (control pair 64/64 exact, staged diverging at token 16) - but that was a witness confound, not a defect
+  (#40 closed 2026-10-27, see the P5.4c entry below): with the timing-adaptive `--pcie auto` pinned to a fixed
+  share, GLM control / same-device relay / cross-card relay are all EXACT 64/64 with identical path counters.
 * **Performance (measured, not claimed):** decode faster on two cards in both paired boots (+85%, +41%) from
   DENSE spread alone; prefill 3-5x NEGATIVE under staging, limiter named as 4.3x file-tier read amplification
   (8875 vs 2073 expert file reads), not the relay (2.70 ms/pass warm). The full table, and the honesty rule
@@ -381,4 +381,27 @@ with its artifact:
 Two rules this phase forced on all future work here, because each was paid for: pin expert residency
 (`--slots`) and boot order in any parity or perf comparison - free-VRAM-derived budgets and first-boot-after-
 cache-eviction both move a control more than the design change under test; and never make a bit-parity claim
-at default VRAM budgets across engine shapes.
+at default VRAM budgets across engine shapes. A third rule came from #40: pin every timing-adaptive admission
+knob (`--pcie`, not just `--slots`) in any CROSS-TOPOLOGY parity comparison - `--pcie auto` sets the PCIe share
+from an EMA of measured per-path cost, so a staged run's different wall time (by design) converges the
+admission to a different cpu/pcie mix, and a CPU expert is not bit-equal to a GPU one. Auto is fine for
+control-vs-control (same shape converges the same); it can never be used to compare a staged run to its control.
+
+## Port log - P5.4c 2026-10-27 (#40 closed): the GLM staged "divergence" was a witness confound, not a relay bug
+
+P5 EXIT had recorded GLM staged as NO-GO because its staged arms diverged from control at token 16 while the
+unsplit twins matched 64/64. The `run-p5.4c-glm-pcie.sh` discriminator pinned every timing-adaptive knob
+(`--pcie 0.25 --pf-b 0 --slots 1500` on all arms, the exact 14-token P5.4 prompt) and re-ran the three shapes.
+All three - control, `--gpus 0,0` (same-device relay), and `--gpus 0,1` (cross-card) - came out EXACT 64/64,
+with bit-IDENTICAL tier counters (hit 12.4%, cpu 75.9%, pcie 11.7%, file tier 8668 on every arm), so the
+admission is now provably on the same path in all three, not just inferred from matching tokens.
+
+What had gone wrong in P5.4: the GLM arms ran `--pcie auto`, which is FreeToken-style bandwidth balance - the
+PCIe share is an EMA of the MEASURED cost of one expert (`tools/ds4/ds4_moe.cpp:337`). A staged run costs
+~2.7 ms/pass more, so auto settled on a different cpu/pcie split (28.5% vs 23.2% witnessed), and a CPU-computed
+expert is not bit-identical to a GPU-computed one, so a knife-edge argmax flipped. `--pf-b 0` alone moved the
+divergence 15 -> 26 but could not remove it while auto was still timing-dependent. GLM and DS4.1 both default
+`--pcie` to a fixed value (0.25 and 0.75); only the P5.4 witness had opted into auto, and the DS4.1 arms that
+went 128/128 bitwise never passed `--pcie` at all - which is why they were comparable. The relay algebra was
+sound all along; this is the same conclusion the DS4.1 five-root-cause work reached, now confirmed for GLM's copy.
+Receipt `2026-10-27-p5.4c-glm-staged-parity.json`.

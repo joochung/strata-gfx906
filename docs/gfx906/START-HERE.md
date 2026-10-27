@@ -69,15 +69,20 @@ engine reported `length` at 55 of 64 tokens after a wrap-up prefill, and the ser
 analysed in [P4.3-serve-stop-analysis.md](P4.3-serve-stop-analysis.md)):
 [XOLOTL-PORT.md](XOLOTL-PORT.md).
 
-### Layer split for the ported engines: phase P5 CLOSED 2026-10-26 (DS4.1 four-card bitwise, GLM staged NO-GO)
+### Layer split for the ported engines: phase P5 CLOSED 2026-10-26 (DS4.1 and GLM staged bitwise, both GO)
 
 **P5 exit verdict** ([receipt](../../benchmarks/gfx906/receipts/2026-10-26-p5-exit.json)): **DS4.1** runs on two
 and four MI50s with a greedy token stream **bitwise-equal** to its single-card run (64/64, 128/128, and 48/48
 with the state column moving mid-prefill at 647 tokens), the staged boundaries costing 2.70 ms/pass warm; the
 dense-spread decode gain measured +85%/+41% on two cards in both paired boots, while staged prefill runs 3-5x
 SLOWER (limiter: 4.3x file-tier read amplification, not the relay) and the 4-card decode mean is not separable
-from control at n=2. **GLM staged is a NO-GO**: its control pair matches 64/64 EXACT while staged arms diverge
-at token 16 - defect #40. Refused by design: `--serve`/DSpark on a staged run, Engram boundaries above layer 14,
+from control at n=2. **GLM staged is also bitwise-GO**: it first looked to FAIL (staged diverging at token
+16 while its control pair matched 64/64), but #40 closed the next day showing that was a WITNESS confound -
+the P5.4 arms ran --pcie auto, whose share is an EMA of MEASURED per-path cost, so the staged shape's timing
+difference converges the admission to a different cpu/pcie mix (and a CPU expert is not bit-equal to a GPU
+one). With --pcie pinned, control / same-device relay / cross-card relay are EXACT 64/64 with identical path
+counters (receipt 2026-10-27-p5.4c-glm-staged-parity.json). The rule: cross-topology parity witnesses pin
+every timing-adaptive knob. Refused by design: `--serve`/DSpark on a staged run, Engram boundaries above layer 14,
 and (arithmetically) more than ~26 state-column windows per stage until the per-stage graph pool grows or evicts.
 The per-step ledger the rest of this section records stands as the path to that verdict.
 

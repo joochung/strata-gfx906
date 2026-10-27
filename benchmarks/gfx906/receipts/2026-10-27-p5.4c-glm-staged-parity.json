@@ -1,0 +1,46 @@
+{
+  "task": "#40 GLM staged parity root-cause",
+  "phase": "P5.4c",
+  "date": "2026-10-27",
+  "verdict": "RESOLVED - NOT an engine defect. The P5.4 GLM staged divergence was a WITNESS-PROTOCOL confound, not a relay bug. With timing-adaptive admission removed, staged GLM is bitwise-equal to its control on one card AND across two cards. GLM staged correctness flips from NO-GO to GO under a stated constraint.",
+  "branch": "gfx906/p5.3-relay",
+  "tip": "7f7f0493",
+  "root_cause": {
+    "what": "The P5.4 GLM arms ran with --pcie auto. In this engine --pcie auto is FreeToken-style bandwidth balance: the PCIe share is an EMA of the MEASURED per-path cost of one expert (tools/ds4/ds4_moe.cpp:337-339), so the admission mix is a function of WALL-CLOCK timing. A staged run costs ~2.7 ms/pass more (the relay), so auto converges to a different pcie/cpu split by construction. A CPU-computed expert is not bit-identical to a GPU-computed one (different summation order), so a knife-edge argmax flips. The divergence was therefore timing -> admission -> float order -> argmax, with the relay never touching a wrong value.",
+    "witness_p5_4_diverging_pair": {
+      "control_g_ctl": "hit 20.6% (prefetched-useful 27.6/52.9 issued), cpu 56.2%, pcie 23.2%, file tier 8664",
+      "staged_g_2":     "hit 12.4% (prefetched-useful 0.0/0.0 issued), cpu 59.2%, pcie 28.5%, file tier 8657",
+      "note": "Different admission mix on the two arms. Two of the three knobs are entangled: control ran the prefetch stream (52.9 issued/token) while the staged decode loop issued none, AND auto re-balanced pcie/cpu under the staged timing. --pf-b 0 alone moved the divergence 15 -> 26 but could not remove it because --pcie auto was still timing-dependent."
+    }
+  },
+  "discriminator": {
+    "script": "tools/gfx906/run-p5.4c-glm-pcie.sh",
+    "arms": [
+      "g_ctlp  control            --pcie 0.25 --pf-b 0 --slots 1500",
+      "g_00p   --gpus 0,0         --pcie 0.25 --pf-b 0 --slots 1500   (same-device relay: relay algebra with an IDENTICAL residency environment)",
+      "g_2p    --gpus 0,1         --pcie 0.25 --pf-b 0 --slots 1500   (cross-card relay)"
+    ],
+    "prompt": "the exact 14-token P5.4 prompt (the stream the token-16 divergence was measured on)",
+    "session_log_ts": "20261027-180516",
+    "result": {
+      "staged_00p_vs_control": "EXACT 64/64",
+      "staged_2p_vs_control":  "EXACT 64/64",
+      "tier_counters": "IDENTICAL on all three arms: hit 12.4%, prefetched-useful 0.0/token of 0.0 issued, cpu 75.9%, pcie 11.7%, file tier 8668. Bit-identical admission is now visible in the counters, not just inferred from the tokens.",
+      "control_vs_control_reference": "P5.4 unsplit twins matched 64/64 EXACT under --pcie auto (same shape -> auto converges the same); only a staged-vs-control comparison under auto breaks, because the two shapes have different timing by design."
+    }
+  },
+  "conclusion": {
+    "relay_algebra": "SOUND. Same-device relay matches control (proves the relay copy itself moves the right bytes) and cross-card relay matches control (proves the hand-off is exact when residency is equal). This is the same conclusion the DS4.1 five-root-cause work reached for its relay; GLM's copy was already correct, it was the P5.4 protocol that obscured it.",
+    "glm_staged_correctness": "GO - with a constraint. A staged GLM run is bitwise-equal to its single-card control WHEN admission is deterministic.",
+    "witness_rule": "The residency rule already recorded for --slots now extends to --pcie: a staged-vs-control parity witness must PIN --pcie (any timing-adaptive admission is a function of wall time, and a staged run's wall time differs on purpose). Auto admission is fine for control-vs-control parity (identical shape) but never for cross-topology parity. GLM and DS4.1 both default --pcie to a deterministic value (0.25 and 0.75); only the P5.4 witness opted into auto.",
+    "production_note": "For serving, bit-identical output across topologies is not required - a --pcie auto staged run still produces valid output; it just will not be byte-equal to an unsplit run. The GO here is about the hand-off not corrupting state, which the exact-match proves."
+  },
+  "not_the_divergence_but_found": {
+    "stale_route_bias_in_staged_glm": "A real defect, but INERT with the bias off (which is every arm here and every P5.4 arm). With --route-bias or --route-bias-file set, a STAGED GLM run never updates the bias for decode: set_bias() lives only on the unsplit step() path (glm_generate.cpp:902) and the staged branch returns at :899, so a staged run decodes with the build-time prune-only vector. This is DS4.1 root cause #2 (commit a6bfab87 - one route-bias computation for both shapes) in GLM's copy, which was never replicated. Filed as a new task; it is orthogonal to the P5.4 token-16 divergence because the witnessed arms left route-bias at 0."
+  },
+  "corrections_triggered": [
+    "docs/CONCURRENCY-PLAN.md P5 EXIT VERDICT: GLM staged correctness NO-GO -> GO (bitwise-equal to single-card under deterministic --pcie, one and two cards); defect #40 closed as a protocol confound, not an engine bug.",
+    "docs/gfx906/START-HERE.md P5 header: GLM staged NO-GO -> GO under deterministic admission.",
+    "docs/gfx906/XOLOTL-PORT.md port log: P5.4c entry."
+  ]
+}
