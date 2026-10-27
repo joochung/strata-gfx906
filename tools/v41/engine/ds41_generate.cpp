@@ -1149,27 +1149,18 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "ds41_generate: stage %zu: cannot open a backend on device %d\n", s, sr.dev[s]);
                 return 2;
             }
-            // WEIGHTS ARE PER CARD: ggml_backend_cuda_buffer_get_memory gives the host an iGPU device pointer, which
-            // the dGPU's copy engine cannot read (cuMemcpyDtoDAsync between these two devices returns invalid value).
-            // A stage that SHARES a weight store therefore has to run on the card that owns it, and a stage on another
-            // card must load its own tensors (--relay-copy-weights).  Checked against the resolved backends rather than
-            // --gpus, because the owner's card is stage 0's device.
-            if (!a.relay_copy_weights) {
-                static std::unordered_map<const void *, int> be_dev;   // backend -> its index (be_index is a scan)
-                auto dev_of_be = [&](ggml_backend_t b) {
-                    auto it = be_dev.find((const void *) b);
-                    if (it == be_dev.end()) it = be_dev.emplace((const void *) b, be_index(b)).first;
-                    return it->second;
-                };
-                const int owner_dev = dev_of_be(be_for(sr.dev[0]));
-                if (dev_of_be(sc.backend) != owner_dev) {
-                    std::fprintf(stderr, "ds41_generate: stage %zu is on device %d but shares its weights with stage 0 "
-                                         "on device %d, and these two cards cannot read each other's memory; run with "
-                                         "--relay-copy-weights (one weight set per card) or put the stages on one card\n",
-                                 s, sr.dev[s], owner_dev);
-                    return 2;
-                }
-            }
+            // WEIGHTS ARE PER CARD: a stage that SHARES a weight store has to run on the card that owns it (a device
+            // pointer from one card is not readable by another card's copy engine here), and a stage on another card
+            // must load its own range.  That is no longer a reason to refuse the plan or to demand
+            // --relay-copy-weights: build_stages applies the rule per stage itself - a stage whose resolved backend is
+            // the owner's ADOPTS the owner's tensors (one load, no duplicate), a stage on a foreign backend loads its
+            // own layer range onto that backend (the same load the --relay-copy-weights path always ran, and what the
+            // GLM engine has run since P5.3 step 2a was witnessed: stage 0 shared + stage 1 own-copy, 64/64).
+            // Forcing --relay-copy-weights for the whole plan instead cost STAGE 0 a second copy of the dense half on
+            // the OWNER's card - ~6 GiB ("VRAM after the prompt" read 17.38 GiB staged vs 23.43 unsplit, session
+            // 20261026-235443) - and the tier sizes itself from that card's free VRAM, so every default-budget staged
+            // number inherited the deficit.  The real cross-card constraint is the ring rule, and build_stages
+            // enforces it (a boundary may cross a card only at the successor's own kv AND index source layer).
             sr.cfg[s] = sc;
         }
         if (a.relay_copy_weights) {   // the measured alternative: one weight set per stage (more memory than the model)
@@ -1220,8 +1211,9 @@ int main(int argc, char ** argv) {
         for (size_t s = 0; s < sr.stage.size(); ++s) {
             const int c = sr.stage[s]->columns();
             sr.cols_of.push_back(c);
-            // A column belongs to a stage only if that stage ALLOCATED it.  A --relay-copy-weights stage on another
-            // card sizes its own state (its own config, its own VRAM), and a smaller one bounds the whole run: a pass
+            // A column belongs to a stage only if that stage ALLOCATED it.  A stage on a FOREIGN backend (its own
+            // load, whether via build_stages' per-card rule or --relay-copy-weights) sizes its own state (its own
+            // config, its own VRAM), and a smaller one bounds the whole run: a pass
             // the producer ran at column 192 would land past a consumer with 128 columns.
             if ((int64_t) c < sr.cols) sr.cols = c;
         }
