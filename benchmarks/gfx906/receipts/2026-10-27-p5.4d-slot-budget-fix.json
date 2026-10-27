@@ -1,0 +1,30 @@
+{
+  "task": "#39 precondition - cross-device slot-budget defect",
+  "phase": "P5.4d",
+  "date": "2026-10-27",
+  "verdict": "FIXED AND WITNESSED. A staged DS4.1 run across two cards no longer forces --relay-copy-weights, and its decode-time expert budget is control-class: 22.33 GiB vs 23.62 unsplit (was 17.38 in the same geometry at session 20261026-235443). ~4.7 GiB reclaimed on the tier's card; tokens EXACT vs control.",
+  "branch": "gfx906/p5.3-relay",
+  "fix_commit": "4f3a8a6c",
+  "defect": {
+    "what": "ds41_generate carried a generate-level refusal: any stage on a foreign backend demanded --relay-copy-weights for the WHOLE plan. That flag gives EVERY stage its own weight load - including stage 0, whose card already holds the parent's whole dense half - so ~6 GiB of duplicate sat on the exact card the tier reads its slot budget from ('VRAM after the prompt' is where the budget line is printed at decode time: 17.38 GiB staged vs 23.43 unsplit, session 20261026-235443). Every default-budget staged number since P5.3b carried the deficit; receipts worked around it with --slots pins.",
+    "why_refusal_was_stale": "Ds41Dense::build_stages already applies the per-card rule per stage: an owner-backend stage ADOPTS the owner's tensors (share_weights, no duplicate), a foreign-backend stage keeps share_weights=false and init() loads its OWN layer range onto that backend. The real cross-card constraint is the ring rule (a boundary may cross a card only at the successor's own kv AND index source layer), enforced inside build_stages. GLM ran this exact shape since step 2a and P5.4c re-witnessed it (g_2p: stage 0 shared + stage 1 own copy, 64/64 EXACT)."
+  },
+  "witness": {
+    "script": "tools/gfx906/run-p5.4d-ds41-noflag.sh",
+    "session": "20261027-183332 (wrapper-managed, vLLM restored after, boot 20261027-183810)",
+    "arms": {
+      "d_ctl": "unsplit control: budget 23.62 GiB free -> 22.62 of expert slots; 64 tokens",
+      "d_2n": "--gpus 0,1 --layer-split 20 WITHOUT the flag (the fixed path): BUILDS (refusal gone); stage 0 device 0 weights shared, stage 1 device 1 own copy; budget 22.33 GiB free -> 21.33 of expert slots; EXACT 64/64 vs control",
+      "d_2f": "same WITH --relay-copy-weights (regression guard): stage 0 own copy as the flag promises; budget 17.64 GiB (the documented duplicate, now clearly attributable to the flag); EXACT 64/64 vs control"
+    },
+    "acceptance": "all four criteria PASS (builds with the right allocation lines; budget line control-class; both staged arms EXACT; the flag path unchanged and still exact).",
+    "residual_delta_explained": "22.33 vs 23.62 = 1.29 GiB: stage 1's own-range load lives on card 1, and the 1.29 GiB on card 0 is the second ggml backend/compute contexts + stage 0's instance state. Control-class by the >= 22.5 gate set in the runner."
+  },
+  "consequences": [
+    "Staged cross-card DS4.1 runs at DEFAULT budgets are now interpretable: the tier budget differs from the control's by ~1.3 GiB of stage context, not ~6 GiB of accidental duplication.",
+    "P5.5's caveat that fixing this 'may change every staged number in this file' is discharged for the BUDGET dimension; P5.5 ran with --slots pinned, so its numbers do not move.",
+    "#39's own claim (four disjoint per-card expert caches) can now size each shard from its own card honestly; the per-card budget read is the design's foundation, not an afterthought.",
+    "--relay-copy-weights remains for what it measures (every stage on its own set), now opt-in by intent instead of forced by refusal."
+  ],
+  "rules_binding_this_run": "one engine at a time (wrapper); MemAvailable >= 60 GiB floor; --slots pinned for parity comparison (residency rule); DS4.1 --pcie left at the deterministic default 0.75 (no timing-adaptive knob, per the P5.4c rule); --prefill-chunk 64 (the pass-cap default for staged runs, engine fix 9674c6d0); no Engram (incompatible with 4 stages); byte-identical default path (no --gpus) and byte-identical flag path - only the previously-refused shape changed behavior, from refusal to a run."
+}
