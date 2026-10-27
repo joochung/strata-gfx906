@@ -164,3 +164,32 @@ instrumentation are the measurement tools (#29).
 `--split-device 0,0` bit-exact, then 2-card, then 4-card with the census. #30/#31 exit:
 token-identical greedy vs single-card (same seed) + measured 1/2/4 scaling curve —
 sublinear-with-numbers closes P5 the way P1.2 closed (the P1.2 pattern).
+
+## 9. Measured scaling (2026-10-26, DS4.1, [receipt](../../benchmarks/gfx906/receipts/2026-10-26-p5.5-split-scaling.json))
+
+Six interleaved boots in one session (ctl, 2c, 4c, ctl, 2c, 4c), 647-token prompt + 64 greedy decode tokens,
+slots pinned both sides. No predicted curve existed in this doc to sit beside, so the measurement stands alone
+and names its own limiter.
+
+| arm | prompt tok/s (boot1, boot2) | decode tok/s (boot1, boot2) | expert path (per run) |
+|---|---|---|---|
+| 1 card  | 38.5, 26.2 | 7.72, 6.07 | 14946 hit / 64 cpu / 110 pcie / 27 file (98.8%) |
+| 2 cards | 12.7, 11.4 | 14.28, 8.57 | 14528 hit / 169 cpu / 423 pcie / 27 file (96.1%) |
+| 4 cards | 7.6, 4.7   | 12.90, 5.86 | same as 2-card, per the engine's own counters |
+
+What the numbers support and what they refuse:
+
+* **Decode is faster on two cards in BOTH paired boots (+85%, +41%).** The gain is entirely from spreading the
+  DENSE compute - the expert path counts are identical across arms because the tier is one card's by design;
+  per-stage expert caches are task #39's prize, not this code's.
+* **Prefill scales strongly negative: -3x at two cards, -5x at four, same sign both boots.** The limiter is
+  named and it is not the relay (2.70 ms/pass warm): staging amplifies the file-tier reads 4.3x (8875 vs 2073
+  expert reads) because the per-stage tier queries cycle the shared VRAM slots worse, and the file path is the
+  ~6 GB/s one.
+* **Within-arm boot variance (control 7.72 vs 6.07; 4-card 12.90 vs 5.86) is as large as the between-arm
+  differences.** The 4-card decode mean is NOT distinguishable from control at n=2; a defensible curve needs
+  n>=4 interleaved boots, and this is recorded as the honest close (the P1.2 pattern) rather than averaged into
+  a claim.
+* The serve round-trip this phase asked for is refused by design (a staged engine rejects `--serve`);
+  GLM scaling is blocked by its staged parity defect (#40). Both are boundaries of the checkpoint, not gaps to
+  average over.
