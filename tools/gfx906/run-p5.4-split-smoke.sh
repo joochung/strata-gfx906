@@ -154,7 +154,7 @@ DARGS=(-m "$M/V41-GSQ.gguf" --backend cuda --experts gpu --rank "$M/rank.bin"
        --prefill-chunk 64)
 
 # ARMS: comma list to re-run a subset after a partial witness (default: everything).
-ARMS="${ARMS:-g_ctl,g_2,g_4,g_ctlb,d_ctl,d_4,d_4b}"
+ARMS="${ARMS:-g_ctl,g_2,g_4,g_ctlb,d_ctl,d_2,d_4,d_ctlb,d_2b,d_4b}"
 has() { [[ ",$ARMS," == *",$1,"* ]]; }
 
 # ---- GLM ladder: control, 2 cards, 4 cards, control twin
@@ -170,8 +170,15 @@ has g_ctlb && { run_one g_ctlb tools/glm/serve/glm-engine-906.sh "${GARGS[@]}" |
 
 # ---- DS4.1 ladder: control and the 4-stage arm (both WITHOUT Engram), plus the staged twin for the bar
 has d_ctl && { run_one d_ctl tools/v41/serve/ds41-engine-906.sh "${DARGS[@]}" || exit 1; }
+# d_2: the boundary-20 two-card plan (the even half of the reader's-rule set); twins of every arm double as the
+# within-arm spread the DSpark swap repeat proved is mandatory before any rate comparison on this engine.
+has d_2    && { run_one d_2    tools/v41/serve/ds41-engine-906.sh "${DARGS[@]}" \
+            --gpus 0,1 --layer-split 20 --relay-chunk 64 --relay-copy-weights || exit 1; }
 has d_4   && { run_one d_4   tools/v41/serve/ds41-engine-906.sh "${DARGS[@]}" \
             --gpus 0,1,2,3 --layer-split 8,14,20 --relay-chunk 64 --relay-copy-weights || exit 1; }
+has d_ctlb && { run_one d_ctlb tools/v41/serve/ds41-engine-906.sh "${DARGS[@]}" || exit 1; }
+has d_2b   && { run_one d_2b   tools/v41/serve/ds41-engine-906.sh "${DARGS[@]}" \
+            --gpus 0,1 --layer-split 20 --relay-chunk 64 --relay-copy-weights || exit 1; }
 has d_4b  && { run_one d_4b  tools/v41/serve/ds41-engine-906.sh "${DARGS[@]}" \
             --gpus 0,1,2,3 --layer-split 8,14,20 --relay-chunk 64 --relay-copy-weights || exit 1; }
 
