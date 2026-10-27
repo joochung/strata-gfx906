@@ -1,0 +1,42 @@
+{
+ "id": "p5.4-split-smoke-2026-10-26",
+ "date": "2026-10-26",
+ "phase": "P5.4 (task #29): split smoke at real context, ported engines",
+ "verdict": {
+  "ds41_4stage": "PASS - bitwise parity, every arm, every shape witnessed, including the mid-prefill state-column move",
+  "glm_staged": "NOT MET - staged arms diverge from the control at token 16 (calibrated bar was a perfect 64/64 control twin); --pf-b 0 on the control moves the divergence to 26, so the admission confound is real but partial; follow-up task #40"
+ },
+ "branch_tip": "9674c6d0 (gfx906/p5.3-relay; engine fix 'staged pass cap takes the relay unit without --prefill-chunk' is in this commit; DS4.1 binaries rebuilt from it)",
+ "runner": "tools/gfx906/run-p5.4-split-smoke.sh (ARMS subset, PROMPT_REPEAT, DECODE_N, g_ctlc admission-equalized arm)",
+ "sessions": {
+  "s1_ts": "20261026-214909 - GLM ladder complete, DS4.1 d_4 died at pass-cap 1 (see finding 1)",
+  "s2_ts": "20261026-222534 - DS4.1 at --prefill-chunk 64: control, 4-stage, 4-stage twin; g_ctlc control",
+  "s3_ts": "20261026-231105 - 647-token prompt (numbered repetitions + elicitation tail), DECODE_N=48: control, 4-stage, twin"
+ },
+ "hardware": "4x AMD Instinct MI50 32GB (gfx906), ROCm 7.2.0; one HIP engine at a time (SVM rule), vLLM stopped by the wrapper and restored after each session",
+ "model": "/ai/models/hf.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored/V41-GSQ.gguf (DS4.1, no --engram per the boundary<=14 rule); GLM Maya-L IQ3_S",
+ "geometry": {
+  "ds41_4stage": "--gpus 0,1,2,3 --layer-split 8,14,20 -> stages [0,8) [8,14) [14,20) [20,40), one stage per card, --relay-chunk 64 --relay-copy-weights --prefill-chunk 64 --slots 1500",
+  "glm_4stage": "--gpus 0,1,2,3 auto split (45 layers, any boundary legal)",
+  "plan_lines_witnessed": "d_4 log: plan stage 0..3 with the ranges above; 32 state columns sized by the engine (session 1); session 3 ran 58-59 passes over 11 distinct windows"
+ },
+ "token_verdicts": {
+  "ds41_s2_14tok_128dec": "d_ctl == d_4 == d_4b: 128/128 tokens, all three streams bitwise identical (covers the MID-DECODE column move at pos 64 and 128)",
+  "ds41_s3_647tok_48dec": "d_ctl == d_4 == d_4b: 48/48 tokens bitwise identical (covers the MID-PREFILL column move: 11 prefill passes cycle columns 0..10 before decode; the P5.3b gate PASS 3 geometry is now hardware-witnessed)",
+  "glm_s1_14tok_64dec": "bar (g_ctl vs g_ctlb) = 64/64 exact; g_2 and g_4 each match 15/64 vs control; staged twins g_2 vs g_4 match 30/64",
+  "glm_admission_confound": "control hit 20.6% with 52.9 prefetch/token issued; staged hit 12.4% with 0 issued (the staged decode loop issues no predicted prefetch). GPU-vs-CPU expert placement changes float summation order (the residency rule applied to admission TIMING). g_ctlc (--pf-b 0, same session as s2) matches staged at 26 (was 15), staged twins still 30 - confound confirmed real, residual defect remains: task #40"
+ },
+ "relay_cost_witnessed": "session 3: 58 passes, 174 boundary hand-offs, 162.7 MiB staged, relay 4620 ms cold vs 170 ms warm (2.93 ms/pass) - the page-cache lesson from P6.2 applies to the relay's host slabs too",
+ "vram_distribution_claim3": "REFUTED as a feature: per-card peaks d_4 = 3.78/5.75/26.72/3.79 GiB - the expert tier lives on ONE card (owner) by construction; dense shards and per-stage relay buffers spread across the rest. Per-stage expert caches are task #39 (P6.4), not this code.",
+ "perf_observations_not_claims": [
+  "prefill (647 tok): control 34.1 tok/s vs staged 6.7 and 4.6 (two boots) - the staged prefill pulled 8875 file-tier expert reads vs control 2073 (4x): staged MoE work does not reuse the owner's warm VRAM slots the way the unsplit run does; this is the #39 path, not a relay-bandwidth cost (relay itself 2.93 ms/pass warm)",
+  "decode: session 2 (14-tok prompt) staged 9.97 vs control 8.08 tok/s (+23%); session 3 (647-tok) staged 13.5/13.3 vs control 14.9 (-10%) - geometry-dependent, both single-prompt gre, NOT a scaling curve (#31 will measure that with repeats)",
+  "graph-pool ceiling (precondition for #31 and any long-context staged serve): a staged stage caches ONE ggml graph per state-column WINDOW; stage 3 (20 layers) costs ~7.5 MiB of its 205.7 MB metadata pool per graph, so ~26 distinct windows per stage is the practical ceiling (~1700 tokens at cap 64); the session-1 pass-cap-1 collapse hit that ceiling at graph ~26. Raising the pool or evicting cold graphs is REQUIRED before a 4096+ staged serve"
+ ],
+ "findings": [
+  "1. pass-cap collapse: a staged run with no --prefill-chunk took cap=min(relay, max(1,0))=1; at cap 1 every token gets its own column and its own cached graph, and stage 3's ggml pool died after ~26 graphs ('ggml_new_object: needed 205986800, available 205676800' - the pool's FULL size). Fixed in 9674c6d0 (staged takes the relay unit; prints a line). Default path untouched (relay_pass_cap only set when --gpus).",
+  "2. a repeated identical prompt (521x one sentence) made BOTH arms emit EOS as the first sampled token - the engine stops unconditionally at G.eos; long-prompt witnesses need non-degenerate text (the runner now numbers the repetitions and appends an elicitation tail).",
+  "3. witness #8's GLM PASS (2026-10-24 receipt) ran under the same admission confound (its control prefetched, its staged arm did not, no --slots on GLM); one staged run matched 64/64, which today's perfect control twin shows was knife-edge luck. The GLM parity protocol must equalize --pf-b (and ideally slots) on both sides."
+ ],
+ "not_tested": "concurrent/serve traffic on staged engines; GLM 4-stage numerics root-cause (#40); Engram with any boundary (rule forbids >14); MTP with staged (engine refuses the pair); graph-pool ceiling reached deliberately"
+}

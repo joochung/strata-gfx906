@@ -184,6 +184,47 @@ witness - and an earlier FAIL (61/64 against every reference, TS 20261024-110925
 settled as knife-edge noise: two identical cross-device runs do not even reproduce each other
 bit-for-bit, so 61/64 is within this engine's own reproducibility and not a placement defect.
 
+### Four cards, real context: P5.4 split smoke (2026-10-26, DS4.1 PASS, GLM defect filed)
+
+[Receipt](../../benchmarks/gfx906/receipts/2026-10-26-p5.4-split-smoke.json), runner
+`tools/gfx906/run-p5.4-split-smoke.sh`, three GPU sessions on the wrapper.
+
+**DS4.1 across four cards is bitwise parity at real context.** `--gpus 0,1,2,3 --layer-split 8,14,20`
+puts one stage on each card - `[0,8) [8,14) [14,20) [20,40)` - the legal four-stage plan the reader's rule
+allows **only without `--engram`** (the Engram rule keeps the first boundary above layer 14). A 647-token
+prompt runs 11 chunk passes and MOVES THE STATE COLUMN MID-PREFILL (columns 0..10, then decode inside
+window 10); all three staged streams (two boots of the 4-stage arm) and the unsplit control produced the
+SAME 48 greedy token ids, bitwise, and with the 14-token shape the same session pattern held at 128/128.
+The P5.3b gate's column-moving PASS 3 - modeled, never booted - is now hardware-witnessed. Per-card VRAM
+peaks (3.78 / 5.75 / 26.72 / 3.79 GiB) refute per-stage expert caches: the tier is ONE card's by design,
+and spreading it is task #39, not this code.
+
+**Two engine findings came out of the first boots.** (1) A staged run with no `--prefill-chunk` collapsed
+its pass cap to `min(relay_chunk, max(1, 0)) = 1`, which gives every token its own state column and its own
+cached graph - and a stage's ggml metadata pool (~205.7 MB, ~7.5 MB per 20-layer graph) dies at ~26 graphs
+("needed 205986800, available 205676800", the pool's FULL size) after 14 prompt tokens and 12 decodes. Fixed
+(9674c6d0): a staged run with no explicit chunk takes the relay unit and says so; the default path is
+untouched. The arithmetic is a PRECONDITION for any long staged serve: distinct cached graphs per stage grow
+with the column WINDOWS a run visits (~26 windows ≈ 1700 tokens at cap 64), so raising the pool or evicting
+cold graphs must land before 4096-token staged serving. (2) A prompt of 521 REPEATED identical sentences
+made both arms emit EOS as the first sampled token (the engine stops unconditionally at `G.eos`): long-prompt
+witnesses need non-degenerate text; the runner now numbers the repetitions and asks for a long answer.
+
+**GLM staged does NOT meet its calibrated bar and is a defect, not a refusal.** Its control twins matched
+64/64 EXACTLY, while `--gpus 0,1` and `0,1,2,3` diverged from control at token 16 (staged twins 30/64 against
+each other). Part of it is admission timing, which is the residency rule applied over TIME: the staged decode
+loop issues no predicted prefetch (12.4% vs 20.6% VRAM hits), and which experts compute on GPU vs CPU changes
+float summation order; a control with `--pf-b 0` moves the divergence 15 -> 26 but not to the bar. That also
+rewrites witness #8's PASS honestly: it ran the same confound with no equalization, and its one 64/64 staged
+match was knife-edge luck under a loose control pair. The residual is root-cause work on GLM's staged branch
+(task #40, with the DS4.1 five-root-cause list as the checklist).
+
+Numbers that are NOT claims: staged 4-card prefill of the 647-token prompt measured 6.7/4.6 tok/s against the
+control's 34.1 - the staged MoE reads ~4x the file tier (8875 vs 2073 expert file reads) because it does not
+reuse the owner's warm slots across stages, while the relay itself costs 2.93 ms/pass warm. Decode measured
++23% (session 2, 14-token prompt) and -10% (session 3, 647-token) against control on single greedy prompts.
+A scaling curve needs repeated runs and is P5.5 (#31).
+
 ## Checked-in CLI
 
 The tensor-split (model-parallel-by-shard) plan - distinct from P5's layer split, with its own
