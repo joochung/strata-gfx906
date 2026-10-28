@@ -341,3 +341,39 @@ and arm absolute rates are only comparable within a session.
 
 The spike stays on the branch, opt-in and default-path byte-identical: if a future kernel path makes
 half-k mul_mats pay their byte-bound share, w4 is the measurement to re-take with ARMS=tp,tp_nofa,tp_b.
+
+## 10. P6.4 expert-parallel tier shards (2026-10-27, witnessed - DS4.1 NO-GO, GLM is the live axis)
+
+The surviving P6 axis after sections 7-9: split no GEMM at all, split only the expert CACHE.
+--tier-cards N stripes experts by expert % N across N shards; each shard is a full Ds41MoeTier on its
+own device - its own VRAM cache, its own arena slice (--arena-gib / N), its own CPU pool, its own file
+reads - admitted through the exclude mask "everything I do not own". Decode fans out at the engine's
+host seam: the top_k entries partition into owned subsets (run/run_to_dev/run_dev gained an n_ent
+parameter, -1 = all = today), partials sum in fixed shard order. N = 1 leaves every path byte-identical;
+N > 1 refuses --serve, staged --gpus, --experts cpu and DSpark at the flag. The fan-in algebra has a host
+gate on real experts (test_ds41_moe --shards 4: rel ~5e-8 vs the full run, deterministic; both coverage
+red controls at 0.55+ where tolerance is 1e-5).
+
+Witness 20261027-194239 (8 boots, 2 interleaved rounds, --slots and --pcie pinned, receipts
+2026-10-27-p6.4-tier-shards.json): decode at the control is 99.2% VRAM-hit at --slots 1500, and the
+shards cannot improve what is already saturated - hit moves +0.20 pt at 4 cards and the rate goes the
+wrong way at every sharding: t2 -9.4%, t4 -27.5%, t4-with-equal-capacity -25.5% (paired vs the warm
+control within the same round; t4's own spread is +-0.02 tok/s across rounds). The attribution boot
+(20261027-200702) rules out the one cost this design introduced: forcing the host-sum fan-in (the
+control's device shortcut off, STRATA_DEC_HOSTSUM=1) costs 15.28 vs 15.74-15.80 tok/s, inside control
+spread. What remains is the fan-out's shape: tier run() is synchronous, so a sharded layer pays N
+serialized GPU submissions and N launch groups where the control pays one. Overlapping that (per-shard
+streams, one join, device fan-in) is real plumbing whose ceiling on this profile is the miss headroom:
++0.2 pt of hit. DS4.1 expert-parallel tier: NO-GO at this operating point, closed with numbers.
+
+The axis does not die with it, because the claim was always about the CACHE-STARVED engine, and this box
+has one: GLM-5.3 Maya-L decode is 12.4% VRAM-hit with the CPU pool at 75.9% of the wall - 275-285 ms of
+its 306-337 ms/token. There the tier is the limiter and it is byte-bound pool compute; four shards are
+four pools, four byte-supply pipes, 4x VRAM and arena over the same hot-set distribution. Mirroring the
+fan-out into tools/ds4/ds4_moe.* and glm_generate.cpp is task #42, and the host algebra gate pattern
+ports with it unchanged.
+
+Two lessons rode along. Shard 0 must take its arena slice too: the first t2 boot pinned 60 + 30 GiB and
+the 84 GiB scope OOM-killed it (dmesg CONSTRAINT_MEMCG at anon-rss 87.6 GiB, fixed 4de1f021). And no
+ladder starts with WARM=0 after a vLLM restart: the first boot is the 2.4x page-cache artifact and it
+poisons the same-round pairing that interleaving exists to buy.

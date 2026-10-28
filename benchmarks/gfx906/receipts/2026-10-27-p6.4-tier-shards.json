@@ -1,0 +1,49 @@
+{
+  "task": "#39 P6.4 expert-parallel tier caching (DS4.1)",
+  "date": "2026-10-27",
+  "branch": "gfx906/p5.3-relay",
+  "commits": ["1e072c43 (implementation + host gate + runner)", "4de1f021 (shard-0 arena slice, the OOM fix)"],
+  "engine": "ds41_generate, build-906, DS4.1 V41-GSQ.gguf WITHOUT --engram, --rank rank.bin, slots 1500, pcie 0.75, arena 60 GiB",
+  "what_was_built": {
+    "flag": "--tier-cards N (default 1: every existing path byte-identical)",
+    "ownership": "expert (l,e) owned by shard e % N (round-robin stripe of the hot head)",
+    "per_shard": "full Ds41MoeTier on its own device: own VRAM cache, own arena slice arena-gib/N, own CPU pool, own file reads; exclude mask = everything I do not own",
+    "fan_in": "engine seam: top_k entries partition into owned subsets (new run/run_to_dev/run_dev n_ent, -1 = all = today); partials summed in FIXED SHARD ORDER; forced host-sum (rdev1=null) when sharded",
+    "refused_n_gt_1": ["--serve", "--gpus staging (staged run)", "--experts cpu", "DSpark (STRATA_DSPARK env, checked at the tier)", "N<1"],
+    "prefill": "chunk path stays on shard 0; non-owned experts read the file tier there (correctness via the exclude-blind CPU/file path)"
+  },
+  "host_gate": {
+    "tool": "tools/v41/engine/test_ds41_moe.cpp --shards 4 (mirrors the engine fan-in on REAL V41-GSQ experts, CPU tier)",
+    "log": "logs/p6.4-hostgate-20261027-200702.log",
+    "result": "PASS: fan-in vs full run rel ~5e-8, deterministic across repeated fan-outs; BOTH coverage red controls (drop an entry / duplicate an entry) rel 0.55-0.96 where the tolerance is 1e-5 - the check is live"
+  },
+  "sessions": {
+    "20261027-192654": "first ladder: warm + ctl OK; t2-r1 OOM-killed by the 84 GiB scope (dmesg CONSTRAINT_MEMCG, anon-rss 87.6 GiB): shard 0 carried the FULL 60 GiB arena while shard 1 took 30 -> 90 GiB pinned. Fixed in 4de1f021.",
+    "20261027-194239": "full ladder 8 boots (2 interleaved rounds x ctl/t2/t4/t4e), jsonl logs/p6.4-tier-shards-20261027-194239.jsonl",
+    "20261027-200702": "attribution boot: ctl WITH STRATA_DEC_HOSTSUM=1, warm (throwaway + 1): 15.28 tok/s vs warm ctl 15.74-15.80 - the host-sum round trip the sharded arms pay is NOT the cost (-3.3%, inside ctl spread)"
+  },
+  "numbers_decode_tps": {
+    "ctl_warm": [15.80, 15.74, 15.28, 15.22],
+    "ctl_note": "session 20261027-194239 ctl-r1 = 10.12 was the FIRST boot after the OOM session + vLLM restart (page-cache artifact, the WARM=0 mistake on my part - the throwaway boot exists for exactly this); warm pair = round 2",
+    "t2": {"r1_coldish": 7.04, "r2": 14.31, "paired_vs_warm_ctl": "-9.4% (n=1 warm pair)"},
+    "t4": {"values": [11.48, 11.45], "stability": "+-0.02 across rounds (the stablest arm in the session)", "paired_vs_warm_ctl": "-27.5%, -27.4% (n=2)"},
+    "t4e_equal_capacity_4x375": {"values": [11.80, 11.77], "paired_vs_warm_ctl": "-25.5%, -25.5% (n=2)"}
+  },
+  "hit_rates": {
+    "ctl": 0.9923, "t2": 0.9904, "t4": 0.9943, "t4e": 0.9850,
+    "path_counts": "lookups identical across arms within knife-edge (30495/30492/30521/30493)",
+    "reading": "the capacity story is bounded by the MISS HEADROOM: at --slots 1500 the single-card cache already serves 99.2% of DS4.1 decode lookups from VRAM; 4 shards buy +0.20 pt at best (t4), 4x-equal-capacity buys nothing"
+  },
+  "token_streams": "t2/t4e twins identical ACROSS sessions within the arm, diverging from ctl at token 6 (systematic summation-order flip, not noise); t4 diverges at token 1 - its cache is 4x the control's (slots are per-shard), a deliberate residency difference under the residency rule. This is the documented knife-edge class, never the gate.",
+  "verdict": {
+    "ds41_this_operating_point": "NO-GO. Exit measured: hit + tok/s at 1/2/4 cards vs baselines. Hit is FLAT (the cache was never the limiter at this operating point); the rate is NEGATIVE at every sharding (-9.4% t2, -25..-27.5% t4/t4e) and the attribution boot EXONERATES the host-sum round trip (-3.3%), localizing the cost to the per-layer fan-out itself: run() is synchronous by design, so a sharded decode pays N serialized tier submissions + N launch groups per layer instead of one.",
+    "what_would_change_it": "an engine where the shard runs OVERLAP (per-shard streams + one join per layer, and a device-side fan-in) - and even then the ceiling is the miss headroom: +0.2 pt hit at best on this profile. Not worth the plumbing for DS4.1.",
+    "live_axis": "the CACHE-STARVED engine: GLM-5.3 Maya-L decode runs hit 12.4%, cpu pool 75.9% = 275-285 ms/token of its 306-337 ms/token wall (logs/p5.4c-g_*-20261027-180516.log, p5.4-g_ctl-20261026-214909.log). There the tier IS the wall and it is byte-bound CPU-pool compute: four shards = four CPU pools + four byte-supply pipes + 4x VRAM/arena on the SAME hot set distribution. That port (mirror the fan-out + n_ent into tools/ds4/ds4_moe.hpp/.cpp and glm_generate.cpp) is NEW TASK #42; the host algebra gate pattern (test_ds41_moe --shards) ports with it."
+  },
+  "lessons": [
+    "shard 0 must take its arena slice too: mc carried the full --arena-gib and shard 1 added arena/N -> 90 GiB pinned vs the 84 GiB scope (fixed 4de1f021; the MemAvailable gate measures the TOTAL arena, the scope catches the mistake)",
+    "never WARM=0 after a vLLM (re)start: the first boot is a 2.4x page-cache artifact and it poisons the SAME-ROUND pairing, which is the whole point of interleaving",
+    "engine counters behaved: identical lookup totals across arms made the residency-confound check a one-line grep",
+    "prompt tok/s on a 16-token prompt is meaningless (load-dominated); long-prompt scaling stays with P5.5-style runners"
+  ]
+}
