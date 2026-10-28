@@ -290,6 +290,7 @@ struct Args {
     std::string gguf = kDefaultGguf;
     bool require_gguf = false, no_synthetic = false, no_real = false, gpu = false, timing = false;
     int sets = 3;
+    int shards = 0;   // --shards N: arm S, the P6.4b fan-out gate (N >= 2)
     // --timing (a FULL-MODEL run: wrap it in tools/ds4/memguard.sh 64 62 -- ...)
     std::string routes, pred, profile;
     int64_t tokens = 32, offset = 512, slots = 2150, threads = 7;
@@ -443,8 +444,84 @@ int arm_real(const std::string& gguf, int sets, bool require_gguf, float lim_ove
     return 0;
 }
 
-#if defined(DS4_MOE_CUDA)
+// ================================ arm S: P6.4b shard fan-out (host mirror of glm_generate's shard_run) ================================
+// The engine partitions the top_k entries by (expert % N), runs each shard's subset, and sums the partials in
+// FIXED SHARD ORDER. This mirrors that fan-in on ONE CPU tier over real GGUF experts: the kernel work is per
+// entry, so only the final summation grouping differs from the full run and the fan-in must track the full sum
+// to f32 noise. Red controls: dropping or duplicating an entry is a COVERAGE error and must be caught - the
+// same check would pass silently with a loose tolerance, so it is reported next to the numbers.
+int arm_shards(const std::string& gguf, int N, int sets) {
+    if (N < 2) { std::printf("shards: --shards needs N >= 2\n"); return 1; }
+    std::string err;
+    Ds4MoeGeom g;
+    if (!strata::ds4::ds4_moe_geom_from_gguf(gguf, g, err)) { std::printf("shards: geom: %s\n", err.c_str()); return 1; }
+    cpu::NativeFmt f;
+    if (!strata::ds4::ds4_moe_blob_layout(g, f, err)) { std::printf("shards: %s\n", err.c_str()); return 1; }
+    Ds4GgufBlobs blobs(g, gguf);
+    if (!blobs.open(err)) { std::printf("shards: %s\n", err.c_str()); return 1; }
+    Ds4MoeConfig cfg;
+    cfg.cpu_only = true; cfg.slots = 0; cfg.pf_b = 0.0; cfg.arena_gib = 0.0; cfg.threads = 8;
+    Ds4MoeTier tier;
+    if (!tier.init(g, &blobs, cfg, err)) { std::printf("shards: init: %s\n", err.c_str()); return 1; }
+    const int64_t H = f.n_embd, K = g.top_k;
+    std::printf("\n-- arm S: shard fan-out over real GGUF experts, %d shards (top-%lld per token)\n", N, (long long) K);
+    // pick routed layers from THIS model (layer 0 is hash-routed on some, dense on others; run() refuses non-routed)
+    std::vector<int64_t> layers;
+    for (int64_t l = 0; l < g.n_layers && layers.size() < 2; ++l)
+        if (g.routed(l)) layers.push_back(l);
+    if (layers.empty()) { std::printf("shards: no routed layer in this geom\n"); return 1; }
+    std::mt19937 rng(20261027);
+    std::normal_distribution<float> xn(0.f, 1.f);
+    std::vector<float> x((size_t) H), w6((size_t) K);
+    int rc = 0;
+    for (int s = 0; s < std::min(sets, 2); ++s) {
+        const int64_t L = layers[(size_t) s % layers.size()];
+        for (int64_t i = 0; i < H; ++i) x[(size_t) i] = xn(rng) * 0.3f;
+        std::vector<int32_t> ids((size_t) K);
+        for (int64_t k = 0; k < K; ++k) ids[(size_t) k] = (int32_t) ((s * 17 + k * 5 + 2) % g.n_experts);   // spread across the stripes
+        router_weights(rng, K, w6.data());
+        std::vector<float> got((size_t) H), want((size_t) H);
+        if (!tier.run(L, ids.data(), w6.data(), x.data(), got.data())) {
+            std::printf("shards: full run refused\n"); return 1;
+        }
+        auto fanout = [&](bool red_drop, bool red_dup, std::vector<float>& tot) {
+            tot.assign((size_t) H, 0.f);   // sized HERE: callers pass default-constructed vectors for the red controls
+            std::vector<float> part((size_t) H);
+            for (int sh = 0; sh < N; ++sh) {
+                std::vector<int32_t> si; std::vector<float> sw;
+                for (int64_t j = 0; j < K; ++j)
+                    if (ids[(size_t) j] % N == sh) { si.push_back(ids[(size_t) j]); sw.push_back(w6[(size_t) j]); }
+                int nn = (int) si.size();
+                if (red_drop && nn > 0) --nn;                                          // red: this entry reaches NO shard
+                if (red_dup && nn > 0) { si.push_back(si[0]); sw.push_back(sw[0]); ++nn; }   // red: TWO shards compute it
+                if (!nn) continue;
+                if (!tier.run(L, si.data(), sw.data(), x.data(), part.data(), nn)) {
+                    std::printf("shards: shard run refused\n"); std::exit(1);
+                }
+                for (int64_t i = 0; i < H; ++i) tot[(size_t) i] += part[(size_t) i];
+            }
+        };
+        fanout(false, false, want);
+        const double r_fan = rel(want.data(), got.data(), H);
+        std::vector<float> want2; fanout(false, false, want2);
+        const bool det = want == want2;   // the fan-in is deterministic across repeats
+        std::vector<float> t1, t2;
+        fanout(true, false, t1); fanout(false, true, t2);
+        const double r_drop = rel(t1.data(), got.data(), H), r_dup = rel(t2.data(), got.data(), H);
+        const bool ok = r_fan < 1e-5 && det && r_drop > 1e-3 && r_dup > 1e-3;
+        check(ok, "shards " + std::to_string(N) + " L" + std::to_string(L) +
+                      ": fan-in vs full run (deterministic; red controls catch coverage)", r_fan);
+        std::printf("   L%lld set %d shards %d: rel %.3e det %s red drop %.3e dup %.3e  ids:",
+                    (long long) L, s, N, r_fan, det ? "yes" : "NO", r_drop, r_dup);
+        for (int64_t k = 0; k < K; ++k) std::printf(" %d", ids[(size_t) k]);
+        std::printf("\n");
+        rc |= !ok;
+    }
+    tier.close();
+    return rc;
+}
 
+#if defined(DS4_MOE_CUDA)
 // ================================ arm 3: the GPU's four sources ================================
 //
 // The card runs the same expert kernels as the pool but a different activation format: q8_1, not Q8_K
@@ -954,6 +1031,7 @@ int main(int argc, char** argv) {
         else if (k == "--no-synthetic") a.no_synthetic = true;
         else if (k == "--no-real") a.no_real = true;
         else if (k == "--sets" && has) a.sets = std::atoi(argv[++i]);
+        else if (k == "--shards" && has) a.shards = std::atoi(argv[++i]);
         else if (k == "--gpu") a.gpu = true;
         else if (k == "--timing") a.timing = true;
         else if (k == "--routes" && has) a.routes = argv[++i];
@@ -969,7 +1047,7 @@ int main(int argc, char** argv) {
         else if (k == "--gap-ms" && has) a.gap_ms = std::atof(argv[++i]);
         else {
             std::printf(
-                "usage: test_ds4_moe [--gguf PATH] [--require-gguf] [--sets N] [--no-synthetic] [--no-real]\n"
+                "usage: test_ds4_moe [--gguf PATH] [--require-gguf] [--sets N] [--shards N] [--no-synthetic] [--no-real]\n"
                 "       test_ds4_moe_gpu [--gpu] [same]                    (the CUDA flavour: build-ds4-cuda)\n"
                 "       test_ds4_moe_gpu --timing --routes R [--pred P] [--profile Q] [--tokens N] [--offset O]\n"
                 "                        [--slots S] [--arena-gib G] [--pcie-frac F] [--pf-b B] [--gap-ms X]\n"
@@ -1010,6 +1088,7 @@ int main(int argc, char** argv) {
     int rc = 0;
     if (!a.no_synthetic) rc |= arm_synthetic(a.sets);
     if (!a.no_real) rc |= arm_real(a.gguf, a.sets, a.require_gguf);
+    if (a.shards > 1) rc |= arm_shards(a.gguf, a.shards, a.sets);
 #if defined(DS4_MOE_CUDA)
     if (a.gpu) rc |= arm_gpu(a.gguf, a.sets);
     if (a.gpu) rc |= arm_multi(a.gguf);

@@ -472,7 +472,7 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks)
+ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks, int core_offset)
     : tasks_(tasks), host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
@@ -495,7 +495,11 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     split_multi_.resize((size_t) kMaxSplitMulti);
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
-        const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
+        // `core_offset` (P6.4b, default 0 = byte-identical): a second tier pool of the same size takes the NEXT
+        // slice of worker cores instead of landing its workers on the first pool's pins (two pinned pools on the
+        // same pins thrash; the sharded tier divides the pool's byte-bound work only if it divides the cores).
+        const int wsel = core_offset + i;
+        const int core = pin ? (wsel < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) wsel] : -1) : -1;
         threads_.emplace_back([this, i, core] {
             strata::aux_cpus::note_owned_thread();   // --aux-cpus never moves a worker
             pin_this_thread(core, i);

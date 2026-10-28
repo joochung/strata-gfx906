@@ -287,6 +287,9 @@ struct Ds4MoeConfig {
     /// GLM abliteration LoRA (routed experts): per-layer rank-1 deltas, an array of `n_layers` entries or null (the
     /// default: off).  The grouped CUDA path applies them; the CPU pool and the MMQ chunk path do not (yet).
     const Ds4MoeLoraHost* lora = nullptr;
+    /// Sharded tier (P6.4b --tier-cards): the CPU pool's workers start at this many physical cores into the
+    /// topology's worker list instead of at its head, so shard pools do not land on each other's pins.  0 = today.
+    int pool_core_offset = 0;
     uint64_t seed = 20261005;     ///< the synthetic arm's generator (unused by the tier itself)
 
     static constexpr int kPredW = 16;   ///< ranked predictions the caller passes to `prefetch`
@@ -362,10 +365,12 @@ public:
     /// `pf_b <= 0`.  `n` may be smaller than the caller's list; never larger than kPredW.
     void prefetch(int64_t layer, const int32_t* top16, int n = Ds4MoeConfig::kPredW);
 
-    /// out[i] = sum_k w6[k] * expert_{ids6[k]}(x)[i], with `x` on the host.  Synchronous.
-    bool run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out);
+    /// out[i] = sum_k w6[k] * expert_{ids6[k]}(x)[i], with `x` on the host.  Synchronous.  `n_ent` (default: all
+    /// top_k) computes the sum over the FIRST `n_ent` entries only - the sharded-tier fan-out (P6.4b, --tier-cards)
+    /// passes each shard its owned subset.  Entries beyond n_ent are never looked up, fetched or computed.
+    bool run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out, int n_ent = -1);
     /// The same with `x` already on the device (the engine's attention output).  CUDA modes only.
-    bool run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out);
+    bool run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out, int n_ent = -1);
 
     void close();
 

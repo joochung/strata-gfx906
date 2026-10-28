@@ -762,7 +762,8 @@ bool Ds4MoeTier::init(const Ds4MoeGeom& geom, Ds4BlobSource* blobs, const Ds4Moe
               std::to_string(im_->blob);
         return false;
     }
-    im_->pool.reset(new cpu::ExpertPool(cfg.threads > 0 ? cfg.threads : 0));
+    im_->pool.reset(new cpu::ExpertPool(cfg.threads > 0 ? cfg.threads : 0, true, true, cpu::PoolAffinity::All, 0,
+                                        cfg.pool_core_offset));
     im_->jobs.resize((size_t) geom.top_k);
     im_->parts.assign((size_t) geom.top_k * (size_t) geom.n_embd, 0.0f);
     im_->nact.assign(cpu::kNativeActBytes, 0);
@@ -1275,9 +1276,10 @@ void set_job_lora(const Ds4MoeImpl& im, cpu::ExpertJobMulti& j, int64_t layer, i
     j.lora_b = h.b_d + (size_t) expert * (size_t) im.g.n_embd;
 }
 
-bool cpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out) {
+bool cpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out,
+             int n_ent = -1) {
     const int64_t H = im.g.n_embd;
-    const int64_t K = im.g.top_k;
+    const int64_t K = n_ent > 0 ? (int64_t) n_ent : im.g.top_k;   // P6.4b shard subset (see Ds4MoeTier::run)
     const double t0 = now_ms();
     const cpu::NativeFmt& f = im.fl[(size_t) layer];
     cpu::native_quant_act(f, x, im.nact.data());
@@ -1319,14 +1321,14 @@ int64_t g_prof_n = 0;
 const char* const g_prof_name[9] = {"split", "activation", "gpu launch", "cpu pool", "layer sync", "d2h parts",
                                     "sum", "admission", "pcie budget"};
 bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x_host,
-             const void* x_dev, float* out) {
+             const void* x_dev, float* out, int n_ent = -1) {
     const TierDev td(im.gpu->dev);   // step 2: the tier names its device on every entry (see TierDev)
     static const bool prof = std::getenv("DS4_TIER_PROF") != nullptr;
     double tp = prof ? now_ms() : 0;
     auto mark = [&](int i) { if (prof) { const double t = now_ms(); g_prof[i] += t - tp; tp = t; } };
     Gpu& gp = *im.gpu;
     const int64_t H = im.g.n_embd;
-    const int64_t K = im.g.top_k;
+    const int64_t K = n_ent > 0 ? (int64_t) n_ent : im.g.top_k;   // P6.4b: a shard sums its owned prefix of the entries
     const int64_t B = im.blob;                        // staging STRIDE (the largest blob)
     const int64_t BL = im.bl[(size_t) layer];         // this layer's blob (the bytes a DMA moves)
     const bool lru = im.cfg.vram_lru && gp.cache && !im.cfg.no_cache;   // uniform (DS4) too: every slot fits any blob
@@ -2636,13 +2638,13 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
 }
 #endif
 
-bool Ds4MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out) {
+bool Ds4MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out, int n_ent) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids6 || !w6 || !x || !out) return false;
     if (!im_->g.routed(layer)) return false;
-    if (im_->cfg.cpu_only) return cpu_run(*im_, layer, ids6, w6, x, out);
+    if (im_->cfg.cpu_only) return cpu_run(*im_, layer, ids6, w6, x, out, n_ent);
 #if defined(DS4_MOE_CUDA)
-    return gpu_run(*im_, layer, ids6, w6, x, nullptr, out);
+    return gpu_run(*im_, layer, ids6, w6, x, nullptr, out, n_ent);
 #else
     return false;
 #endif
@@ -2814,13 +2816,13 @@ bool Ds4MoeTier::run_chunk_dev(int64_t layer, int n, const int32_t* ids, const f
     return false;
 }
 
-bool Ds4MoeTier::run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out) {
+bool Ds4MoeTier::run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out, int n_ent) {
     if (!im_->inited) return false;
     if (!ids6 || !w6 || !x_dev || !out) return false;
     if (!im_->g.routed(layer)) return false;
     if (im_->cfg.cpu_only) return false;   // there is no device input without a device tier
 #if defined(DS4_MOE_CUDA)
-    return gpu_run(*im_, layer, ids6, w6, nullptr, x_dev, out);
+    return gpu_run(*im_, layer, ids6, w6, nullptr, x_dev, out, n_ent);
 #else
     return false;
 #endif
