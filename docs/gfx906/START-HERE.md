@@ -82,9 +82,12 @@ the P5.4 arms ran --pcie auto, whose share is an EMA of MEASURED per-path cost, 
 difference converges the admission to a different cpu/pcie mix (and a CPU expert is not bit-equal to a GPU
 one). With --pcie pinned, control / same-device relay / cross-card relay are EXACT 64/64 with identical path
 counters (receipt 2026-10-27-p5.4c-glm-staged-parity.json). The rule: cross-topology parity witnesses pin
-every timing-adaptive knob. Refused by design: `--serve`/DSpark on a staged run, Engram boundaries above layer 14,
-and (arithmetically) more than ~26 state-column windows per stage until the per-stage graph pool grows or evicts.
-The per-step ledger the rest of this section records stands as the path to that verdict.
+every timing-adaptive knob. Refused by design: `--serve`/DSpark on a staged run, Engram boundaries above layer 14.
+The column-window graph-pool ceiling that the first boots arithmetic-ed out (~26 windows per stage) was measured
+and FIXED (2026-10-28): a staged stage's arena now grows once to its full-cycle size, and a 2200-token 4-stage
+DS4.1 run - past the old death point - is bit-identical to the single-card control (receipt
+2026-10-28-p43-graph-pool-growth.json). The per-step ledger the rest of this section records stands as the path
+to that verdict.
 
 
 The GLM engine now runs a STAGED pass opt-in (`--gpus 0,0`): the model is split into two stage
@@ -220,9 +223,13 @@ its pass cap to `min(relay_chunk, max(1, 0)) = 1`, which gives every token its o
 cached graph - and a stage's ggml metadata pool (~205.7 MB, ~7.5 MB per 20-layer graph) dies at ~26 graphs
 ("needed 205986800, available 205676800", the pool's FULL size) after 14 prompt tokens and 12 decodes. Fixed
 (9674c6d0): a staged run with no explicit chunk takes the relay unit and says so; the default path is
-untouched. The arithmetic is a PRECONDITION for any long staged serve: distinct cached graphs per stage grow
-with the column WINDOWS a run visits (~26 windows ≈ 1700 tokens at cap 64), so raising the pool or evicting
-cold graphs must land before 4096-token staged serving. (2) A prompt of 521 REPEATED identical sentences
+untouched. The arithmetic was a PRECONDITION for any long staged serve, and it was MEASURED and met
+(2026-10-28, receipt 2026-10-28-p43-graph-pool-growth.json): instrumenting the arena showed each cached n=1 graph
+costs ~0.37 MiB and a column window adds (owned layers x attn + one shared finish) graphs, so the 20-layer last
+stage needs ~250 MiB per full 32-window cycle against the 196 MiB init pool - that is where 2200-token staged
+decodes died (rc=139 at 1521 tokens, graph 531 at 99% fill). The fix grows a staged stage's arena ONCE, at 70%
+fill, from geometry times the measured mean graph cost; the re-witness ran 2200/2200 tokens bit-identical to the
+single-card control with the growth line printed once for the whole boot. (2) A prompt of 521 REPEATED identical sentences
 made both arms emit EOS as the first sampled token (the engine stops unconditionally at `G.eos`): long-prompt
 witnesses need non-degenerate text; the runner now numbers the repetitions and asks for a long answer.
 

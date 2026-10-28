@@ -348,6 +348,9 @@ struct Ds41Dense::Impl {
     struct GKey { int il, kind; int64_t cap, n, col; bool operator<(const GKey & o) const {
         return std::tie(il, kind, cap, n, col) < std::tie(o.il, o.kind, o.cap, o.n, o.col); } };
     std::map<GKey, ggml_cgraph *> graphs;
+    // task #43 (see grow_graph_pool): the arena gctx was init with, and whether the one-shot growth already ran.
+    size_t gpool_bytes = 0;
+    bool gpool_grown = false;
     std::map<int, ggml_tensor *> logits_out;   // decode head graph output, by nrows
     // the output tensor of each cached graph, keyed the SAME way as the graph (the output is a view of that graph's
     // own scratch, so it belongs to one column too - see GKey's `col`)
@@ -692,6 +695,75 @@ struct B {
         return ggml_rope_set_offset(r, (int) (a->ne[0] - nd));
     }
 };
+
+// STRATA_GPOOL=1 (opt-in, print only): node-pool accounting lines for task #43.  The graph cache (GKey above)
+// lives in ONE ggml arena per stage; the 2026-10-26 P5.4 witness died when a degenerate pass cap put every token
+// in its own cached graph and the arena exhausted mid-request.  The 2026-10-27 measurement run (2200-token staged
+// decode, this print) sized the pieces: a cached n=1 graph costs ~0.39 MiB of arena, and a staged stage needs
+// windows x layers x ~4 graphs per full column cycle (32 x 20 x 4 = 2560 graphs on the 20-layer last stage at
+// cap 64) against an arena of 196 MiB = ~500 graphs, so the cycle at full column count CANNOT fit the init pool.
+// Usage is nevertheless BOUNDED (the column walk cycles over NC/S windows, graphs are reused on every re-entry),
+// so the fix is grow-once-to-the-cycle-size, not eviction: see grow_graph_pool().
+static void pool_note(Ds41Dense::Impl & im, const char * what) {
+    static const bool on = std::getenv("STRATA_GPOOL") != nullptr;
+    if (!on || !im.gctx) return;
+    const size_t used = ggml_used_mem(im.gctx), tot = ggml_get_mem_size(im.gctx);
+    std::fprintf(stderr, "gpool: %-18s used %.1f/%.1f MiB (%.1f%%) graphs %zu\n", what, used / 1048576.0,
+                 tot / 1048576.0, tot ? 100.0 * (double) used / (double) tot : 0.0, im.graphs.size());
+    std::fflush(stderr);
+}
+
+// The arena size a stage should have, from what the pool was init with and what a measured graph costs.  At
+// init this is exactly the historical formula (im.gpool_bytes is 0 then); after grow_graph_pool() records the
+// arena it installed, set_columns()/re-inits keep the larger size instead of silently shrinking back.
+static size_t gpool_fit_bytes(const Ds41Dense::Impl & im) {
+    const size_t base = ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(8192, false) * 400;
+    return std::max(base, im.gpool_bytes);
+}
+
+// task #43: one-shot growth of a STAGED stage's graph arena to the size one full column cycle needs.  Called
+// before a graph is BUILT (never between build and map insertion, so no pointer this function invalidates is
+// ever held by the caller).  The default path cannot reach it: it is gated on im.staged, and an unsplit run
+// caches one graph per (il, kind, cap, n) at col 0 - its arena has never approached the limit in production.
+// The clear-and-rebuild sequence mirrors set_columns() (the elastic-columns path, the proven mid-run instance
+// of "free gctx, everything in it is rebuildable lazily"), except the column tensors and their buffer are
+// UNTOUCHED here - only the node arena changes, so last_col0 stays (the carry state lives in the column buffer).
+static void grow_graph_pool(Ds41Dense::Impl & im) {
+    if (!im.gctx || im.graphs.size() < 2) return;
+    const size_t used = ggml_used_mem(im.gctx), tot = ggml_get_mem_size(im.gctx);
+    if (used < (size_t) (0.70 * (double) tot)) return;                 // headroom left: the init pool still fits it
+    const size_t per = (used - ggml_graph_overhead_custom(8192, false)) / im.graphs.size();   // mean graph, incl. outputs
+    const int64_t windows = im.S > 0 ? std::max<int64_t>(1, im.NC / im.S) : 1;   // the column walk cycles over these
+    const int64_t layers = std::max<int64_t>(1, im.wle - im.lb);
+    // ~4 cached graphs per (layer, window): attn, predict, finish_predict, finish_predict_ahead.  x1.5 over the
+    // measured mean (later-window graphs of other kinds cost the same order), x1.3 headroom, host-RAM stop at 4 GiB.
+    size_t need = (size_t) ((double) windows * (double) layers * 4.0 * (double) per * 1.5);
+    need = (size_t) ((double) need * 1.3);
+    need = std::min<size_t>(need, (size_t) 4 << 30);
+    if (need <= tot) return;   // the cycle already fits (small NC/S or few layers): leave the pool alone
+    ggml_backend_synchronize(im.backend);
+    im.graphs.clear();
+    im.logits_out.clear();
+    im.predict_out.clear();
+    im.predict_out_n.clear();
+    im.fpredict_out.clear();
+    im.fpredict_ahead.clear();
+    for (Allo * al : { &im.allo_dec, &im.allo_pass }) {
+        if (al->a) ggml_gallocr_free(al->a);
+        al->a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
+        al->graph_epoch.clear();
+        al->compute_bufs.clear();
+        ++al->epoch;
+    }
+    ggml_free(im.gctx);
+    ggml_init_params gp = { need, nullptr, true };
+    im.gctx = ggml_init(gp);
+    im.gpool_bytes = need;
+    im.gpool_grown = true;   // only an ACTUAL re-init retires the check; the early returns above leave it live
+    std::fprintf(stderr, "gpool: staged arena grew %.1f -> %.1f MiB (%lld windows x %lld layers, %.2f MiB/graph)\n",
+                 tot / 1048576.0, need / 1048576.0, (long long) windows, (long long) layers, per / 1048576.0);
+    std::fflush(stderr);
+}
 
 }  // namespace
 
@@ -1391,7 +1463,7 @@ bool Ds41Dense::set_columns(int nc) {
         ++al->epoch;
     }
     if (im.gctx) ggml_free(im.gctx);
-    ggml_init_params gp = { ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(8192, false) * 400, nullptr, true };
+    ggml_init_params gp = { gpool_fit_bytes(im), nullptr, true };   // #43: keep a grown arena across a column resize
     im.gctx = ggml_init(gp);
     im.last_col0 = -1;   // the column tensors are reallocated below; the remembered carry column is gone with them
     return alloc_cols(im, want, im.err);
@@ -1625,7 +1697,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         for (size_t i = 0; i < v.size(); ++i) v[i] = (float) i;
         ggml_backend_tensor_set(im.blk_ramp, v.data(), 0, v.size() * 4);
     }
-    ggml_init_params gp = { ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(8192, false) * 400, nullptr, true };
+    ggml_init_params gp = { gpool_fit_bytes(im), nullptr, true };   // #43: same sizing helper as set_columns
     im.gctx = ggml_init(gp);
     im.allo_dec.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     im.allo_pass.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
@@ -2397,7 +2469,11 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
     std::vector<uint8_t> meta;
     if (cached) {
         auto it = im.graphs.find({ -1, 0, 0, 1, im.col0 });
-        if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 0, 0, 1, im.col0 }, build_init(im, im.gctx, 1)).first;
+        if (it == im.graphs.end()) {
+            if (im.staged && !im.gpool_grown) grow_graph_pool(im);   // #43: before the build - nothing to dangle
+            it = im.graphs.emplace(Impl::GKey { -1, 0, 0, 1, im.col0 }, build_init(im, im.gctx, 1)).first;
+            pool_note(im, "init n=1");
+        }
         gf = it->second;
     } else {
         meta.resize(ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(64, false));
@@ -2646,7 +2722,11 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     if (cached) {
         const Impl::GKey key { il, 1, cap, 1, im.col0 };
         auto it = im.graphs.find(key);
-        if (it == im.graphs.end()) it = im.graphs.emplace(key, build_attn(im, im.gctx, il, 1)).first;
+        if (it == im.graphs.end()) {
+            if (im.staged && !im.gpool_grown) grow_graph_pool(im);   // #43: before the build - nothing to dangle
+            it = im.graphs.emplace(key, build_attn(im, im.gctx, il, 1)).first;
+            pool_note(im, "attn n=1");
+        }
         gf = it->second;
     } else {
         im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
@@ -2684,10 +2764,12 @@ bool Ds41Dense::predict(int il, int * top_ids, int n_top) {
     const Impl::GKey key { il, 3, 0, 1, im.col0 };
     auto it = im.graphs.find(key);
     if (it == im.graphs.end()) {
+        if (im.staged && !im.gpool_grown) grow_graph_pool(im);   // #43: before the build - nothing to dangle
         ggml_tensor * o = nullptr;
         ggml_cgraph * gf = build_predict(im, im.gctx, il, &o);
         it = im.graphs.emplace(key, gf).first;
         im.predict_out[{ il, im.col0 }] = o;
+        pool_note(im, "predict");
     }
     if (!im.compute(it->second, true)) return false;
     int32_t buf[16];
@@ -2706,9 +2788,11 @@ bool Ds41Dense::predict_multi(int il, int * top_ids) {
     auto it = im.graphs.find(key);
     ggml_tensor * o = nullptr;
     if (it == im.graphs.end()) {
+        if (im.staged && !im.gpool_grown) grow_graph_pool(im);   // #43: before the build - nothing to dangle
         ggml_cgraph * gf = build_predict(im, im.gctx, il, &o, n);
         it = im.graphs.emplace(key, gf).first;
         im.predict_out_n[{ il, (int) n, im.col0 }] = o;
+        pool_note(im, "predict_multi");
     }
     o = im.predict_out_n[{ il, (int) n, im.col0 }];
     if (!im.compute(it->second, true)) return false;
@@ -2729,7 +2813,11 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
     std::vector<uint8_t> meta;
     if (cached) {
         auto it = im.graphs.find({ -1, 2, 0, 1, im.col0 });
-        if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 2, 0, 1, im.col0 }, build_finish(im, im.gctx, 1)).first;
+        if (it == im.graphs.end()) {
+            if (im.staged && !im.gpool_grown) grow_graph_pool(im);   // #43: before the build - nothing to dangle
+            it = im.graphs.emplace(Impl::GKey { -1, 2, 0, 1, im.col0 }, build_finish(im, im.gctx, 1)).first;
+            pool_note(im, "finish n=1");
+        }
         gf = it->second;
     } else {
         meta.resize(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
@@ -2756,10 +2844,12 @@ bool Ds41Dense::finish_predict(int il, const float * routed_sum, int next_il, in
     const Impl::GKey key { next_il, 5, 0, 1, im.col0 };
     auto it = im.graphs.find(key);
     if (it == im.graphs.end()) {
+        if (im.staged && !im.gpool_grown) grow_graph_pool(im);   // #43: before the build - nothing to dangle
         ggml_tensor * o = nullptr;
         ggml_cgraph * gf = build_finish_predict(im, im.gctx, next_il, &o);
         it = im.graphs.emplace(key, gf).first;
         im.fpredict_out[{ next_il, im.col0 }] = o;
+        pool_note(im, "finish_predict");
     }
     if (!im.compute(it->second, true)) return false;
     int32_t buf[16];
@@ -2780,12 +2870,14 @@ bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_
     const Impl::GKey key { next_il, 6, ahead, 1, im.col0 };
     auto it = im.graphs.find(key);
     if (it == im.graphs.end()) {
+        if (im.staged && !im.gpool_grown) grow_graph_pool(im);   // #43: before the build - nothing to dangle
         ggml_tensor * o = nullptr;
         std::vector<ggml_tensor *> ao;
         ggml_cgraph * gf = build_finish_predict(im, im.gctx, next_il, &o, ahead, &ao);
         it = im.graphs.emplace(key, gf).first;
         ao.insert(ao.begin(), o);   // [0] = next_il's prediction, [1 + a] = next_il + 1 + a's
         im.fpredict_ahead[{ next_il, ahead, im.col0 }] = ao;
+        pool_note(im, "fp_ahead");
     }
     if (!im.compute(it->second, true)) return false;
     const auto & ao = im.fpredict_ahead[{ next_il, ahead, im.col0 }];   // [0] = the output, then one entry per extra row

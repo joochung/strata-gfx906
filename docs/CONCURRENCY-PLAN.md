@@ -553,9 +553,10 @@ counters identical across arms); prefill scales 3-5x NEGATIVE under staging with
 the 4-card decode mean is NOT separable from control at n=2 because within-arm boot variance is as
 large as between-arm differences - so no scaling claim stronger than the paired comparison is made.
 BOUNDARIES the checkpoint refuses by design: `--serve` and DSpark on a staged run, Engram boundaries
-above layer 14, and (arithmetically) staged runs past ~26 state-column windows per stage (~1700 tokens
-at cap 64) until the per-stage ggml graph pool grows or evicts. P4b is unblocked for the ported engines'
-per-session caches with the device ownership from #25's inventory.
+above layer 14. (The fourth boundary the first checkpoint listed - staged runs past ~26 state-column windows
+per stage - was measured and removed 2026-10-28: the per-stage graph arena now grows once to the full-cycle
+size and a 2200-token 4-stage DS4.1 run is bit-identical to control, receipt 2026-10-28-p43-graph-pool-growth.json.)
+P4b is unblocked for the ported engines' per-session caches with the device ownership from #25's inventory.
 
 ## Cross-cutting
 
