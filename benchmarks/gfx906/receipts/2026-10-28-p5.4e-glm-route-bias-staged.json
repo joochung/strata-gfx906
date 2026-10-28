@@ -1,0 +1,19 @@
+{
+  "task": "#41 - staged GLM route-bias: behavior witness (bias_owner + per-pass set_bias, shipped untested in f6cda8c5)",
+  "date": "2026-10-27",
+  "branch": "gfx906/p5.3-relay",
+  "engine": "glm_generate (Maya-L IQ3_S), HIP gfx906, 4x MI50",
+  "protocol": "run-p5.4c-glm-pcie.sh + EXTRA_ARGS='--route-bias 0.5 --route-bias-file 0.3' (the new knob); deterministic admission set (--pcie 0.25, --pf-b 0, slots pinned), 14-token prompt, 64 decodes, three boots: g_ctlp control / g_00p same-device relay / g_2p cross-card 0,1",
+  "session": "wrapper 2026-10-27 23:36, logs/p5.4c-{g_ctlp,g_00p,g_2p}-20261027-233606.{log,toks,vram}",
+  "verdict": {
+    "staged_00p_vs_control": "EXACT 64/64",
+    "staged_2p_vs_control": "EXACT 64/64",
+    "expert_path_counters": "identical across all three arms: hit 14.1%, cpu 74.6%, pcie 11.3%, file tier 8593, skipped 0.0/token",
+    "reading": "with the route bias ON, the staged run updates the decode bias every pass exactly like the control (staged_step calls set_bias(); bias_owner routes each layer's set_route_bias to its OWNING stage). The pre-fix staged path would have decoded with the prune-only build-time vector - a different expert placement - and diverged. EXACT streams plus identical path counters close #41."
+  },
+  "limits_not_tested": [
+    "64 tokens spans windows 0-1 only; a bias ON run across a column rollover was not repeated here (the rollover path itself is P5.3b-witnessed with bias off, and the bias refresh is per-pass, not per-window)",
+    "route-bias with tier shards (--tier-cards) - refused combination by design",
+    "non-zero route-bias-file interaction with staged expert residency beyond 64 tokens"
+  ]
+}

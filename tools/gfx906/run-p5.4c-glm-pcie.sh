@@ -78,9 +78,17 @@ GARGS=(-m "$GLM_MODEL" --backend cuda --experts gpu --ids-file "$IDS_G" -n 64
        --ctx 32768 --arena-gib 60 --arena-skip-resident --prefill-chunk 4096 --chunk-mmq
        --vram-margin 4.0 --arena-adapt --pcie 0.25 --pf-b 0 --stop 154820,154827,154829 --slots "$SLOTS")
 
-run_one g_ctlp "${GARGS[@]}" || exit 1
-run_one g_00p "${GARGS[@]}" --gpus 0,0 || exit 1
-run_one g_2p  "${GARGS[@]}" --gpus 0,1 || exit 1
+# EXTRA_ARGS: the #41 witness passes "--route-bias 0.5 --route-bias-file 0.3" here.  With the bias OFF (the
+# #40 discriminator above) the staged bias path is inert; with it ON, a staged run must update the decode bias
+# every pass exactly like the control (fixed in f6cda8c5: staged_step calls set_bias(), bias_owner routes each
+# layer's set_route_bias to its OWNING stage).  Old code would route the staged decode with the prune-only
+# vector and diverge; EXACT streams with the bias ON are the behavior witness.
+EXTRA_ARGS_STR="${EXTRA_ARGS:-}"
+read -r -a EXTRA_ARGS_ARR <<< "$EXTRA_ARGS_STR"
+
+run_one g_ctlp "${GARGS[@]}" ${EXTRA_ARGS_ARR[@]+"${EXTRA_ARGS_ARR[@]}"} || exit 1
+run_one g_00p "${GARGS[@]}" --gpus 0,0 ${EXTRA_ARGS_ARR[@]+"${EXTRA_ARGS_ARR[@]}"} || exit 1
+run_one g_2p  "${GARGS[@]}" --gpus 0,1 ${EXTRA_ARGS_ARR[@]+"${EXTRA_ARGS_ARR[@]}"} || exit 1
 
 lcp() { local a=$1 b=$2 i=0; while IFS= read -r x <&3 && IFS= read -r y <&4; do
             [ "$x" = "$y" ] || break; i=$((i+1)); done 3<"$a" 4<"$b"; echo $i; }
