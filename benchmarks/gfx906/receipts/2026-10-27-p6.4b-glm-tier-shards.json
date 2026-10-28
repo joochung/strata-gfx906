@@ -1,0 +1,67 @@
+{
+  "task": "#42 P6.4b: expert-parallel tier (--tier-cards N) for GLM Maya-L, the cache-starved engine",
+  "date": "2026-10-27",
+  "branch": "gfx906/p5.3-relay",
+  "commits": {
+    "implementation": "f6cda8c5",
+    "witness_runner": "tools/gfx906/run-p6.4b-glm-tier-shards.sh"
+  },
+  "engine": {
+    "model": "/ai/models/hf.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/Maya-L/GLM-5.3-Flash-Maya-L-IQ3_S-00001-of-00004.gguf",
+    "binary": "build-906/glm_generate",
+    "shape": "--backend cuda --experts gpu --arena-gib 60 --arena-adapt --vram-lru --vram-margin 4.0 --pcie 0.25 --lora GLM-5.3-Flash-Ablitered2-LoRA-v2.gguf -n 128",
+    "prompt": "14-token MoE question (P4.2 recipe, glm4 tokenizer)"
+  },
+  "host_gate": {
+    "tool": "build-906/test_ds4_moe --no-synthetic --no-real --shards N (arm S, real Maya-L experts)",
+    "shards2": {"rel": 2.4e-08, "deterministic": true, "red_drop": 0.44, "red_dup": 0.42},
+    "shards4": {"rel": 3.8e-08, "deterministic": true, "red_drop": 0.72, "red_dup": 0.72},
+    "pre_existing_not_from_this_change": "arm-2 real L20 weighted-sum rel nan on Maya-L IQ3_S (witnessed identical at HEAD with the change stashed)"
+  },
+  "refusals_exit2": ["--tier-cards 0", "--tier-cards 2 --serve", "--tier-cards N --gpus staging", "--tier-cards 2 --experts cpu", "--tier-cards 9 (> 4 visible GPUs)"],
+  "session1": {
+    "ts": "20261027-223648",
+    "runner_log": "logs/p6.4b-session-20261027-223612.log",
+    "jsonl": "logs/p6.4b-glm-tier-shards-20261027-223648.jsonl",
+    "arms": {
+      "ctl": {"tier_cards": 1, "slots": 1934, "hit_pct": 21.8, "cpu_pct": 71.9, "decode_tps": "1.94+-0.01 (n=2)", "tier_wall_ms_tok": "404.0+-1.5", "cpu_pool_ms_tok": "350.9+-1.3", "prefill_tps": "2.02+-0.00"},
+      "t2":  {"tier_cards": 2, "slots": 4507, "hit_pct": 40.5, "cpu_pct": 57.9, "decode_tps": "1.87+-0.01 (n=2)", "tier_wall_ms_tok": "448.8+-1.4", "cpu_pool_ms_tok": "374.0+-1.0", "prefill_tps": "0.91+-0.01"},
+      "t4":  {"tier_cards": 4, "slots": 9614, "hit_pct": 78.7, "cpu_pct": 21.3, "decode_tps": "3.23+-0.06 (n=2)", "tier_wall_ms_tok": "237.1+-16.5", "cpu_pool_ms_tok": "166.0+-0.02", "prefill_tps": "2.88+-0.01"}
+    },
+    "paired_ratios": {
+      "r1": {"t2_decode": 0.964, "t4_decode": 1.644, "t4_tier_wall": 0.614, "t4_cpu_pool": 0.472, "t4_prefill": 1.421},
+      "r2": {"t2_decode": 0.954, "t4_decode": 1.677, "t4_tier_wall": 0.560, "t4_cpu_pool": 0.474, "t4_prefill": 1.431}
+    }
+  },
+  "session2_attribution": {
+    "ts": "20261027-230437",
+    "runner_log": "logs/p6.4b-session2-20261027-230410.log",
+    "jsonl": "logs/p6.4b-glm-tier-shards-20261027-230437.jsonl",
+    "arms": {
+      "ctl": {"tier_cards": 1, "slots": 1934, "hit_pct": 21.8, "decode_tps": "2.02+-0.01 (n=2)", "cpu_pool_ms_tok": "352.6+-1.0"},
+      "t4e": {"tier_cards": 4, "slots": 1936, "hit_pct": 32.0, "decode_tps": "1.58+-0.06 (n=2)", "cpu_pool_ms_tok": "416.9+-0.9"}
+    },
+    "paired_ratios": {"r1": {"decode": 0.802, "cpu_pool": 1.182}, "r2": {"decode": 0.754, "cpu_pool": 1.183}},
+    "meaning": "EQUAL CAPACITY (4x484 = the control's auto 1934 slots): the fan-out itself is NEGATIVE (-20..-25% decode, pool time +18%): four serialized tier submissions per layer plus 8-thread shard pools do not divide a memory-bandwidth-bound pool."
+  },
+  "tokens": {
+    "ctl": "deterministic across rounds AND sessions (12/12)",
+    "t2": "intra-arm identical; diverges from ctl at token 6 (fan-in summation-order knife edge)",
+    "t4": "intra-arm identical, cross-session identical; diverges from ctl at token 1 (4x residency is a deliberate routing difference, not noise)",
+    "t4e": "intra-arm identical, cross-session identical; diverges at token 1 (different admission order under striped caches)",
+    "bar": "parity bar is NOT bit-parity vs ctl (different float grouping by construction, host gate 3.8e-08); common prefix reported, never gated"
+  },
+  "verdict": {
+    "t4": "GO for GLM Maya-L decode serving: +64/+68% decode (paired rounds), tier wall -40%, cpu pool /2.1, hit 21.8->78.7%, prefill +42/+43% both rounds. THE PRIZE IS THE AGGREGATED VRAM CAPACITY (4 cards x their own expert caches = 9614 slots vs one card's 1934), converted into VRAM hits that skip the pool entirely.",
+    "t2": "NO-GO: -4..-5% decode. Two shards double the slots but leave the stripe's misses on 16-thread pools with 2 serialized submissions; hit 40.5% is not enough to pay for it.",
+    "t4e_equal_capacity_fanout": "NO-GO (-20..-25%): the pool is bandwidth-bound, not core-count-bound; splitting it buys nothing while the serialization and striped-admission overhead is real.",
+    "contrast_ds41_p6.4": "DS4.1 --tier-cards was NO-GO at every N because its ctl already hit 99.23% - capacity was not its limiter. GLM's ctl hits 21.8%: the same mechanism flips sign because the prize (miss headroom) is 3.6x the cache. This is the confirmation the P6.4 doc section 10 predicted: the live axis was the cache-starved engine."
+  },
+  "limits_not_tested": [
+    "--serve with --tier-cards (refused by design; production multi-card GLM serving needs the serve path wired or replicas)",
+    "staged --gpus with --tier-cards (refused by design)",
+    "long-context / long-serve residency drift (128-token decode only)",
+    "arena total > 60 GiB scope",
+    "t3 (3-shard) geometry"
+  ]
+}

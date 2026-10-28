@@ -377,3 +377,49 @@ Two lessons rode along. Shard 0 must take its arena slice too: the first t2 boot
 the 84 GiB scope OOM-killed it (dmesg CONSTRAINT_MEMCG at anon-rss 87.6 GiB, fixed 4de1f021). And no
 ladder starts with WARM=0 after a vLLM restart: the first boot is the 2.4x page-cache artifact and it
 poisons the same-round pairing that interleaving exists to buy.
+
+## 11. P6.4b: the same fan-out on GLM Maya-L - GO at 4 cards, and the prize is capacity (task #42, 2026-10-27)
+
+Section 10 closed DS4.1 NO-GO and said the claim was always about the cache-starved engine. This section is
+that claim, witnessed. `glm_generate` takes the same `--tier-cards N` (f6cda8c5): expert (l,e) owned by shard
+e%N, each shard a full tier on its own device with the exclude mask "pruned UNION not-owned", fan-out at the
+engine seam through `n_ent`, fan-in summed in fixed shard order. GLM adds what DS4.1 did not need: the CPU
+pool is THE limiter here, so shard pools pin DISJOINT physical-core slices (`ExpertPool` core_offset), and
+shard 0 takes its arena slice from the first commit (the ds41 OOM lesson did not have to repeat).
+
+Host gate first, as always: `test_ds4_moe --shards N` (arm S) mirrors the fan-in on REAL Maya-L experts -
+rel 2.4e-08 (N=2) / 3.8e-08 (N=4), deterministic, and both coverage red controls land at 0.42-0.72. All five
+refusal combinations exit 2 before any model load. (Recorded while at it: arm-2's real-L20 `rel nan` on
+Maya-L is PRE-EXISTING - identical with the change stashed at HEAD.)
+
+Two interleaved sessions, 2 rounds each, throwaway WARM boot first (receipt
+`benchmarks/gfx906/receipts/2026-10-27-p6.4b-glm-tier-shards.json`, jsonls
+`logs/p6.4b-glm-tier-shards-20261027-{223648,230437}.jsonl`):
+
+| arm | slots | hit% | decode tok/s | tier wall ms/tok | cpu pool ms/tok | prefill tok/s |
+|---|---|---|---|---|---|---|
+| ctl (1 card) | 1934 | 21.8 | 1.94 +- 0.01 | 404.0 +- 1.5 | 350.9 | 2.02 |
+| t2 | 4507 | 40.5 | 1.87 +- 0.01 (-4.5%) | 448.8 | 374.0 | 0.91 |
+| t4 | 9614 | 78.7 | 3.23 +- 0.06 (+66%) | 237.1 | 166.0 | 2.88 |
+| t4e (4 x 484 = ctl capacity) | 1936 | 32.0 | 1.58 +- 0.06 (-22%) | 517.5 | 416.9 | - |
+
+VERDICT, by arm: **t4 GO for decode serving** - +64/+68% in BOTH paired rounds, tier wall -40%, cpu pool
+time divided by 2.1, hit 21.8 -> 78.7%, and prefill +42/+43% both rounds (the 4x cache pays the chunk path
+too). **t2 NO-GO** (-4..-5%): two shards double the slots but leave the stripe's misses on 16-thread pools
+with two serialized submissions; 40.5% hit does not pay for it. **t4e NO-GO**: at EQUAL capacity the
+fan-out itself is -20..-25% and pool time RISES 18% - the pool is memory-bandwidth-bound, not
+core-count-bound, so splitting its cores buys nothing while the serialization and striped-admission
+overhead is real. The t4 win is therefore NOT four-core-pipes dividing pool work (the original section-10
+framing); it is FOUR CARDS' VRAM AGGREGATED INTO ONE LOGICAL EXPERT CACHE (9614 slots vs one card's 1934),
+converting 3.6x more of the hot set into VRAM hits that skip the pool entirely. Pool work does not divide -
+it mostly stops being needed.
+
+Token streams behave exactly as the fan-in construction predicts: ctl deterministic across rounds AND
+sessions; t2 intra-arm identical, diverging from ctl at token 6 (summation-order knife edge); t4/t4e
+intra-arm and cross-session identical, diverging at token 1 because their residency is deliberately
+different. Bit-parity vs ctl is not the bar (host gate: the fan-in is 3.8e-08, not zero, by construction).
+
+What this does NOT claim: `--serve` refuses `--tier-cards` (the serve path is not wired for shards; a
+production multi-card GLM serve is follow-up work, as is staged + shards), 128-token decodes only, no t3
+geometry, and the arm-2 L20 NaN on this quantization remains unexplained and unfixed (filed with the
+receipt's `limits_not_tested`).
