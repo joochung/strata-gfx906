@@ -265,8 +265,10 @@ same-device number as its benefit.  **P6.4b CLOSED 2026-10-27 with a GO** (task 
 both paired rounds), hit 21.8 -> 78.7%, prefill +43%; the equal-capacity arm proves the prize is FOUR CARDS'
 VRAM AGGREGATED into one logical expert cache, not pool-core division (t4e -22%, t2 -4.5% both NO-GO).
 DS4.1 stays NO-GO (99.23% ctl hit - no headroom); see P6-TENSOR-SPLIT.md sections 10-11 and receipt
-2026-10-27-p6.4b-glm-tier-shards.json.  `--serve` and staged runs refuse `--tier-cards`; wiring the serve
-path for shards is open follow-up.
+2026-10-27-p6.4b-glm-tier-shards.json.  Staged runs still refuse `--tier-cards`; **the serve path was wired
+and witnessed GO 2026-10-28** (task #44): `--serve --tier-cards 4` through the real stack, paired request
+ratios 1.53/1.34 vs single-card, 8581 vs 1738 resident slots, 0 request errors - P6-TENSOR-SPLIT.md section 12
+and receipt 2026-10-28-p6.5-glm-serve-shards.json.
 
 The checked-in gfx906 command entry point is [`tools/gfx906.py`](../../tools/gfx906.py). Run
 `python tools/gfx906.py doctor` without a GPU. In a fresh Python environment, install the pinned schema-test

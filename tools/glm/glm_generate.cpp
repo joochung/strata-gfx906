@@ -353,7 +353,7 @@ int main(int argc, char ** argv) {
                              "       [--lora adapter.gguf] [--prefill-chunk N [--chunk-mmq] [--chunk-prestage]] [--allow-long-ctx]\n"
                              "       [--prune f [--prune-penalty X]] [--arena-adapt [--arena-admit HALF_LIFE_TOKENS]]\n"
                              "       [--tier-cards N]  (P6.4b: stripe the expert tier over N GPU devices, expert e on e%N;\n"
-                             "                          refuses --serve / --gpus staging / --experts cpu; default 1)\n"
+                             "                          refuses --gpus staging / --experts cpu; --serve is supported (#44); default 1)\n"
                              "       [--skip-miss T] [--skip-file T] [--skip-file-prefill T] [--renorm-skip] [--arena-lazy] [--vram-grow KEEP_GIB]\n"
                              "       [--lora-exps] (with --lora: also apply the routed-expert ffn_*_exps deltas)\n");
         return 2;
@@ -371,9 +371,18 @@ int main(int argc, char ** argv) {
 
     // P6.4b --tier-cards (the GLM mirror of ds41_generate; docs/gfx906/P6-TENSOR-SPLIT.md section 10): the
     // cache-starved engine the shard design was built for.  Combinations the invariants cannot survive refuse now.
+    // --serve joined the SUPPORTED list (task #44, 2026-10-28): the audit found the serve path already speaks to the
+    // tier only through the shard seam - decode goes through step() (shard_run / shard_prefetch), the per-request
+    // stats through read_stats/reset_stats_all (aggregated), and route bias through shard_resident.  The elastic
+    // --vram-grow stays shard 0's by construction (mk.slot_gib_max = 0 for the shards): chunk staging happens on
+    // shard 0's card only, so the other cards never need to shrink and their caches stay at their measured full
+    // size.  The INFO line now reports shard-aggregated counts, and the witness path's --saliency dump (serve never
+    // dumped it, single-card included) sums the shards - disjoint by ownership, so the sum is the truth.  Staged (--gpus) and cpu
+    // experts stay refused: staging moves graphs across cards the tier has already claimed, and --experts cpu has
+    // no shard story at all.
     if (a.tier_cards < 1) { std::fprintf(stderr, "glm_generate: --tier-cards must be >= 1\n"); return 2; }
-    if (a.tier_cards > 1 && (a.serve || !a.split.gpus.empty() || a.experts == "cpu"))
-        { std::fprintf(stderr, "glm_generate: --tier-cards %d refuses --serve, --gpus staging and --experts cpu\n",
+    if (a.tier_cards > 1 && (!a.split.gpus.empty() || a.experts == "cpu"))
+        { std::fprintf(stderr, "glm_generate: --tier-cards %d refuses --gpus staging and --experts cpu\n",
                        a.tier_cards); return 2; }
     if (a.tier_cards > 1) {
         int ndev = 0;
@@ -1187,8 +1196,9 @@ int main(int argc, char ** argv) {
             std::string gerr;
             if (tier.grow_cache(a.vram_grow_keep, gerr) < 0) std::fprintf(stderr, "serve: grow_cache: %s\n", gerr.c_str());
         }
-        std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) tier.resident(),
-                    (long long) tier.arena_experts());
+        long long rv = tier.resident(), av = tier.arena_experts();   // #44: the INFO line counts ACROSS the shards
+        for (auto & t : tier_x) { rv += t.resident(); av += t.arena_experts(); }
+        std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, rv, av);
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
@@ -1395,8 +1405,16 @@ int main(int argc, char ** argv) {
             }
         }
         if (!a.saliency.empty()) {   // [i32 n_layer][i32 n_expert][f64 sum x L*E][i64 count x L*E]
-            const std::vector<double> & ss = tier.saliency_sum();
-            const std::vector<int64_t> & sc = tier.saliency_count();
+            // #44: with --tier-cards the recorders are disjoint by expert ownership (expert e's saliency is only
+            // ever written on its owning shard), so the element-wise sum over the shards IS the whole model's table.
+            std::vector<double> ss = tier.saliency_sum();
+            std::vector<int64_t> sc = tier.saliency_count();
+            for (auto & t : tier_x) {
+                const std::vector<double> & s2 = t.saliency_sum();
+                const std::vector<int64_t> & c2 = t.saliency_count();
+                for (size_t i = 0; i < ss.size() && i < s2.size(); ++i) ss[i] += s2[i];
+                for (size_t i = 0; i < sc.size() && i < c2.size(); ++i) sc[i] += c2[i];
+            }
             std::FILE * sf = std::fopen(a.saliency.c_str(), "wb");
             if (!sf || ss.empty()) { std::fprintf(stderr, "glm_generate: cannot write saliency %s\n", a.saliency.c_str()); return 1; }
             const int32_t hdr[2] = { (int32_t) TG.n_layers, (int32_t) TG.n_experts };

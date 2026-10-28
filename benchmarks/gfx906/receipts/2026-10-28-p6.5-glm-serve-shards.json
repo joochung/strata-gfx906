@@ -1,0 +1,30 @@
+{
+  "task": "#44 - GLM --serve x --tier-cards: wire the serve path and witness it (the P6.4b GO configuration through production serving)",
+  "date": "2026-10-28",
+  "branch": "gfx906/p5.3-relay",
+  "engine": "glm_generate --serve under serve_glm.py/serve/server.py (Maya-L IQ3_S + abliterated LoRA), HIP gfx906, 4x MI50",
+  "code_change": "glm_generate.cpp: removed --serve from the --tier-cards refusal (the audit: serve's decode already routes through step()'s shard_run/shard_prefetch, per-request stats through the aggregated read_stats/reset_stats_all, route bias through shard_resident; elastic --vram-grow stays shard 0's by construction because chunk staging runs on shard 0's card only); the serve INFO line now reports shard-aggregated resident/arena counts; the witness-path --saliency dump sums the shards (disjoint by expert ownership). Refusals kept: --gpus staging, --experts cpu, N > visible devices. Default path (tcards=1) untouched.",
+  "config_finding": "the serve config's \"gpu\" key pins the engine's HIP/CUDA_VISIBLE_DEVICES (server.py child_env) - with it set, --tier-cards 4 correctly refused (1 device visible). The witness configs omit the key; documented in both files' _comment. First witness attempt failed exactly here.",
+  "protocol": "tools/gfx906/run-p6.5-glm-serve-shards.sh: one throwaway WARM boot (s4), then 2 rounds x (ctl, s4) interleaved; each boot = real stack up (serve_glm.py), /health loaded, six greedy 128-token chat requests over /v1/chat/completions, JSONL timing, SIGTERM + shard-cleanup guard, sleep 15 between boots. Arms differ by exactly one flag (--tier-cards 4).",
+  "session": "wrapper 2026-10-28 18:24, logs/p6.5-serve-20261028-182402.jsonl + p6.5-*-$TS.{log,server.log}",
+  "results": {
+    "request_errors": "0 across all 5 boots, 768 tokens per boot",
+    "paired_ratios": "round 1: ctl 2.68 tok/s vs s4 4.11 -> 1.533; round 2: ctl 3.13 vs s4 4.19 -> 1.339",
+    "within_arm_spread": "s4 4.11-4.19 (+/-1%), ctl 2.68-3.13 (+/-8%)",
+    "tier_lines": "s4: 'tier: gpu, 4 shards (expert e on card e%4): 8581 resident slots, arenas 50.8 GiB (4244 experts)'; ctl: '1738 resident slots, arena 60.0 GiB (5522 experts)' - 4.9x the VRAM residency at equal load time (41.6 vs 41.7 s)",
+    "reading": "the aggregated-VRAM prize (P6.4b section 11) carries into serving end-to-end: +34% to +53% total request throughput (the ratio is diluted by prompt+prefill time the batch witness did not carry); the s4 arm is also the more STABLE arm."
+  },
+  "limits_not_tested": [
+    "concurrent sessions / parallel requests (the server runs one sequence at a time behind its FIFO - multi-stream serving is P4b's per-session caches, after this)",
+    "the aggregated serve INFO line itself is not log-witnessed (it goes to the engine's stdout protocol channel, which the server consumes; the stderr tier line carries the residency evidence instead)",
+    "--pcie auto is production timing-adaptive admission: no token-parity claim is made or needed (the #40 rule)",
+    "n=2 paired rounds (ratios agree in direction; spread reported)",
+    "long sessions with arena-adapt drifting the shard arenas (one boot here is ~20 requests at most)"
+  ],
+  "artifacts": [
+    "tools/glm/glm_generate.cpp (refusal, INFO aggregation, saliency aggregation)",
+    "tools/glm/serve/strata-glm-mayal-906-{ctl,t4}.json (witness configs, no gpu key)",
+    "tools/gfx906/run-p6.5-glm-serve-shards.sh",
+    "logs/p6.5-serve-20261028-182402.jsonl"
+  ]
+}

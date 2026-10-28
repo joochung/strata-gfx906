@@ -419,7 +419,31 @@ sessions; t2 intra-arm identical, diverging from ctl at token 6 (summation-order
 intra-arm and cross-session identical, diverging at token 1 because their residency is deliberately
 different. Bit-parity vs ctl is not the bar (host gate: the fan-in is 3.8e-08, not zero, by construction).
 
-What this does NOT claim: `--serve` refuses `--tier-cards` (the serve path is not wired for shards; a
-production multi-card GLM serve is follow-up work, as is staged + shards), 128-token decodes only, no t3
-geometry, and the arm-2 L20 NaN on this quantization remains unexplained and unfixed (filed with the
-receipt's `limits_not_tested`).
+What this does NOT claim: 128-token decodes only, no t3 geometry, and the arm-2 L20 NaN on this quantization
+remains unexplained and unfixed (filed with the receipt's `limits_not_tested`).  (`--serve` refused
+`--tier-cards` when this section was written; section 12 closed that on 2026-10-28.  staged + shards still
+refuses.)
+
+## 12. P6.5: the serve path with shards (task #44, 2026-10-28) - WITNESSED GO
+
+The refusal `--tier-cards` + `--serve` was defensive, not structural: the audit of the serve block found
+decode already routes through `step()` (which calls `shard_run` / `shard_prefetch`), per-request stats through
+the aggregated `read_stats` / `reset_stats_all`, and route bias through `shard_resident`.  The elastic
+`--vram-grow` stays shard 0's BY CONSTRUCTION (`mk.slot_gib_max = 0` for the shards): chunk staging runs on
+shard 0's card only, so the other cards never need to shrink for `c_stage` and their caches stay at their
+measured full size.  What the wiring adds: the serve INFO line reports shard-aggregated resident/arena counts,
+and the witness-path `--saliency` dump sums the shards (disjoint by expert ownership, so the sum is the truth).
+Staged (`--gpus`) and `--experts cpu` stay refused.
+
+One operational trap found the hard way: the serve config's `"gpu"` key pins the engine's
+`HIP_VISIBLE_DEVICES` (`server.py child_env`), so a shard config must NOT carry it - the first witness attempt
+died with the engine's own correct refusal (1 device visible, 4 asked).
+
+Witness (receipt 2026-10-28-p6.5-glm-serve-shards.json, runner `tools/gfx906/run-p6.5-glm-serve-shards.sh`,
+real stack: serve_glm.py over serve/server.py over `glm_generate --serve`, warm boot + 2 interleaved rounds,
+six greedy 128-token requests per boot): **0 request errors, paired ratios s4/ctl 1.533 and 1.339** (ctl
+2.68/3.13 tok/s spread +/-8%, s4 4.11/4.19 +/-1%), engine tier lines 8581 resident slots across 4 shards vs
+1738 single-card at equal load time.  The end-to-end ratio is diluted by prompt+prefill time the batch witness
+(+66% decode) did not carry, and the sharded arm is the more STABLE one.  Not tested: concurrent sessions
+(one sequence at a time behind the FIFO - that is P4b), long arena-adapt drift, and the INFO line's own log
+trail (stdout goes to the server; the tier stderr line carries the evidence).
