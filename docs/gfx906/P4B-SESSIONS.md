@@ -1,0 +1,143 @@
+# P4b - concurrent sessions on the ported engines (time-slicing + N park slots)
+
+Status: DESIGN (2026-10-28). Implementation order: P4b.1 DS4.1 engine slots, P4b.2 server slice
+arbiter, P4b.3 DS4.1 witness, P4b.4 GLM mirror. Follow-on: task #46 (DS4.1 4-shard re-measure under
+this concurrency) is the design's stress test, so it runs on the DS4.1 path first.
+
+## 0. What today costs what (measured / line-referenced, this worktree)
+
+- The server serializes EVERY request behind one lock: `Service.fifo` (`serve/server.py:3157`), acquired
+  for the WHOLE generation (`serve/server.py:4316-4341`), with SSE `ping` keep-alives while queued. A
+  128-token GLM request at the witnessed 2.7-4.2 tok/s blocks every other user 30-50 s. That is the
+  problem P4b fixes.
+- Both ported engines run ONE generation to completion (`glm_generate.cpp:1108-1310`,
+  `ds41_generate.cpp:2190+`): hist/snap_len per conversation, ONE snapshot pair, and DS4.1 has ONE
+  park slot (`STRATA_SERVE_PARK`, `ds41_dense.cpp:2961-3003`): `park(n)` host-copies the snapshot
+  rings + live `comp/idxk` rows `[0, n]` + spare rows; `unpark()` writes them back. Written for the
+  harness pattern (main conversation + side calls), it is exactly a session cache with N=1.
+- A continuation GEN reuses at ZERO cost: `hist.push_back(tok)` during decode
+  (`ds41_generate.cpp:2778,2804`) means prompt+generated-so-far is the exact LCP of the next slice,
+  and the positional caches keep every row the slices wrote.
+- Per-session bytes (docs/gfx906/P4-RAM-BUDGET.md 54,70 + code glm_dense.cpp:900,926-931,
+  ds41_dense.cpp:1631,1660-1661): DS4.1 2,560 B/token + ctx-independent rings (RAW=144, doubled by
+  raw_snap) ~= 0.08 GiB per 32K session; GLM 11,968 B/token + 139 MB KDA state + ~70 MB snapshot
+  ~= 0.5-0.6 GiB per 32K session. Four sessions of each engine fit the card with the elastic expert
+  slot budget giving back ~2 GiB (the mechanism exists: `glm_generate.cpp:1146-1190`).
+- Park/unpark traffic: a 20K-position DS4.1 conversation is ~50 MB of rows + rings; host round-trip
+  at pinned-DRAM speed is tens of ms - noise against a ~5 s slice.
+- P2's census (receipt 2026-10-20-p0.4-census-sweep.json): lane route Jaccard 0.7-1.9%. Shared
+  batched decode has NO reuse to harvest on this workload. P4b therefore claims FAIRNESS, not
+  throughput: N sessions get N interleaved streams at ~the single-session aggregate rate; nobody
+  waits 50 s to see a token. Do not promise 4x - nothing here delivers 4x.
+
+## 1. Design decision: time-slice in the server, remember in the engine
+
+Two changes, decoupled, each testable alone:
+
+1. ENGINE (`ds41_generate`, then `glm_generate`): turn the single park slot into **N park slots**,
+   self-managed - no session ids in the protocol. A GEN whose prompt best-matches a parked
+   conversation (longest common prefix, existing partial rule `lp >= max(park_min, 3/4 x len)`)
+   unparks that slot; an unrelated GEN parks the current conversation into a free slot (LRU evict).
+   Flag `--park-slots N` (default 1 = today's single-slot code path, byte-identical). READY gains
+   ` slots=N` ONLY when N > 1 (an old server keeps parsing the old line unchanged).
+2. SERVER (`serve/server.py`): when the engine advertises slots (and has no native `batch`), run the
+   generation in **slices of `slice_tokens` (default 16)** and between slices yield the fifo IF
+   `status["queued"] > 0` (release + re-acquire). Round-robin emerges from the existing FIFO queue:
+   A slices 16 tokens, yields, B (queued) gets its turn, yields, ... The engine never sees a mid-turn
+   interrupt: each slice is a complete GEN ending in DONE; the parked conversation is exactly what
+   the park slot already is. No STOP, no preemption, no new protocol verbs.
+
+Why not the alternatives: BSlot-style kernel batching is P1/P2 territory and the census says it
+buys nothing here; N engine processes (replicas.py) duplicates 156 GB of CPU RAM per replica on a
+125 GiB box; token-level preemption with state save/restore costs a per-token 0.5 GiB copy - slice
+boundaries (park once per handoff, tens of ms) are the cheap granularity the positional caches give
+us for free.
+
+## 2. Engine changes (DS4.1 first)
+
+2a. `Ds41Dense` park interface: `park(positions)` -> `park(positions, int slot = 0)`,
+`unpark(slot = 0)`, `drop_park(slot = 0)`, `parked(slot = 0)`; storage `parked`/`parked_pos` become
+per-slot vectors. Slot 0 keeps today's exact buffers and semantics, so `--park-slots 1` is
+byte-identical. (`ds41_dense.hpp:313-320`, `ds41_dense.cpp:2961-3003`.)
+
+2b. `ds41_generate` serve loop: park bookkeeping (park_hist/park_logits/park_rows) becomes a small
+per-slot table with last-used stamps. Arrival logic: scan slots, best lp wins (existing partial
+rules per slot); unrelated GEN parks the live conversation into a free slot, else evicts the
+least-recently-used slot. The park condition gains: with slots > 1, park conversations from
+`--park-min 128` tokens (the default 2048 exists to avoid parking trivia when there is ONE slot;
+with N slots, every active slice must be parkable or it re-prefills at 16.8 s+ - the batch-path
+crossover, `STRATA_SERVE_STEP_MAX` note at `ds41_generate.cpp:2264`).
+
+2c. Per-slice snapshot: with slots > 1, at each DONE re-arm the snapshot at the new
+hist length (`dense.snapshot(hist.size())`, the call already exists at `:2636` taken pre-decode;
+re-arm cost is the ring twin copy, ~ms). This is what makes slice continuation FREE: park then
+covers prompt+generated, the next slice unparks at lp == full length, re-feeds nothing. Consequence
+to document: a re-snapshot past the prompt-end moves `snap_len`, so the REGENERATE fast path
+(same prompt again, samples from `snap_logits`) fires only at slice ends - a repeated prompt re-feeds
+from the prompt-end LCP instead (correct, slower). Only with slots > 1.
+
+2d. DSpark: the park/unpark path already resets `dsp_next` (acceptance drops after a swap, never
+correctness, `ds41_generate.cpp:2255-2258` comment). Multi-slot keeps that property; no work.
+
+2e. Refusals: `--park-slots N>1` with staged serve (already refused: reuse bookkeeping is
+per-instance, `:2177-2188`). `--park-slots N>1` with `--tier-cards`: compatible BY CONSTRUCTION
+(park holds KV/cache rows host-side; shards own experts, not caches) - DS4.1's tier+serve refusal is
+task #46's wiring, not P4b's.
+
+## 3. Server changes
+
+- Parse the READY suffix into `StrataEngine.session_slots` (absent = 0, native engines unaffected).
+- In the single-turn path (`serve/server.py:4316-4341` acquisition, engine.generate at `:1949`):
+  when `session_slots > 0` and `slice_tokens > 0`, drive the GEN in slices: send
+  `GEN min(remaining, slice_tokens) ... ids`, yield tokens, on DONE append them to ids and, if
+  more remains, call a `yield_turn()` seam the Service injects (fifo release + re-acquire) only when
+  `self.status["queued"] > 0`; then continue. Cancellation/timeout/STOP semantics ride the existing
+  per-request cancel event: between slices the engine is idle, so STOP is never racing a slice.
+- Sampling: the seed is re-sent per slice; at temperature 0 slices are bit-identical to one long
+  GEN (greedy), at temperature > 0 a sliced generation samples a different stream than one GEN would
+  (each slice re-seeds). Document, do not "fix" - per-slice determinism is the claim.
+- Fake-engine tests: extend `serve/test_parallel.py`'s harness (run as
+  `python3 -m serve.test_parallel` from the repo root; extra engine log lines BREAK its assertions -
+  known trap). Cover: slice loop, yield only when queued > 0, DONE accounting across slices,
+  READY-with-slots parsing, old-READY unchanged.
+
+## 4. Budgets and limits
+
+- Host RAM per parked slot: rings (~ctx-independent, per-layer RAW x DH x 2 B x 2 twins x 40 layers
+  ~ 0.3 GiB DS4.1 / KDA state 139 MB + 70 MB GLM) + `park_rows` x 2,560 B (DS4.1) / ~13.6 KB (GLM).
+  With `--park-slots 4` and 20K-position conversations: ~1-2.5 GB. Inside the 84 G serve scope next
+  to the 60 G arena; the runner's MemAvailable gate (65 GiB) still applies.
+- VRAM is NOT multiplied: caches are positional and shared; only parked (inactive) sessions' rows
+  live host-side. N ACTIVE 32K contexts on the same positional cache do not exist here - one live
+  conversation owns the rows; a second must park the first. (True N-resident caches = the BSlot
+  rewrite, out of scope; the park design is the honest version of per-session caches for positional
+  engines.)
+- Fairness granularity: one slice = `slice_tokens` tokens at that session's rate; at DS4.1's ~2-4
+  tok/s and slice 16, a user sees a 16-token burst every ~5-8 s x active sessions. Tune per engine.
+- NOT claimed: throughput gain (section 0), shared-prefix radix (P2 NO-GO stands), native-engine
+  changes (none), mid-slice preemption (never needed - slices end at DONE).
+
+## 5. Witness plan (P4b.3, DS4.1, GPU window)
+
+Runner `tools/gfx906/run-p4b-sessions.sh`: one boot `--park-slots 4`; THREE conversations (distinct
+long system prompts ~2-3K tokens so they park above park-min) driven concurrently by three client
+threads through the real stack (serve_ds41.py), greedy, 96 tokens each, plus a serial control that
+runs the same three conversations back-to-back UNsliced. Claims to check:
+(a) CORRECTNESS: every session's 96-token greedy answer is BIT-IDENTICAL to its serial run (park
+    round-trip is lossless; slice continuation re-feeds nothing);
+(b) FAIRNESS: inter-arrival between a session's token bursts <= ~3 slice durations x active count;
+    worst-case first-token wait for the last-arriving session vs the 50 s FIFO baseline;
+(c) ENGINE EVIDENCE: unpark/park lines per swap count, RESUME values == full prefix every slice
+    (proves zero re-feed), no re-prefill (>64-token "reused=" gaps);
+(d) rates: per-session tok/s with N=2,3 interleaved vs solo (expect ~aggregate flat, per-session
+    ~1/N minus park traffic) - reported, not promised.
+#46 rides the same runner shape with the tier wired: DS4.1 ctl vs t4 under 3 rotating sessions.
+
+## 6. GLM mirror (P4b.4, last, per the plan's "KDA state per session first, shared prefixes last")
+
+`glm_dense` has NO park today (snapshot pair only, `glm_dense.hpp:159-165`, `glm_dense.cpp:1074-1111`).
+Mirror 2a-2c: `park(positions, slot)` = host-copy per-KDA-layer S+conv snap twins + MLA `kvc`
+rows `[0, positions]` + `ipool` rows `[0, positions/4]`; `unpark(slot)` writes back and re-arms the
+snapshot (the twins already exist, ~209 MB per session incl. state - P4-RAM-BUDGET.md 54-55). The
+serve loop's hist/snap single-conversation bookkeeping (`glm_generate.cpp:1188-1239`) becomes the
+same per-slot table. Slice arbiter: same server code, READY suffix, no further server work.
