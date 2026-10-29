@@ -277,6 +277,15 @@ the only GO shards engine.  **P4b per-session caches CLOSED and witnessed on bot
 `--park-slots` + sliced generations + the FIFO slice seam (stage A 5/5 exact, fairness shorts first-token at
 10.2/15.7 s of a 41.1 s marathon) and the GLM mirror (stage A 5/5, park/unpark live, shorts at 16.1/26.8 s of a
 78.8 s marathon) - P4B-SESSIONS.md, receipts 2026-10-28-p4b3-ds41-sessions.json and 2026-10-28-p4b4-glm-sessions.json.
+**P7 prefill anatomy CLOSED 2026-10-29** (what four cards can buy DS4.1's ~40 tok/s - P7-PREFILL-SCALE.md,
+receipt 2026-10-29-p7-prefill-anatomy.json, runner tools/gfx906/run-p7-prefill-anatomy.sh): first
+`MIMO_CHUNK_PROF` witnesses on this box - the grouped expert GEMMs are 0.5 s of a 31 s prompt (GEMM-split TP4
+has nothing to split), prefill streams experts with NO VRAM cache by design (`defer_vram`; 288000/288000 pcie,
+`resident 0`; an eager seed still gives 0 prompt hits), NVMe is 7.7 s/prompt (54 GB @ 6.98 GB/s, ONE disk),
+chunk size 64/256/1024 does not move the rate, and the per-token path fanned over 4 cards equals single-card
+eager (10.2 vs 11.2 tok/s) with doubled file wait. The only 4-card shape with a path past 40 is expert-parallel
+CHUNK fan-out of the `run_chunk` seam (~1.5-2x priced, gate 1.25x paired same-boot behind a 20-line
+stream-timer pre-gate); the no-card lever first is arena coverage (46% -> ~70%) against the NVMe floor.
 
 The checked-in gfx906 command entry point is [`tools/gfx906.py`](../../tools/gfx906.py). Run
 `python tools/gfx906.py doctor` without a GPU. In a fresh Python environment, install the pinned schema-test
