@@ -126,6 +126,8 @@ check("A-replay fresh-prefills to the SAME answer the resumed run gave", res["A_
       "match=%d/%d" % (sum(x == y for x, y in zip(res["A_replay"], res["A2"])), len(res["A2"])))
 import json
 print("STAGE-A-RESULT " + json.dumps({k: (v if not isinstance(v, list) else v[:32]) for k, v in res.items()}))
+with open(aout, "a") as fh:
+    fh.write("STAGE-A-RESULT " + json.dumps({k: (v if not isinstance(v, list) else v[:32]) for k, v in res.items()}) + "\n")
 sys.exit(0 if ok else 1)
 EOF
 [ $? -eq 0 ] || { echo "stage A failed"; exit 1; }
