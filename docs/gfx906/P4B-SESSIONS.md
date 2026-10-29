@@ -117,21 +117,33 @@ task #46's wiring, not P4b's.
 - NOT claimed: throughput gain (section 0), shared-prefix radix (P2 NO-GO stands), native-engine
   changes (none), mid-slice preemption (never needed - slices end at DONE).
 
-## 5. Witness plan (P4b.3, DS4.1, GPU window)
+## 5. Witness protocol (P4b.3, DS4.1, GPU window)
 
-Runner `tools/gfx906/run-p4b-sessions.sh`: one boot `--park-slots 4`; THREE conversations (distinct
-long system prompts ~2-3K tokens so they park above park-min) driven concurrently by three client
-threads through the real stack (serve_ds41.py), greedy, 96 tokens each, plus a serial control that
-runs the same three conversations back-to-back UNsliced. Claims to check:
-(a) CORRECTNESS: every session's 96-token greedy answer is BIT-IDENTICAL to its serial run (park
-    round-trip is lossless; slice continuation re-feeds nothing);
-(b) FAIRNESS: inter-arrival between a session's token bursts <= ~3 slice durations x active count;
-    worst-case first-token wait for the last-arriving session vs the 50 s FIFO baseline;
-(c) ENGINE EVIDENCE: unpark/park lines per swap count, RESUME values == full prefix every slice
-    (proves zero re-feed), no re-prefill (>64-token "reused=" gaps);
-(d) rates: per-session tok/s with N=2,3 interleaved vs solo (expect ~aggregate flat, per-session
-    ~1/N minus park traffic) - reported, not promised.
-#46 rides the same runner shape with the tier wired: DS4.1 ctl vs t4 under 3 rotating sessions.
+Runner `tools/gfx906/run-p4b-ds41-sessions.sh`.
+
+Stage A (engine-level, deterministic, no server): raw-protocol replay with `--park-slots 3` and
+`STRATA_SERVE_PARK_MIN=16` - a resumed generation must equal a fresh prefill of the same conversation
+(12/12-token match), 4-conversation pressure through 3 slots must answer every turn, and a strict-prefix
+resubmission must NOT read the longer parked state (the P4b.1 guard: it prefills fresh).
+
+Stage B (serve-level, ONE boot through serve_ds41.py with `--park-slots 4`): six conversations x two
+turns run serially then concurrently (same boot - the engine is not bit-deterministic across processes,
+the standing rule), then a fairness phase: one 256-token marathon with two short requests arriving at
++2 s and +4 s. Metrics: completion, errors, reused counters, TTFTs, per-slice park/unpark lines.
+
+Gates (receipt verdict): stage-A exactness + fairness (short TTFT < 60% of the marathon's wall) + zero
+request errors. Serve-level TEXT equality serial-vs-concurrent is INFORMATIONAL only: residency drift
+reorders float sums and flips knife-edge argmax within a boot under traffic (the standing rule from
+P6.4b); the exactness gate is the raw-protocol stage A.
+
+Found by witness run 3 and fixed in cc31f914: releasing the FIFO at a slice boundary is not HANDING it
+over - the releasing thread re-acquires before the woken waiter gets the GIL (Python locks are not
+FIFO-fair). The trace was `queued=1, seam fired, 0 beats`, and the short request still waited the
+marathon's remaining wall (28.7 s TTFT on the real box). beat() now sleeps 2 ms before each reacquire;
+MarathonFairnessOverHttp in serve/test_parked_slices.py reproduces the starvation without the window
+and passes with it.
+
+#46 rides the same runner shape with the tier wired: DS4.1 ctl vs t4 under rotating sessions.
 
 ## 6. GLM mirror (P4b.4, last, per the plan's "KDA state per session first, shared prefixes last")
 
