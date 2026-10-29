@@ -1,0 +1,230 @@
+{
+ "question": "how could TP4 improve DS4.1-Flash prefill (~40 tok/s)? anatomy first, then price the shapes",
+ "date": "2026-10-29",
+ "prompt_shape": "1200 real-document tokens, one-shot, warm, run-with-free-gpus windows",
+ "sessions": [
+  "logs/p7-anatomy-20261029-002015.*",
+  "logs/p7-anatomy-20261029-004434.*"
+ ],
+ "runner": "tools/gfx906/run-p7-prefill-anatomy.sh",
+ "arms": {
+  "chunk": {
+   "rounds": {
+    "chunk-r1": {
+     "tok_s": 38.1,
+     "dense_s": 7.4,
+     "experts_s": 23.9,
+     "file_wait_s": 7.7,
+     "file_reads": 5171,
+     "prof_wall_ms": 1790,
+     "grouped_kern_ms": 507,
+     "resident": 0,
+     "file_GB": 54.0,
+     "file_GBps": 6.98
+    },
+    "chunk-r2": {
+     "tok_s": 38.8,
+     "dense_s": 7.4,
+     "experts_s": 23.3,
+     "file_wait_s": 7.7,
+     "file_reads": 5171,
+     "prof_wall_ms": 1794,
+     "grouped_kern_ms": 510,
+     "resident": 0,
+     "file_GB": 54.0,
+     "file_GBps": 6.99
+    }
+   },
+   "tok_s_mean": 38.5
+  },
+  "batch": {
+   "rounds": {
+    "batch-r1": {
+     "tok_s": 37.3,
+     "dense_s": 4.5,
+     "experts_s": 27.5,
+     "file_wait_s": 7.5,
+     "file_reads": 5173,
+     "prof_wall_ms": 1754,
+     "grouped_kern_ms": 510,
+     "resident": 0,
+     "file_GB": 54.1,
+     "file_GBps": 6.99
+    },
+    "batch-r2": {
+     "tok_s": 33.8,
+     "dense_s": 4.5,
+     "experts_s": 30.8,
+     "file_wait_s": 7.5,
+     "file_reads": 5173,
+     "prof_wall_ms": 1753,
+     "grouped_kern_ms": 508,
+     "resident": 0,
+     "file_GB": 54.1,
+     "file_GBps": 6.95
+    }
+   },
+   "tok_s_mean": 35.5
+  },
+  "chunk-64": {
+   "rounds": {
+    "chunk-64-r1": {
+     "tok_s": 36.0,
+     "dense_s": 9.6,
+     "experts_s": 23.6,
+     "file_wait_s": 7.7,
+     "file_reads": 5171,
+     "prof_wall_ms": 1793,
+     "grouped_kern_ms": 506,
+     "resident": 0,
+     "file_GB": 54.0,
+     "file_GBps": 6.99
+    },
+    "chunk-64-r2": {
+     "tok_s": 35.1,
+     "dense_s": 7.4,
+     "experts_s": 26.7,
+     "file_wait_s": 7.7,
+     "file_reads": 5171,
+     "prof_wall_ms": 1791,
+     "grouped_kern_ms": 507,
+     "resident": 0,
+     "file_GB": 54.0,
+     "file_GBps": 6.99
+    }
+   },
+   "tok_s_mean": 35.5
+  },
+  "chunk-256": {
+   "rounds": {
+    "chunk-256-r1": {
+     "tok_s": 35.4,
+     "dense_s": 9.6,
+     "experts_s": 24.1,
+     "file_wait_s": 7.7,
+     "file_reads": 5187,
+     "prof_wall_ms": 1791,
+     "grouped_kern_ms": 509,
+     "resident": 0,
+     "file_GB": 54.2,
+     "file_GBps": 6.96
+    },
+    "chunk-256-r2": {
+     "tok_s": 25.8,
+     "dense_s": 4.8,
+     "experts_s": 41.6,
+     "file_wait_s": 7.8,
+     "file_reads": 5187,
+     "prof_wall_ms": 1794,
+     "grouped_kern_ms": 508,
+     "resident": 0,
+     "file_GB": 54.2,
+     "file_GBps": 6.97
+    }
+   },
+   "tok_s_mean": 30.6
+  },
+  "chunk-1024": {
+   "rounds": {
+    "chunk-1024-r1": {
+     "tok_s": 28.5,
+     "dense_s": 10.9,
+     "experts_s": 31.1,
+     "file_wait_s": 7.9,
+     "file_reads": 5188,
+     "prof_wall_ms": 1750,
+     "grouped_kern_ms": 506,
+     "resident": 0,
+     "file_GB": 54.2,
+     "file_GBps": 6.93
+    },
+    "chunk-1024-r2": {
+     "tok_s": 45.1,
+     "dense_s": 4.7,
+     "experts_s": 21.7,
+     "file_wait_s": 7.9,
+     "file_reads": 5188,
+     "prof_wall_ms": 1749,
+     "grouped_kern_ms": 508,
+     "resident": 0,
+     "file_GB": 54.2,
+     "file_GBps": 7.01
+    }
+   },
+   "tok_s_mean": 36.8
+  },
+  "eager-ctl": {
+   "rounds": {
+    "eager-ctl-r1": {
+     "tok_s": 9.9,
+     "dense_s": 79.1,
+     "experts_s": 41.8,
+     "file_wait_s": 7.7,
+     "file_reads": 5168,
+     "prof_wall_ms": 1819,
+     "grouped_kern_ms": 509,
+     "resident": 0,
+     "file_GB": 54.0,
+     "file_GBps": 6.9
+    },
+    "eager-ctl-r2": {
+     "tok_s": 12.6,
+     "dense_s": 69.5,
+     "experts_s": 25.2,
+     "file_wait_s": 7.7,
+     "file_reads": 5168,
+     "prof_wall_ms": 1821,
+     "grouped_kern_ms": 510,
+     "resident": 0,
+     "file_GB": 54.0,
+     "file_GBps": 6.94
+    }
+   },
+   "tok_s_mean": 11.2
+  },
+  "eager-t4": {
+   "rounds": {
+    "eager-t4-r1": {
+     "tok_s": 7.4,
+     "dense_s": 65.0,
+     "experts_s": 96.1,
+     "file_wait_s": 15.1,
+     "file_reads": 9733,
+     "prof_wall_ms": 2006,
+     "grouped_kern_ms": 449,
+     "resident": 0,
+     "file_GB": 98.2,
+     "file_GBps": 7.09
+    },
+    "eager-t4-r2": {
+     "tok_s": 13.0,
+     "dense_s": 61.6,
+     "experts_s": 30.4,
+     "file_wait_s": 15.2,
+     "file_reads": 9733,
+     "prof_wall_ms": 2020,
+     "grouped_kern_ms": 453,
+     "resident": 0,
+     "file_GB": 98.2,
+     "file_GBps": 7.07
+    }
+   },
+   "tok_s_mean": 10.2
+  }
+ },
+ "anatomy_stable_across_arms": {
+  "grouped_kernels_ms_per_prompt": 507,
+  "resident_kernel_ms": 0,
+  "file_tier": "54.0 GB @ 6.98 GB/s = 7.7 s (single NVMe, shared by all cards)",
+  "vram_cache_during_prefill": "none by design (defer_vram ds41_generate.cpp:1131; eager seed also yields 0 prompt hits)",
+  "expert_lookups": "288000/288000 pcie (arena->card streaming) at every chunk size"
+ },
+ "verdicts": {
+  "gemm_split_tp4": "DEAD twice: P6.2 half-k +41%, and grouped kernels are 0.5 s of 31 s - nothing to split",
+  "chunk_size_scaling": "NO effect (64/256/1024 all 31-37 tok/s, variance-dominated) - MMQ classes already persist across passes",
+  "per_token_fanout_prefill": "NO gain (eager-t4 10.2 vs eager-ctl 11.2 tok/s) + doubled file wait under 4-arena seed contention",
+  "surviving_4card_shape": "Option A: expert-parallel CHUNK fan-out of the run_chunk seam (ownership split, own-link staging, 4x residency, chunk-cadence bounce reductions); priced ~1.5-2x prefill, gate 1.25x paired same-boot",
+  "no_card_lever": "Option B: arena sizing (46% -> ~70% coverage) shrinks the 7.7 s/prompt NVMe floor; config only",
+  "decode": "unchanged by all of this: P6.4 -25% per-token tier-cards stands (re-measured 0.750/0.752 under P4b concurrency for #46)"
+ }
+}
