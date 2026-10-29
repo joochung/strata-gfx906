@@ -1,0 +1,49 @@
+{
+ "gate": "P4b.3 witness: DS4.1 serve x park slots x sliced turns",
+ "ts": "20261028-214917",
+ "commit": "0899e180",
+ "stageA": {
+  "A1_reused": 0,
+  "B1_reused": 0,
+  "A2_reused": 37,
+  "C1_reused": 0,
+  "D1_reused": 0,
+  "B2_reused": 0,
+  "D2_reused": 28,
+  "A_replay": [
+   21828,
+   21828,
+   21828,
+   21828,
+   21828,
+   21828,
+   21828,
+   21828,
+   21828,
+   21828,
+   21828,
+   21828
+  ],
+  "A_replay_reused": 0
+ },
+ "stageA_checks_passed": [
+  "A2 resumed reused>0",
+  "D2 freshest resumed reused>0",
+  "A-replay post-eviction completed",
+  "A-replay strict-prefix refused stale state reused=0",
+  "A-replay fresh == resumed answer 12/12"
+ ],
+ "fairness": {
+  "short_ttft_s": {
+   "A": 10.17017650604248,
+   "B": 15.740751504898071
+  },
+  "marathon_wall_s": 41.05350661277771,
+  "short_beat_marathons_wall": true
+ },
+ "text_match_serial_vs_concurrent": "0/6 (informational - residency knife-edge)",
+ "requests": 15,
+ "errors": 0,
+ "concurrent_requests_with_reused_cache": 0,
+ "verdict": "GO: park/unpark exact (stage A), slicing fair, all requests completed"
+}

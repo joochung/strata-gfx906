@@ -143,6 +143,15 @@ marathon's remaining wall (28.7 s TTFT on the real box). beat() now sleeps 2 ms 
 MarathonFairnessOverHttp in serve/test_parked_slices.py reproduces the starvation without the window
 and passes with it.
 
+RESULT (run 4, 2026-10-28 21:49, tip 0899e180, one boot through serve_ds41.py --park-slots 4):
+GO. Stage A 5/5 PASS. Fairness: marathon wall 41.1 s; short requests arriving mid-marathon got first
+token at 10.2 s and 15.7 s (unsliced baseline ~39 s) - gate is 60% of wall, cleared at 25%/38%.
+All 25 requests completed, 0 errors; every concurrent request showed reused>0 through the real stack
+(engine lines like `reuse lcp=292 ... reused=292` per slice: zero re-feed). Text match serial-vs-
+concurrent 0/6, informational as designed (the concurrent phase runs on a much fuller arena than the
+serial one did; residency differs, sums reorder, knife-edge flips). Receipt
+`benchmarks/gfx906/receipts/2026-10-28-p4b3-ds41-sessions.json`.
+
 #46 rides the same runner shape with the tier wired: DS4.1 ctl vs t4 under rotating sessions.
 
 ## 6. GLM mirror (P4b.4, last, per the plan's "KDA state per session first, shared prefixes last")

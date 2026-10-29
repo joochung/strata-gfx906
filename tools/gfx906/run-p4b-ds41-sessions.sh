@@ -26,6 +26,7 @@ ENGSH=tools/v41/serve/ds41-engine-906.sh
 CFG0=tools/v41/serve/strata-ds41-906.json
 PORT=${PORT:-8151}
 JSONL=logs/p4b-ds41-sessions-$TS.jsonl
+R=benchmarks/gfx906/receipts/$(date +%Y-%m-%d)-p4b3-ds41-sessions.json
 SLOTS=${SLOTS:-4}
 T1MAX=${T1MAX:-64}
 T2MAX=${T2MAX:-32}
