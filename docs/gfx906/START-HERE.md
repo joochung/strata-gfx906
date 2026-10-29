@@ -268,7 +268,15 @@ DS4.1 stays NO-GO (99.23% ctl hit - no headroom); see P6-TENSOR-SPLIT.md section
 2026-10-27-p6.4b-glm-tier-shards.json.  Staged runs still refuse `--tier-cards`; **the serve path was wired
 and witnessed GO 2026-10-28** (task #44): `--serve --tier-cards 4` through the real stack, paired request
 ratios 1.53/1.34 vs single-card, 8581 vs 1738 resident slots, 0 request errors - P6-TENSOR-SPLIT.md section 12
-and receipt 2026-10-28-p6.5-glm-serve-shards.json.
+and receipt 2026-10-28-p6.5-glm-serve-shards.json.  **Re-measured DS4.1 serve x shards under P4b concurrency
+too** (task #46, 2026-10-28, P6-TENSOR-SPLIT.md section 13, receipt 2026-10-28-p46-ds41-serve-tiers.json): the
+decode window - the fan-out path - is paired 0.750/0.752 with t4 hit 99.96%, so concurrency does not create the
+cache-starvation prize for DS4.1 and its fast decode pays the serialized-submission tax; the serve path is now
+WIRED for DS4.1 (refusal removed, aggregators byte-identical at N=1) but stays refused BY ECONOMICS - GLM is
+the only GO shards engine.  **P4b per-session caches CLOSED and witnessed on both engines 2026-10-28**: DS4.1
+`--park-slots` + sliced generations + the FIFO slice seam (stage A 5/5 exact, fairness shorts first-token at
+10.2/15.7 s of a 41.1 s marathon) and the GLM mirror (stage A 5/5, park/unpark live, shorts at 16.1/26.8 s of a
+78.8 s marathon) - P4B-SESSIONS.md, receipts 2026-10-28-p4b3-ds41-sessions.json and 2026-10-28-p4b4-glm-sessions.json.
 
 The checked-in gfx906 command entry point is [`tools/gfx906.py`](../../tools/gfx906.py). Run
 `python tools/gfx906.py doctor` without a GPU. In a fresh Python environment, install the pinned schema-test
