@@ -326,6 +326,18 @@ struct GlmDense::Impl {
     ggml_backend_buffer_t snap_buf = nullptr;
     std::vector<std::pair<ggml_tensor *, ggml_tensor *>> snap_pairs;   // (live, copy)
     int snap_pos = -1;
+    // P4b --park-slots (docs/gfx906/P4B-SESSIONS.md section 6, the GLM mirror of ds41_dense's parks): one HOST copy of
+    // a whole conversation per park slot.  parks[k] with park_pos[k] is that slot's byte windows and the position its
+    // conversation stopped at (-1 = empty).  The table grows on demand; nothing here is touched unless the engine
+    // calls park(), which glm_generate does only with --park-slots > 1 - the default run leaves these empty forever.
+    struct ParkedRows { ggml_tensor * t; size_t off; std::vector<uint8_t> b; };
+    std::vector<std::vector<ParkedRows>> parks;
+    std::vector<int64_t> park_pos;
+    std::vector<ParkedRows> & park_slot(int slot) {   // grows the table on demand (slots are few, small ints)
+        if ((size_t) slot >= parks.size()) { parks.resize((size_t) slot + 1); park_pos.resize((size_t) slot + 1, -1); }
+        return parks[(size_t) slot];
+    }
+    int64_t slot_pos(int slot) const { return (size_t) slot < park_pos.size() ? park_pos[(size_t) slot] : -1; }
 
     int64_t o_blk = 0, o_ids_off = 0, o_wts_off = 0;
 
@@ -1109,6 +1121,74 @@ bool GlmDense::restore() {
 // same wording, so a caller sees one rule rather than two: an out-of-order pass on a stage whose recurrent state is
 // already past that position is refused rather than silently mis-sliced.
 int GlmDense::snapshot_pos() const { return p_->snap_pos; }
+
+// P4b (docs/gfx906/P4B-SESSIONS.md section 6): the GLM mirror of Ds41Dense::park (cc871fae), with the slot table.
+// The engine calls these ONLY with --park-slots > 1, so the default serve run never gets here: it keeps the one
+// conversation it has always kept, through snapshot()/restore().
+//
+// What a park holds, per slot: the state of the conversation as it stands NOW (not its last prompt end) - the live
+// KDA S + conv states and the indexer tail carry, which is exactly the tensor set snapshot() twins - PLUS the rows an
+// unrelated conversation overwrites from position 0: the MLA latent cache [0, positions) and the indexer pool rows
+// those positions completed.  The live tensors are copied straight from the card to host memory, which is what makes a
+// sliced continuation free: the park covers prompt + everything generated so far, so the next slice resumes at its own
+// end and re-feeds nothing (Ds41Dense needs a re-arm of its rings for the same effect, P4B-SESSIONS.md 2c).
+bool GlmDense::park(int64_t positions, int slot) {
+    Impl & im = *p_;
+    if (im.next_pos < 1 || positions < 1) { im.err = "park: the state has seen no positions"; return false; }
+    ggml_backend_synchronize(im.backend);
+    auto & parked = im.park_slot(slot);
+    parked.clear();
+    auto put = [&](ggml_tensor * t, size_t off, size_t n) {
+        Impl::ParkedRows r{ t, off, std::vector<uint8_t>(n) };
+        ggml_backend_tensor_get(t, r.b.data(), off, n);
+        parked.push_back(std::move(r));
+    };
+    for (Impl::Layer & L : im.ly) {
+        if (L.kda) {
+            // The KDA state is recurrent, not position-indexed (glm_dense.hpp's phase-1 limit): the whole tensor is the
+            // conversation's window, and these are the tensors restore() would have written back for a rewind.
+            if (L.S) put(L.S, 0, ggml_nbytes(L.S));
+            for (ggml_tensor * c : L.conv) if (c) put(c, 0, ggml_nbytes(c));
+        } else if (L.kvc) {
+            put(L.kvc, 0, (size_t) std::min<int64_t>(positions, im.CAPMAX) * L.kvc->nb[1]);
+            if (L.ipool) {   // the pools those positions completed (row p = positions [p*KP, p*KP+KP))
+                const int64_t prows = std::min<int64_t>((positions + im.KP - 1) / im.KP, im.PCAP);
+                if (prows > 0) put(L.ipool, 0, (size_t) prows * L.ipool->nb[1]);
+            }
+            // the pool DUMP row (row PCAP) is deliberately not saved: dead slots and padding writes land there (the
+            // graph's scatter gives every dead slot its own dump row so the indices stay unique) and the attention
+            // reads only rows [0, npc) - it is scratch, so a parked conversation loses nothing by leaving it behind.
+            if (L.itail) put(L.itail, 0, ggml_nbytes(L.itail));   // the incomplete pool's tail carry (recurrent)
+        }
+    }
+    im.park_pos[slot] = im.next_pos;   // where this conversation stops: unpark rewinds next_pos to here
+    return true;
+}
+
+bool GlmDense::unpark(int slot) {
+    Impl & im = *p_;
+    if (im.slot_pos(slot) < 0) { im.err = "unpark: that slot holds no conversation"; return false; }
+    ggml_backend_synchronize(im.backend);
+    for (auto & r : im.park_slot(slot)) ggml_backend_tensor_set(r.t, r.b.data(), r.off, r.b.size());
+    ggml_backend_synchronize(im.backend);
+    im.next_pos = (int) im.park_pos[slot];   // attn_router_n's in-order rule: this pass starts exactly here
+    im.in_pos = -1;      // the pass inputs (write slots, mask, pool targets) are the other request's
+    im.pred_ready = -1;  // the fused predict cache holds the other request's router scores (a hint, never output)
+    im.snap_pos = -1;    // so does the device snapshot twin: the engine re-arms snapshot() at this prompt's end
+    drop_park(slot);
+    return true;
+}
+
+void GlmDense::drop_park(int slot) {
+    if ((size_t) slot >= p_->parks.size()) return;
+    p_->parks[(size_t) slot].clear();
+    p_->parks[(size_t) slot].shrink_to_fit();
+    p_->park_pos[(size_t) slot] = -1;
+}
+
+bool GlmDense::parked(int slot) const { return p_->slot_pos(slot) >= 0; }
+
+int64_t GlmDense::parked_pos(int slot) const { return p_->slot_pos(slot); }
 
 // P5.3 step 1: the boundary hand-off OUT of a producer stage.  The pass's state is x_state's token columns [0,n) at
 // byte 0 on EVERY stage (the overwrite layout the last release uses), so a boundary is ONE contiguous D2H of

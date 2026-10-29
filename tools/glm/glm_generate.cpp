@@ -55,6 +55,8 @@ struct Args {
     double vram_grow_keep = 0.0, vram_margin_gib = 1.0, pcie = 0.25, pf_b = 1.43, arena_gib = 60.0;
     int threads = 0;
     int tier_cards = 1;            // P6.4b --tier-cards N: stripe the expert tier over N cards (1 = today, byte-identical)
+    int park_slots = 1;            // P4b --serve parks N conversations (docs/gfx906/P4B-SESSIONS.md); 1 = no park at all,
+                                   // which is what every release before this one did (the byte-identical default)
     int64_t ctx = 0;
     float route_bias_file = 0.0f;   // --route-bias-file X: DECODE-only selection penalty -X on file-tier experts
                                     // (neither VRAM cache nor RAM arena) - soft, every expert stays reachable and keeps
@@ -143,6 +145,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
         else if (k == "--threads") a.threads = std::atoi(next().c_str());
         else if (k == "--tier-cards") a.tier_cards = std::atoi(next().c_str());
+        else if (k == "--park-slots") a.park_slots = std::atoi(next().c_str());
         else if (k == "--ctx") a.ctx = std::atoll(next().c_str());
         else if (k == "--temp") a.temp = (float) std::atof(next().c_str());
         else if (k == "--seed") a.seed = (uint64_t) std::atoll(next().c_str());
@@ -354,6 +357,8 @@ int main(int argc, char ** argv) {
                              "       [--prune f [--prune-penalty X]] [--arena-adapt [--arena-admit HALF_LIFE_TOKENS]]\n"
                              "       [--tier-cards N]  (P6.4b: stripe the expert tier over N GPU devices, expert e on e%N;\n"
                              "                          refuses --gpus staging / --experts cpu; --serve is supported (#44); default 1)\n"
+                             "       [--park-slots N]  (P4b: --serve keeps N conversations in host park slots so the server\n"
+                             "                          can slice turns between sessions; 1 = no park, the release path)\n"
                              "       [--skip-miss T] [--skip-file T] [--skip-file-prefill T] [--renorm-skip] [--arena-lazy] [--vram-grow KEEP_GIB]\n"
                              "       [--lora-exps] (with --lora: also apply the routed-expert ffn_*_exps deltas)\n");
         return 2;
@@ -381,6 +386,10 @@ int main(int argc, char ** argv) {
     // experts stay refused: staging moves graphs across cards the tier has already claimed, and --experts cpu has
     // no shard story at all.
     if (a.tier_cards < 1) { std::fprintf(stderr, "glm_generate: --tier-cards must be >= 1\n"); return 2; }
+    // P4b: the same clamp ds41_generate applies to --park-slots (cc871fae).  N=1 is the default and means GLM's
+    // single live conversation with NO park machinery at all - see the serve block's identity note.
+    if (a.park_slots < 1 || a.park_slots > 16)
+        { std::fprintf(stderr, "glm_generate: --park-slots must be 1..16\n"); return 2; }
     if (a.tier_cards > 1 && (!a.split.gpus.empty() || a.experts == "cpu"))
         { std::fprintf(stderr, "glm_generate: --tier-cards %d refuses --gpus staging and --experts cpu\n",
                        a.tier_cards); return 2; }
@@ -1106,7 +1115,18 @@ int main(int argc, char ** argv) {
     // <file blobs> 0 <prompt read>, ERR <text>.  Conversation reuse: the state is snapshotted at the end of every
     // prompt (GlmDense::snapshot); a request that extends what was fed continues, one that shares the last prompt
     // restores the snapshot, anything else starts over (KDA state cannot rewind further).
+    //
+    // P4b (docs/gfx906/P4B-SESSIONS.md; the GLM mirror of ds41_generate's cc871fae + 5b4643df): --park-slots N > 1
+    // keeps N conversations, so the server can slice turns between concurrent sessions.  EVERY line that flag adds is
+    // gated on `a.park_slots > 1`, including the READY suffix; at the default 1 there is no park call, no scan and no
+    // suffix - the release path of the last version, byte for byte.
     if (a.serve) {
+        // Park slots are per GlmDense instance and a staged conversation spans several stages, each with its own KDA
+        // state (the same refusal ds41_generate makes for staged serve, P4B-SESSIONS.md 2e).
+        if (a.park_slots > 1 && staged)
+            { std::fprintf(stderr, "glm_generate: --park-slots %d refuses a staged (--gpus) --serve: park slots are "
+                                   "per GlmDense instance and a staged conversation spans several\n", a.park_slots);
+              return 2; }
         const int ctxv = (int) dc.ctx;
         std::mutex qm;
         std::condition_variable qc;
@@ -1192,6 +1212,49 @@ int main(int argc, char ** argv) {
         auto is_stop = [&](int t) { return std::find(a.stop.begin(), a.stop.end(), t) != a.stop.end(); };
         std::vector<int> hist;   // the ids the state has seen, in order
         int snap_len = -1;       // hist's length at the snapshot (the end of the last prompt)
+        // ---- P4b --park-slots (docs/gfx906/P4B-SESSIONS.md 2b + 6).  With N > 1 the card's ONE set of KDA/MLA state
+        // is handed between conversations: an arrival that continues a PARKED conversation takes its state back
+        // (GlmDense::unpark), and the conversation it displaces goes to host memory first (GlmDense::park).  Slot k's
+        // bookkeeping is pslots[k]; slot LRU order is the last-parked stamp.  None of this is reachable at N == 1.
+        const bool park_on = !(std::getenv("STRATA_SERVE_PARK") && std::getenv("STRATA_SERVE_PARK")[0] == '0');
+        // The same three knobs as ds41_generate, same meanings.  park_min drops to 128 with N slots because every
+        // active slice must be parkable or it re-prefills; the 2048 floor only ever mattered to a single slot.
+        const int park_min = std::getenv("STRATA_SERVE_PARK_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PARK_MIN"))
+                                                                  : (a.park_slots > 1 ? 128 : 2048);
+        // GLM's park window is ~13.6 KB per position (11 MLA layers of latent rows + pool rows, P4B-SESSIONS.md 4),
+        // ~5x DS4.1's, so the default ceiling is 32768 positions (~0.45 GiB a slot) rather than DS4.1's 65536.
+        const int64_t park_max = std::getenv("STRATA_SERVE_PARK_MAX") ? std::atoll(std::getenv("STRATA_SERVE_PARK_MAX")) : 32768;
+        struct SlotConv { std::vector<int> hist; uint64_t last = 0; };   // the parked ids + the LRU stamp
+        std::vector<SlotConv> pslots((size_t) std::max(1, a.park_slots));
+        uint64_t ptick = 0;
+        // Put the LIVE conversation into a free slot, else the least-recently-parked one (P4B-SESSIONS.md 2b).  The
+        // caller runs it at the moment just before it would clobber the state, which is the whole point: the parked
+        // conversation's KDA state and its rows [0, hist.size()) come back on the card when it is asked for again.
+        // `protect` is the slot the arriving request is about to RESUME - it must not become the free slot or the LRU
+        // victim here, or the hand-off would park itself on top of the state it is about to load.
+        auto park_live = [&](const char * why, int protect = -1) {
+            if (!park_on || a.park_slots <= 1 || hist.empty() || (int64_t) hist.size() < park_min) return;
+            if ((int64_t) hist.size() > park_max) return;   // host RAM budget for one slot (see park_max above)
+            int k = -1;
+            for (int j = 0; j < a.park_slots; ++j) if (j != protect && !dense.parked(j)) { k = j; break; }
+            if (k < 0) {   // all slots hold a conversation: the one parked longest ago gives its memory back
+                for (int j = 0; j < a.park_slots; ++j) {
+                    if (j == protect) continue;
+                    if (k < 0 || pslots[(size_t) j].last < pslots[(size_t) k].last) k = j;
+                }
+            }
+            if (k < 0) return;   // every slot is protected: nowhere to put this conversation, so it is dropped
+            if (!dense.park((int64_t) hist.size(), k)) {
+                std::fprintf(stderr, "serve: park of the %zu-token conversation failed: %s\n",
+                             hist.size(), dense.last_error().c_str());
+                return;
+            }
+            SlotConv & sc = pslots[(size_t) k];
+            sc.hist = hist;   // the card's state now IS these ids; a resumption must continue exactly from them
+            sc.last = ++ptick;
+            std::fprintf(stderr, "serve: parked the %zu-token conversation into slot %d (slot=%d ids=%zu positions=%zu"
+                                 ", kda state + mla rows%s)\n", hist.size(), k, k, hist.size(), hist.size(), why);
+        };
         if (slot_gib_max > 0) {   // start at the decode size: a short first request (no shrink) must not decode small
             std::string gerr;
             if (tier.grow_cache(a.vram_grow_keep, gerr) < 0) std::fprintf(stderr, "serve: grow_cache: %s\n", gerr.c_str());
@@ -1199,7 +1262,10 @@ int main(int argc, char ** argv) {
         long long rv = tier.resident(), av = tier.arena_experts();   // #44: the INFO line counts ACROSS the shards
         for (auto & t : tier_x) { rv += t.resident(); av += t.arena_experts(); }
         std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, rv, av);
-        std::printf("READY %d stop\n", ctxv);
+        // P4b: the slots suffix is printed ONLY when N > 1, so an existing server parses today's line unchanged (and
+        // keys its slice arbiter on that suffix: an engine that does not advertise slots is served exactly as before).
+        if (a.park_slots > 1) std::printf("READY %d stop slots=%d\n", ctxv, a.park_slots);
+        else std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
         std::string line;
@@ -1233,11 +1299,68 @@ int main(int argc, char ** argv) {
             size_t lcp = 0;
             while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
             int reused = 0;
+            // P4b 2b (ONLY with --park-slots > 1): scan the park slots for the conversation this request continues; the
+            // longest match wins.  A read-only scan - at the default 1 park_best stays -1 and the chain below is the
+            // release path line for line.
+            int park_best = -1;
+            size_t park_lp = 0;
+            if (a.park_slots > 1) {
+                size_t best_lp = 0;
+                for (int k = 0; k < a.park_slots; ++k) {
+                    if (!dense.parked(k) || pslots[(size_t) k].hist.empty()) continue;
+                    const std::vector<int> & ph = pslots[(size_t) k].hist;
+                    size_t lp = 0;
+                    while (lp < ph.size() && lp < ids.size() && ph[lp] == ids[lp]) ++lp;
+                    const bool full = lp == ph.size();
+                    // A request that is a STRICT PREFIX of a parked conversation (lp == ids.size() < ph.size()) does not
+                    // continue it - it CONTRADICTS it (an edited/resubmitted history). Unparking would resume at the
+                    // longer state's end: the answer would continue tokens the request never sent (stage A of the P4b.3
+                    // witness caught exactly this: a 38-token replay of a 50-token parked conversation, 0/12 tokens
+                    // matching the resumed answer). Such a request prefills fresh; the slot's real continuation still fits.
+                    if (lp >= ids.size() && !full) continue;
+                    // GLM takes DS4.1's FULL-match rule only, and the KDA state is why: it is recurrent, not
+                    // position-indexed (glm_dense.hpp's phase-1 limit), so a slot can resume ONLY at the position it
+                    // stopped at. DS4.1's partial branch (lp >= max(park_min, 3/4 of the park)) re-feeds from the
+                    // longest common prefix because its caches are positional; here that would hand attn_router_n a
+                    // pass at a position the recurrent state has already passed, which it refuses.
+                    // GLM also requires a STRICT extension (lp < ids.size()): a request that replays a parked
+                    // conversation to the token would decode from last_logits, which are still the outgoing
+                    // conversation's (a park has no saved logits twin - DS4.1's regen path does). Feeding nothing
+                    // cannot refresh them, so an exact replay prefills fresh, like the release path's else-branch.
+                    if (!full || lp >= ids.size() || lp <= lcp || lp < best_lp) continue;
+                    best_lp = lp; park_best = k; park_lp = lp;
+                }
+            }
             if (!hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
             else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);
                 reused = snap_len;
+            } else if (park_best >= 0) {
+                // This request continues a PARKED conversation: hand the card over.  The live conversation goes to host
+                // memory first (it is about to be overwritten), then the slot's state comes back and the feed starts at
+                // its own end - the sliced continuation re-feeds NOTHING (P4B-SESSIONS.md 2c, free here because GLM's
+                // park copies the live state, so it already covers prompt + everything generated).
+                SlotConv & sc = pslots[(size_t) park_best];   // reachable only with --park-slots > 1 (park_best)
+                park_live(" before a parked conversation resumed", park_best);
+                if (dense.unpark(park_best)) {
+                    std::fprintf(stderr, "serve: unparked slot %d's %zu-token conversation (slot=%d ids=%zu "
+                                         "positions=%zu, kda state + mla rows back)\n",
+                                 park_best, sc.hist.size(), park_best, sc.hist.size(), sc.hist.size());
+                    hist = sc.hist;    // the card now holds exactly these ids' state, at position hist.size()
+                    sc.hist.clear();   // the slot is consumed: the conversation is live on the card again
+                    snap_len = -1;     // unpark dropped the device twin; it is re-armed at this prompt's end below
+                    lcp = park_lp;
+                    reused = (int) park_lp;
+                } else {   // cannot happen (the scan only picks slots dense.parked() says are full); reset anyway
+                    dense.reset();
+                    hist.clear();
+                    snap_len = -1;
+                }
             } else {
+                // an unrelated request overwrites the state outright: park the live conversation first (P4b), then
+                // today's reset.  The gate is spelled out here so that at the default --park-slots 1 the three lines
+                // below are the ONLY things this branch runs - the release path, statement for statement.
+                if (a.park_slots > 1) park_live(" before an unrelated request");
                 dense.reset();
                 hist.clear();
                 snap_len = -1;

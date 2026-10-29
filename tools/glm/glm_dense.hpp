@@ -164,6 +164,25 @@ public:
     bool restore();
     int snapshot_pos() const;   ///< -1: none
 
+    /// P4b --park-slots (docs/gfx906/P4B-SESSIONS.md section 6; the GLM mirror of ds41_dense's park, cc871fae +
+    /// 5b4643df): keep a WHOLE conversation through a DIFFERENT one.  snapshot()/restore() can only rewind the live
+    /// conversation to its own last prompt; a second conversation has to overwrite the state outright, because every
+    /// GLM session's state is the ONE set of KDA tensors on the card.  park(positions, slot) copies the state AS IT
+    /// STANDS NOW (the live KDA S + conv states and the indexer tail carry - the same tensor set snapshot() twins,
+    /// plus the position-indexed rows an unrelated request overwrites from position 0: the MLA latent cache kvc rows
+    /// [0, positions) and the indexer pool rows [0, ceil(positions/kpool))) to HOST memory in THAT slot;
+    /// unpark(slot) writes them back and rewinds next_pos to where that conversation stopped, so the engine feeds its
+    /// next token at exactly that position.  drop_park(slot) frees a slot's host memory, parked(slot) asks if it holds one.
+    /// The engine uses slots 0..N-1 of a --park-slots N serve run, and NONE of this at the default N == 1:
+    /// glm_generate engages the park machinery only with N > 1, so the default run never calls into it - the
+    /// byte-identical release path.
+    bool park(int64_t positions, int slot = 0);
+    bool unpark(int slot = 0);
+    void drop_park(int slot = 0);
+    bool parked(int slot = 0) const;
+    /// The position the conversation in this slot stopped at (-1: the slot is empty).
+    int64_t parked_pos(int slot = 0) const;
+
     const float * tap_l_out(int il) const;   ///< [n_embd * hc] of the last token of the last pass (gate_taps)
     const std::string & last_error() const;
 

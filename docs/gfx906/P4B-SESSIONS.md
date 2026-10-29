@@ -162,3 +162,30 @@ rows `[0, positions]` + `ipool` rows `[0, positions/4]`; `unpark(slot)` writes b
 snapshot (the twins already exist, ~209 MB per session incl. state - P4-RAM-BUDGET.md 54-55). The
 serve loop's hist/snap single-conversation bookkeeping (`glm_generate.cpp:1188-1239`) becomes the
 same per-slot table. Slice arbiter: same server code, READY suffix, no further server work.
+
+LANDED (P4b.4, no witness yet - no GPU window). `--park-slots N` on `glm_generate --serve`, the same
+1..16 clamp and the same `READY ... slots=N`-only-when-N>1 suffix; `GlmDense::park/unpark/drop_park/
+parked(slot)` (`glm_dense.hpp`, `glm_dense.cpp` after `snapshot_pos`). Identity: GLM has no park at N=1,
+so EVERY added line - the park calls, the scan, the READY suffix, the park scope - is inside a
+`park_slots > 1` gate and the default run reaches none of it.
+
+Four places the KDA state forced a different shape from DS4.1:
+1. A park copies the LIVE state (live KDA `S` + `conv`, the MLA `itail` carry - the same tensor set
+   `snapshot()` twins - plus `kvc` rows [0, positions) and `ipool` rows [0, ceil(positions/kpool))),
+   not the snapshot twin at the last prompt end. That makes DS4.1's 2c re-arm unnecessary: the park
+   already covers prompt + generated, so a slice resumes at zero re-feed without any extra copy.
+   The `ipool` DUMP row is not saved (dead-slot/padding writes land there; attention reads [0, npc)).
+2. A slot resumes on a FULL match that STRICTLY EXTENDS it, only. DS4.1's partial rule (resume at the
+   longest common prefix >= 3/4) needs positional caches to overwrite a stale tail; a recurrent state
+   cannot rewind to `lp` (attn_router_n refuses an out-of-order pass), and a same-length replay would
+   decode from `last_logits` that belong to the outgoing conversation (no saved logits twin), so both
+   prefill fresh. The strict-prefix guard of 5b4643df is ported verbatim ahead of that rule.
+3. The OUTGOING conversation is parked on EVERY hand-off (also the one that resumes a slot), with the
+   resuming slot protected from being the free/LRU victim. DS4.1's multi-slot scan parks only on an
+   unrelated arrival, which drops the interrupted conversation; here dropping it costs a re-prefill.
+4. `STRATA_SERVE_PARK_MAX` defaults to 32768 positions, not 65536: GLM's window is ~13.6 KB per
+   position (section 4), ~5x DS4.1's, so one slot at DS4.1's ceiling would be ~0.9 GiB.
+`--park-slots N>1` refuses a staged (--gpus) --serve, the same refusal as 2e. The witness (stage-A
+exactness through the raw protocol + the fairness marathon) still has to run on a GPU window, and the
+GLM engine log lines to grep are `parked the N-token conversation into slot K (slot=K ids=I
+positions=P, kda state + mla rows ...)` and `unparked slot K's ... (kda state + mla rows back)`.
