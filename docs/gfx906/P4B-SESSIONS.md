@@ -163,7 +163,18 @@ snapshot (the twins already exist, ~209 MB per session incl. state - P4-RAM-BUDG
 serve loop's hist/snap single-conversation bookkeeping (`glm_generate.cpp:1188-1239`) becomes the
 same per-slot table. Slice arbiter: same server code, READY suffix, no further server work.
 
-LANDED (P4b.4, no witness yet - no GPU window). `--park-slots N` on `glm_generate --serve`, the same
+LANDED (P4b.4) and WITNESSED GO 2026-10-28 run 2 (receipt `benchmarks/gfx906/receipts/2026-10-28-p4b4-glm-sessions.json`,
+runner `tools/gfx906/run-p4b-glm-sessions.sh`, window log `logs/p4b4-glm-witness-run2.log`): stage A 5/5 exact
+(A2 resumed reused=37, D2 reused=28, the strict-prefix replay refused reused=0 and matched its resumed answer
+12/12); stage B one boot through `serve_glm.py --park-slots 4`: the engine parked into slots 1/2 and unparked
+slot 0 (`kda state + mla rows`) with `reused=92..189` per turn under concurrent replay, 15 requests 0 errors;
+fairness shorts got their first streamed token at 16.1 s and 26.8 s against a 78.8 s marathon wall (20%/34%,
+gate 60%). The hand-off is slower than DS4.1's (one slice + GLM's ~13.6 KB/position park copy + prefill), which
+the TTFT numbers show honestly. Run 1 (log `logs/p4b46-window.log`) reported fairness false through a CLIENT bug,
+not an engine one: it timed the first `delta.content`, GLM thinks inside every answer and the thinking streams as
+`reasoning_content` (server.py:5022), so a 32-token short looked silent while its engine decoded it - the shorts
+had finished at wall 20.3/30.2 s of a 75.3 s marathon all along. Fixed in 19e046e4 (first streamed token, either
+channel; that IS the scheduling evidence). `--park-slots N` on `glm_generate --serve`, the same
 1..16 clamp and the same `READY ... slots=N`-only-when-N>1 suffix; `GlmDense::park/unpark/drop_park/
 parked(slot)` (`glm_dense.hpp`, `glm_dense.cpp` after `snapshot_pos`). Identity: GLM has no park at N=1,
 so EVERY added line - the park calls, the scan, the READY suffix, the park scope - is inside a
@@ -185,7 +196,6 @@ Four places the KDA state forced a different shape from DS4.1:
    unrelated arrival, which drops the interrupted conversation; here dropping it costs a re-prefill.
 4. `STRATA_SERVE_PARK_MAX` defaults to 32768 positions, not 65536: GLM's window is ~13.6 KB per
    position (section 4), ~5x DS4.1's, so one slot at DS4.1's ceiling would be ~0.9 GiB.
-`--park-slots N>1` refuses a staged (--gpus) --serve, the same refusal as 2e. The witness (stage-A
-exactness through the raw protocol + the fairness marathon) still has to run on a GPU window, and the
-GLM engine log lines to grep are `parked the N-token conversation into slot K (slot=K ids=I
-positions=P, kda state + mla rows ...)` and `unparked slot K's ... (kda state + mla rows back)`.
+`--park-slots N>1` refuses a staged (--gpus) --serve, the same refusal as 2e. The engine log lines to grep (both
+witnesses) are `parked the N-token conversation into slot K (slot=K ids=I positions=P, kda state + mla rows ...)`
+and `unparked slot K's ... (kda state + mla rows back)`.

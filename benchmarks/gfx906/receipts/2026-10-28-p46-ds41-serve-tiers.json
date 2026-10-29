@@ -1,0 +1,76 @@
+{
+ "gate": "#46 DS4.1 --serve x --tier-cards under P4b concurrent sessions",
+ "ts": "20261028-230010",
+ "commit": "47f7ff76",
+ "arms_differ_by": "--tier-cards 4 (t4 also omits the config gpu key: shards need all cards)",
+ "load": "concurrent 3-session x 2-turn replay, warm burst before each measured window",
+ "per_arm": [
+  {
+   "arm": "ctl",
+   "round": "1",
+   "decode_tokens": 288,
+   "decode_s": 17.68,
+   "decode_toks_s": 16.29,
+   "decode_hit_pct": 98.6,
+   "decode_lookups": 64904,
+   "decode_cpu": 281,
+   "decode_pcie": 525,
+   "decode_file": 104,
+   "prompt_hit_pct": 47.98
+  },
+  {
+   "arm": "t4",
+   "round": "1",
+   "decode_tokens": 288,
+   "decode_s": 23.57,
+   "decode_toks_s": 12.219,
+   "decode_hit_pct": 99.96,
+   "decode_lookups": 64809,
+   "decode_cpu": 14,
+   "decode_pcie": 4,
+   "decode_file": 9,
+   "prompt_hit_pct": 97.21
+  },
+  {
+   "arm": "ctl",
+   "round": "2",
+   "decode_tokens": 288,
+   "decode_s": 17.88,
+   "decode_toks_s": 16.107,
+   "decode_hit_pct": 98.54,
+   "decode_lookups": 64932,
+   "decode_cpu": 303,
+   "decode_pcie": 514,
+   "decode_file": 132,
+   "prompt_hit_pct": 46.89
+  },
+  {
+   "arm": "t4",
+   "round": "2",
+   "decode_tokens": 288,
+   "decode_s": 23.78,
+   "decode_toks_s": 12.111,
+   "decode_hit_pct": 99.96,
+   "decode_lookups": 64808,
+   "decode_cpu": 12,
+   "decode_pcie": 9,
+   "decode_file": 8,
+   "prompt_hit_pct": 97.35
+  }
+ ],
+ "paired": {
+  "1": {
+   "decode_t4/ctl": 0.75,
+   "hit_ctl": 98.6,
+   "hit_t4": 99.96
+  },
+  "2": {
+   "decode_t4/ctl": 0.752,
+   "hit_ctl": 98.54,
+   "hit_t4": 99.96
+  }
+ },
+ "requests": 36,
+ "errors": 0,
+ "verdict": "NO-GO: the P6.4 single-workload verdict stands under the concurrent load too (paired decode ratio at or below 1.0; see per-round numbers)"
+}

@@ -447,3 +447,29 @@ six greedy 128-token requests per boot): **0 request errors, paired ratios s4/ct
 (+66% decode) did not carry, and the sharded arm is the more STABLE one.  Not tested: concurrent sessions
 (one sequence at a time behind the FIFO - that is P4b), long arena-adapt drift, and the INFO line's own log
 trail (stdout goes to the server; the tier stderr line carries the evidence).
+
+## 13. Task #46: DS4.1 serve x shards re-measured under P4b concurrency (2026-10-28) - NO-GO stands
+
+Section 10 refused DS4.1 shards on ONE-SHOT load (ctl decode hit 99.23%, capacity prize +0.2 pt, paired
+decode ratio 0.72-0.91) and section 12 wired GLM serve only.  Two things changed the question since: DS4.1
+`--serve` now accepts `--tier-cards` (the same defensive-refusal removal as #44 - the serve loop's tier calls
+go through `arena_all`/`rebalance_all_*` aggregators that fan out per shard and are byte-identical at N=1),
+and P4b gave the server a genuinely concurrent shape (sliced generations + per-conversation park) that
+presses the arena differently than the one-request-at-a-time FIFO sections 10 and 12 measured.
+
+Witness (receipt 2026-10-28-p46-ds41-serve-tiers.json, runner `tools/gfx906/run-p46-ds41-serve-tiers.sh`):
+arms differ by `--tier-cards 4` (t4 also drops the config `gpu` key, the #44 rule); warm burst then a measured
+window per boot, two interleaved rounds; load = 3 sessions x 2 turns replayed concurrently.  **The decode
+window - the task's metric and the fan-out path - says the single-workload verdict stands: paired t4/ctl
+decode ratio 0.750 and 0.752 (rounds agree), t4 decode hit 99.96% (capacity DID aggregate, +1.4 pt over ctl's
+98.6%), 36 requests 0 errors.**  Concurrency did not starve the ctl cache (98.6%/98.5% rounds), so the prize
+that flipped GLM (section 11: ctl hit 21.8%, starved) does not exist here, and DS4.1's faster decode makes the
+N-serialized tier submissions cost MORE, not less: the same -25% that one-shot measurement showed.
+
+Honest caveat on the prompt window (not the gate): the serve batch prefill above `STRATA_SERVE_STEP_MAX` runs
+`tier.run_chunk` on shard 0's tier, which is not fanned out (a shard arena excludes non-owned experts by
+design, P6.4).  Its hit%% numbers are therefore NOT comparable across arms (t4 97.2%, ctl 46.9%) and are
+recorded, not interpreted.  Fanning chunk prefill out would need per-shard sub-chunk entry lists (run_chunk
+takes dense top_k-per-token rows); P6.4's one-shot decode already prices that shape at -25%, so it was not
+built for a measurement whose gated path is clean.  **Verdict: DS4.1 `--serve` x `--tier-cards` stays refused
+by economics.  GLM remains the only GO engine for shards (sections 11-12).**

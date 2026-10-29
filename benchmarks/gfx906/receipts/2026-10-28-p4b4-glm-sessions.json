@@ -1,0 +1,40 @@
+{
+ "gate": "P4b.4 witness: GLM serve x park slots x sliced turns",
+ "ts": "20261028-233135",
+ "commit": "19e046e4",
+ "stageA": {
+  "A1_reused": 0,
+  "B1_reused": 0,
+  "A2_reused": 37,
+  "C1_reused": 0,
+  "D1_reused": 0,
+  "D2_reused": 28,
+  "A_replay": [
+   4019,
+   4026,
+   4030,
+   4036,
+   4044,
+   4054,
+   4061,
+   4065,
+   4071,
+   4079,
+   660,
+   284
+  ],
+  "A_replay_reused": 0
+ },
+ "fairness": {
+  "short_ttft_s": {
+   "A": 16.0788152217865,
+   "B": 26.780353784561157
+  },
+  "marathon_wall_s": 78.81975865364075,
+  "short_beat_marathons_wall": true
+ },
+ "text_match_serial_vs_concurrent": "5/6 (informational - residency knife-edge)",
+ "requests": 15,
+ "errors": 0,
+ "verdict": "GO: park/unpark exact (stage A), slicing fair, all requests completed"
+}
