@@ -176,7 +176,7 @@ def ask(msgs, maxtok):
     body = {"messages": msgs, "max_tokens": maxtok, "temperature": 0, "stream": True}
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
                                  data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
-    t0 = time.time(); first = None; text = []
+    t0 = time.time(); first = None; text = []; n_content = 0
     try:
         with urllib.request.urlopen(req, timeout=900) as r:
             for raw in r:
@@ -190,13 +190,23 @@ def ask(msgs, maxtok):
                     j = json.loads(d)
                 except Exception:
                     continue
+                if j.get("error"):                       # a server error JSON: record it, never count it as a stream
+                    return {"phase": phase, "text": "", "ttft": first, "wall": time.time() - t0,
+                            "error": str(j["error"])[:200]}
                 ch = (j.get("choices") or [{}])[0]
-                piece = (ch.get("delta") or {}).get("content")
+                dl = ch.get("delta") or {}
+                # TTFT counts the FIRST STREAMED TOKEN, reasoning or content: GLM always thinks first (its config's
+                # reasoning_budget_tokens, and reasoning_effort=none does not switch the template off the way
+                # DS4.1's does). What the slice seam buys is the engine - the first token either channel proves it.
+                piece = dl.get("content") or dl.get("reasoning_content")
+                if dl.get("content"):
+                    n_content += 1
                 if piece:
                     if first is None:
                         first = time.time() - t0
                     text.append(piece)
-        return {"phase": phase, "text": "".join(text), "ttft": first, "wall": time.time() - t0, "error": None}
+        return {"phase": phase, "text": "".join(text), "ttft": first, "content_toks": n_content,
+                "wall": time.time() - t0, "error": None}
     except Exception as e:
         return {"phase": phase, "text": "", "ttft": None, "wall": time.time() - t0, "error": str(e)}
 out = []
