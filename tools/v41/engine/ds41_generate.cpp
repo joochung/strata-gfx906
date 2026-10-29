@@ -661,8 +661,8 @@ int main(int argc, char ** argv) {
         return 2;
     }
     if (a.tier_cards < 1) { std::fprintf(stderr, "ds41_generate: --tier-cards must be >= 1\n"); return 2; }
-    if (a.tier_cards > 1 && (a.serve || !a.split.gpus.empty() || a.experts == "cpu"))
-        { std::fprintf(stderr, "ds41_generate: --tier-cards %d refuses --serve, --gpus staging and --experts cpu\n", a.tier_cards); return 2; }
+    if (a.tier_cards > 1 && (!a.split.gpus.empty() || a.experts == "cpu"))
+        { std::fprintf(stderr, "ds41_generate: --tier-cards %d refuses --gpus staging and --experts cpu\n", a.tier_cards); return 2; }
     if (a.park_slots < 1 || a.park_slots > 16)
         { std::fprintf(stderr, "ds41_generate: --park-slots must be 1..16\n"); return 2; }
     if (!a.build_mirror.empty()) {   // the second-drive blob mirror (STRATA_BLOB_MIRROR): coldest experts first
@@ -1081,9 +1081,14 @@ int main(int argc, char ** argv) {
     const int tcards = a.tier_cards;
     if (tcards > 1) {
         const char * dsp_env = a.serve ? std::getenv("STRATA_SERVE_DSPARK") : std::getenv("STRATA_DSPARK");
-        if (a.serve || staged || mc.cpu_only || (dsp_env && *dsp_env) || tcards < 1)
-            { std::fprintf(stderr, "ds41_generate: --tier-cards %d refuses --serve, --gpus staging, --experts cpu and "
-                                   "DSpark (STRATA_DSPARK); and N must be >= 1\n", tcards); return 2; }
+        // P4b/#46 (the DS4.1 mirror of #44's GLM audit): --serve is NOT refused any more. Decode (step/pass_m) and
+        // prefill route through the shard_run/shard_prefetch seam; stats aggregate (stats_all); the route bias reads
+        // shard_resident; the deferred VRAM seed (open_cache) seeds EVERY shard; and the elastic keep/shrink stays
+        // shard-0's BY CONSTRUCTION (the prompt batch stages on the card that holds the dense half - the other
+        // cards keep their caches). What stays refused: staged (--gpus spans instances), --experts cpu, and DSpark.
+        if (staged || mc.cpu_only || (dsp_env && *dsp_env) || tcards < 1)
+            { std::fprintf(stderr, "ds41_generate: --tier-cards %d refuses --gpus staging, --experts cpu and "
+                                   "DSpark (STRATA_DSPARK / STRATA_SERVE_DSPARK); and N must be >= 1\n", tcards); return 2; }
         if (gpu_dev_at(tcards - 1) == nullptr)
             { std::fprintf(stderr, "ds41_generate: --tier-cards %d: not enough GPU devices visible\n", tcards); return 2; }
     }
@@ -1205,6 +1210,13 @@ int main(int argc, char ** argv) {
     // readahead it hints serves that shard's paths (chunked prefill, its own CPU-tier misses)
     auto stats_all = [&]() { Ds41MoeStats s = tier.stats(); for (auto & t : tier_x) s.add(t.stats()); return s; };
     auto reset_all = [&]() { tier.reset_stats(); for (auto & t : tier_x) t.reset_stats(); };
+    auto arena_all = [&]() { long long n = tier.arena_experts(); for (auto & t : tier_x) n += t.arena_experts(); return n; };
+    // #46: the serve arena brain, EVERY shard's. Each tier rebalances ITS OWN arena from ITS OWN hit stats, and a
+    // shard only ever holds the experts it owns (the exclude mask), so driving all of them is the same per-tier
+    // state machine run tcards times - at tcards == 1 tier_x is empty and this is exactly today's single call.
+    auto rebalance_all_begin_prompt = [&]() { tier.rebalance_begin_prompt(); for (auto & t : tier_x) t.rebalance_begin_prompt(); };
+    auto rebalance_all_plan = [&]() { tier.rebalance_plan(); for (auto & t : tier_x) t.rebalance_plan(); };
+    auto rebalance_all_tick = [&](bool request_end) { tier.rebalance_tick(request_end); for (auto & t : tier_x) t.rebalance_tick(request_end); };
     auto resident_all = [&]() { long long r = tier.resident(); for (auto & t : tier_x) r += t.resident(); return r; };
     // the selection-only bias per layer: the prune penalty / mask, + route_bias on the experts resident in VRAM now
     std::vector<char> proxy_res;   // --bias-prompt: the would-be VRAM set (first N ranked) until the real seed
@@ -2274,7 +2286,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
         // STRATA_SERVE_PASS_BIAS=0: those passes route exactly (the decode biases only while decoding)
         const bool pass_bias = !(std::getenv("STRATA_SERVE_PASS_BIAS") && std::getenv("STRATA_SERVE_PASS_BIAS")[0] == '0');
         std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) resident_all(),
-                    (long long) tier.arena_experts());
+                    (long long) arena_all());   // #46: EVERY shard's arena (tier_x empty at tcards==1: same number)
         // P4b: the slots suffix is printed ONLY when N > 1, so an existing server parses today's line unchanged.
         if (a.park_slots > 1) std::printf("READY %d stop slots=%d\n", ctxv, a.park_slots);
         else std::printf("READY %d stop\n", ctxv);
@@ -2522,7 +2534,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                 bias_now = a.bias_prompt > 0;
                 apply_bias();
             }
-            tier.rebalance_begin_prompt();
+            rebalance_all_begin_prompt();
             reset_all();
             if (const char* rl = std::getenv("STRATA_ROUTE_LOG")) {   // a turn marker for the route log (see ds41_moe.cpp)
                 if (FILE* f = std::fopen(rl, "a")) { std::fprintf(f, "# turn %d new %d %s\n", n_req, dh, by_step ? "passes" : "batch"); std::fclose(f); }
@@ -2736,7 +2748,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                 std::fprintf(stderr, "serve: VRAM %.2f GiB free -> %lld experts in VRAM (seed %.2f s)\n", seed_free,
                              (long long) resident_all(), seed_s);
             }
-            if (ok) tier.rebalance_plan();
+            if (ok) rebalance_all_plan();
             reset_all();
             const double td0 = now_ms();
             int gen = 0, pos = total;
@@ -2851,7 +2863,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                     dirty = acc < k;
                     P += 1 + acc;
                     t = tn;
-                    tier.rebalance_tick();
+                    rebalance_all_tick(false);
                     if (!more) break;
                 }
                 if (lk_pass > 0)
@@ -2872,7 +2884,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                 if (!step(tok, pos) || !(staged ? *sr.stage.back() : dense).logits(0, 1, lg.data())) { finish = "error"; break; }
                 hist.push_back(tok);
                 ++pos;
-                tier.rebalance_tick();
+                rebalance_all_tick(false);
             }
             const double dec_ms = now_ms() - td0;
             const Ds41MoeStats st = stats_all();
@@ -2890,7 +2902,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                 std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", rq_pass,
                              1.0 + (double) rq_acc / rq_pass, 1.0 + (double) sv_acc / std::max(1L, sv_pass));
 #endif
-            tier.rebalance_tick(true);   // the gap until the next request: retire a large batch for the reader
+            rebalance_all_tick(true);   // the gap until the next request: retire a large batch for the reader
             // P4b 2c: with slots > 1 re-arm the snapshot at THIS request's end, so a slice's park covers
             // prompt+generated and its continuation resumes at zero re-feed (docs/gfx906/P4B-SESSIONS.md 2c).
             // Consequence, slots>1 only: the REGENERATE fast path fires at slice ends, a repeated prompt re-feeds
