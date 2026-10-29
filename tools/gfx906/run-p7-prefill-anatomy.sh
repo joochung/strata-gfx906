@@ -79,9 +79,26 @@ run_one() {   # run_one <name> [ENV=k=v] [extra engine args...]
 # moves the control 2.4x by itself).
 run_one warm MIMO_CHUNK_PROF=0 -n 1 --prefill-chunk 64 || { echo "P7: warm boot failed"; exit 1; }
 
-for r in 1 2; do
-    run_one "chunk-r$r" MIMO_CHUNK_PROF=1 --prefill-chunk 64
-    run_one "batch-r$r" MIMO_CHUNK_PROF=1 --prefill-chunk 2048 --prompt-batch 2048
+# ARMS: name|PROF|args | name|PROF|args | ... (triples separated by |). Defaults to EXP1. EXP2 set:
+#   ARMS="chunk-64|1|--prefill-chunk 64|chunk-256|1|--prefill-chunk 256|chunk-1024|1|--prefill-chunk 1024|\
+# eager-ctl|1|--prefill-chunk 1|eager-t4|1|--prefill-chunk 1 --tier-cards 4"
+# --prefill-chunk 1 = per-token passes, no defer_vram: the VRAM expert cache EXISTS before the prompt (eager
+# seed). --tier-cards 4 fans the per-token run() out over the four cards (P6.4 seam = the serve pass-shape
+# with shards, 4 caches + 4 PCIe links). If the rate scales with the chunk size, prefill is streaming-bound.
+ARMS=${ARMS:-"chunk-64|1|--prefill-chunk 64|batch-2048|1|--prefill-chunk 2048 --prompt-batch 2048"}
+ROUNDS=${ROUNDS:-2}
+
+run_arm() { # one "name|prof|args" spec, round suffix r$1
+    local spec=$1 r=$2 name prof args
+    IFS='|' read -r name prof args <<<"$spec"
+    run_one "$name-r$r" "MIMO_CHUNK_PROF=$prof" $args
+}
+
+for r in $(seq 1 "$ROUNDS"); do
+    IFS='|' read -ra SPECS <<<"$ARMS"
+    for ((i = 0; i + 2 < ${#SPECS[@]} + 1; i += 3)); do
+        run_arm "${SPECS[$i]}|${SPECS[$((i + 1))]}|${SPECS[$((i + 2))]}" "$r"
+    done
 done
 
 echo "== anatomy summary =="
@@ -89,16 +106,19 @@ $PY - "$OUT" "$OUT.summary.jsonl" <<'EOF'
 import re, sys, json
 out, js = sys.argv[1], sys.argv[2]
 def grab(name, path, rx):
-    m = re.search(rx, open(path, errors="replace").read())
+    m = re.search(rx, open(path, errors="replace").read(), re.M)
     return m.groupdict() if m else {}
 rows = []
-for name in ("chunk-r1", "batch-r1", "chunk-r2", "batch-r2"):
+import glob, os
+names = sorted({os.path.basename(p)[len(out) + 1:-len(".log")] for p in glob.glob(out + ".*.log") if ".warm." not in p},
+               key=lambda n: (int(n.split("-r")[-1]), n))
+for name in names:
     log = f"{out}.{name}.log"
     row = {"arm": name}
-    row.update(grab(name, log, r"^prompt: (?P<toks>\d+) tokens in (?P<s>[\d.]+) s = (?P<tok_s>[\d.]+) tok/s \(experts (?P<eh>\d+) hit / (?P<ec>\d+) cpu / (?P<ep>\d+) pcie / (?P<ef>\d+) file", ))
-    row.update(grab(name, log, r"^prompt split: dense (?P<dense_s>[\d.]+) s, experts (?P<experts_s>[\d.]+) s \(file wait (?P<file_s>[\d.]+) s\)"))
-    row.update(grab(name, log, r"^chunk prof: (?P<calls>\d+) calls, (?P<launches>\d+) launches: wall (?P<wall>\d+) ms = waits on reads (?P<reads>\d+) \+ wave/copy waits (?P<copies>\d+) \+ final sync (?P<sync>\d+) \+ other host (?P<other>\d+); reader wall (?P<reader>\d+) ms; GPU grouped kernels (?P<kern>\d+) ms \(resident (?P<resident>\d+)\); file tier (?P<file_gb>[\d.]+) GB read in (?P<rd_busy>\d+) ms of reader time = (?P<file_gbs>[\d.]+) GB/s"))
-    row.update(grab(name, log, r"^chunk prof MMQ: (?P<mmq_sub>\d+) sub-runs; PTQ1_0 -> Q2_0 transcode (?P<tc>\d+) ms GPU \(inside the grouped kernels\) over (?P<tc_launches>\d+) sub-runs, (?P<tc_gb>[\d.]+) GB of ternary read = (?P<tc_gbs>\d+) GB/s"))
+    row.update(grab(name, log, r"prompt: (?P<toks>\d+) tokens in (?P<s>[\d.]+) s = (?P<tok_s>[\d.]+) tok/s \(experts (?P<eh>\d+) hit / (?P<ec>\d+) cpu / (?P<ep>\d+) pcie / (?P<ef>\d+) file", ))
+    row.update(grab(name, log, r"prompt split: dense (?P<dense_s>[\d.]+) s, experts (?P<experts_s>[\d.]+) s \(file wait (?P<file_s>[\d.]+) s\)"))
+    row.update(grab(name, log, r"chunk prof: (?P<calls>\d+) calls, (?P<launches>\d+) launches: wall (?P<wall>\d+) ms = waits on reads (?P<reads>\d+) \+ wave/copy waits (?P<copies>\d+) \+ final sync (?P<sync>\d+) \+ other host (?P<other>\d+); reader wall (?P<reader>\d+) ms; GPU grouped kernels (?P<kern>\d+) ms \(resident (?P<resident>\d+)\); file tier (?P<file_gb>[\d.]+) GB read in (?P<rd_busy>\d+) ms of reader time = (?P<file_gbs>[\d.]+) GB/s"))
+    row.update(grab(name, log, r"chunk prof MMQ: (?P<mmq_sub>\d+) sub-runs; PTQ1_0 -> Q2_0 transcode (?P<tc>\d+) ms GPU \(inside the grouped kernels\) over (?P<tc_launches>\d+) sub-runs, (?P<tc_gb>[\d.]+) GB of ternary read = (?P<tc_gbs>\d+) GB/s"))
     rows.append(row)
     print(name, json.dumps(row))
 with open(js, "w") as fh:
