@@ -2362,6 +2362,12 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                     if (lp > lp_show) lp_show = lp;
                     const bool full = lp == ph.size();
                     const size_t lp_min = (size_t) std::max<int64_t>(park_min, (int64_t) ph.size() * 3 / 4);
+                    // A request that is a STRICT PREFIX of a parked conversation (lp == ids.size() < ph.size()) does not
+                    // continue it - it CONTRADICTS it (an edited/resubmitted history). Unparking would resume at the
+                    // longer state's end: the answer would continue tokens the request never sent (stage A of the P4b.3
+                    // witness caught exactly this: a 38-token replay of a 50-token parked conversation, 0/12 tokens
+                    // matching the resumed answer). Such a request prefills fresh; the slot's real continuation still fits.
+                    if (lp >= ids.size() && !full) continue;
                     if (lp <= lcp || lp < best_lp || (!full && !(park_partial && lp >= lp_min))) continue;
                     best = k; best_lp = lp; best_full = full;
                 }

@@ -80,7 +80,16 @@ def gen(max_new, ids, tag):
         elif f and f[0] == "DONE":
             reused = int(f[8]); finish = f[5]
             return toks, reused, finish
-ready = lines.get()
+ready = ""
+while True:                                    # INFO lines (ctx, arena) precede READY on stdout
+    l = lines.get()
+    if l is None:
+        raise RuntimeError("engine stdout closed before READY")
+    if l.startswith("READY"):
+        ready = l
+        break
+    if l.startswith("ERR"):
+        raise RuntimeError("engine ERR before READY: " + l)
 print("READY:", ready)
 assert "slots=3" in ready, "engine did not advertise slots=3: " + ready
 def prompt(base, n):                                 # deterministic pseudo-token ids, well inside the vocab
@@ -111,7 +120,9 @@ def check(name, cond, detail=""):
 check("A2 resumed from the parked conversation", res["A2_reused"] >= len(PA), "reused=%d want >= %d" % (res["A2_reused"], len(PA)))
 check("D2 (freshest) resumed", res["D2_reused"] >= len(PD), "reused=%d" % res["D2_reused"])
 check("A-replay (post-eviction fresh prefill) completed", len(res["A_replay"]) > 0, "%d tokens" % len(res["A_replay"]))
-check("A-replay matches the resumed answer or reports the difference", True,
+check("A-replay (strict-prefix of a longer parked conversation) refused the stale state",
+      res["A_replay_reused"] == 0, "reused=%d want 0 (the lp>=ids.size() guard)" % res["A_replay_reused"])
+check("A-replay fresh-prefills to the SAME answer the resumed run gave", res["A_replay"] == res["A2"],
       "match=%d/%d" % (sum(x == y for x, y in zip(res["A_replay"], res["A2"])), len(res["A2"])))
 import json
 print("STAGE-A-RESULT " + json.dumps({k: (v if not isinstance(v, list) else v[:32]) for k, v in res.items()}))
@@ -167,8 +178,9 @@ kill_server() {
     unset SPID; sleep 15                                   # the async VRAM-free rule after a killed engine
 }
 
-client() { # $1=phase tag (serial|concurrent)
-    $PY - "$PORT" "$1" "$TS" "$JSONL" "$T1MAX" "$T2MAX" <<'EOF'
+
+client() { # $1=phase: serial | concurrent | fairness
+    $PY - "$PORT" "$1" "$TS" "$JSONL" "$T1MAX" "$T2MAX" <<'EOF' || return 1
 import json, sys, threading, time, urllib.request
 port, phase, ts, jsonl, t1max, t2max = sys.argv[1:7]
 CONVS = {
@@ -212,20 +224,39 @@ def one(name):
               {"role": "user", "content": u2}], int(t2max))
     r2.update(conv=name, turn=2)
     return r1, r2
-out = []
-lock = threading.Lock()
+out, lock = [], threading.Lock()
 def run(name):
     r1, r2 = one(name)
     with lock:
         out.extend([r1, r2])
-th = []
 if phase == "serial":
     for name in CONVS:
         run(name)
-else:
+elif phase == "concurrent":
+    th = []
     for name in CONVS:
-        t = threading.Thread(target=run, args=(name,)); t.start(); th.append((name, t)); time.sleep(0.2)
-    for _, t in th:
+        t = threading.Thread(target=run, args=(name,)); t.start(); th.append(t); time.sleep(0.2)
+    for t in th:
+        t.join(600)
+else:  # fairness: a 256-token marathon holds the engine; two short requests arrive mid-marathon.
+    def marathon():
+        r = ask([{"role": "user", "content": "Write a 2000-word technical narrative about every component of "
+                     "a four-GPU MoE inference box: PCIe topology, HBM2, the RAM tier, NVMe, the operating "
+                     "system's page tables, and the scheduler. Begin."}], 256)
+        r.update(conv="M", turn=1)
+        with lock:
+            out.append(r)
+    def short(name, delay):
+        time.sleep(delay)
+        r = ask([{"role": "user", "content": CONVS[name][0]}, {"role": "assistant", "content": "Understood."},
+                 {"role": "user", "content": "One sentence only: what is the VRAM tier for?"}], 32)
+        r.update(conv=name, turn=9)
+        with lock:
+            out.append(r)
+    ms = threading.Thread(target=marathon); ms.start()
+    s1 = threading.Thread(target=short, args=("A", 2.0)); s1.start()
+    s2 = threading.Thread(target=short, args=("B", 4.0)); s2.start()
+    for t in (s1, s2, ms):
         t.join(600)
 with open(jsonl, "a") as fh:
     for r in out:
@@ -233,55 +264,48 @@ with open(jsonl, "a") as fh:
         fh.write(json.dumps(r) + "\n")
 try:
     m = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5))
-    print("metrics[%s]: requests=%s requests_reused=%s reused_tokens=%s"
-          % (phase, m.get("requests"), m.get("requests_reused"), m.get("reused_tokens")))
+    hist = m.get("requests") or []
+    if isinstance(hist, list):
+        print("phase[%s]: %d requests, %d with reused>0, reused_tokens=%d"
+              % (phase, len(hist), sum(1 for r in hist if (r.get("reused") or 0) > 0),
+                 sum(int(r.get("reused") or 0) for r in hist)))
 except Exception as e:
-    print("metrics[%s]: unavailable (%s)" % (phase, e))
+    print("phase[%s]: metrics unavailable (%s)" % (phase, e))
 EOF
 }
 
-echo "== stage B: serve witness, serial control boot =="
-boot serial || { kill_server; exit 1; }
-client serial || { echo "serial client failed"; kill_server; exit 1; }
-kill_server
-
-echo "== stage B: serve witness, concurrent boot =="
-boot concurrent || { kill_server; exit 1; }
+echo "== stage B: ONE boot; serial control, concurrent replay, fairness marathon =="
+boot serve || { kill_server; exit 1; }
+client serial     || { echo "serial client failed"; kill_server; exit 1; }
 client concurrent || { echo "concurrent client failed"; kill_server; exit 1; }
-METRICS=$($PY - "$PORT" <<'EOF' 2>/dev/null || true
-import json, sys, urllib.request
-m = json.load(urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/metrics", timeout=5))
-print(json.dumps({k: m.get(k) for k in ("requests", "requests_reused", "reused_tokens")}))
-EOF
-)
+client fairness   || { echo "fairness client failed"; kill_server; exit 1; }
 kill_server
 
 echo "== verdict =="
-$PY - "$JSONL" "${METRICS:-\{\}}" <<'EOF'
+$PY - "$JSONL" <<'EOF'
 import json, sys
-jsonl, metrics = sys.argv[1], json.loads(sys.argv[2] or "{}")
-rows = [json.loads(l) for l in open(jsonl)]
+rows = [json.loads(l) for l in open(sys.argv[1])]
 by = {(r["phase"], r["conv"], r["turn"]): r for r in rows}
 same = tot = 0
 for k in sorted(by):
     if k[0] != "serial":
         continue
-    a, b = by[k], by.get(("concurrent",) + k[1:])
+    b = by.get(("concurrent",) + k[1:])
     if b:
         tot += 1
-        same += a["text"] == b["text"]
-        if a["text"] != b["text"]:
-            print("DIFF %s turn %d: serial %d chars vs concurrent %d chars" % (k[1], k[2], len(a["text"]), len(b["text"])))
-print("text match serial vs concurrent: %d/%d" % (same, tot))
-cc = [r for r in rows if r["phase"] == "concurrent" and r["turn"] == 1]
-cc.sort(key=lambda r: r["ttft"] if r["ttft"] is not None else 9e9)
-for r in cc:
-    print("concurrent %s: ttft=%.2f s wall=%.2f s" % (r["conv"], r["ttft"] or -1, r["wall"]))
-if len(cc) >= 2:
-    last_start_ok = cc[1]["ttft"] < min(r["wall"] for r in cc[:1]) if cc else True
-    print("fairness: the slowest-starting turn-1 answered its first token after %.2f s "
-          "(the first request alone would have held the engine ~%.0f s)"
-          % (max(r["ttft"] or 9e9 for r in cc), cc[0]["wall"]))
-print("metrics(concurrent):", metrics)
+        same += by[k]["text"] == b["text"]
+        if by[k]["text"] != b["text"]:
+            print("DIFF %s turn %d: serial %d chars vs concurrent %d chars" % (k[1], k[2], len(by[k]["text"]), len(b["text"])))
+print("text match serial vs concurrent (SAME boot, park exactness): %d/%d" % (same, tot))
+for ph in ("serial", "concurrent"):
+    t = [r for r in rows if r["phase"] == ph and r["turn"] == 1]
+    t.sort(key=lambda r: r["ttft"] or 9e9)
+    print("%s turn-1 ttft: %s" % (ph, " ".join("%s=%.1fs" % (r["conv"], r["ttft"] or -1) for r in t)))
+fair = {r["conv"]: r for r in rows if r["phase"] == "fairness"}
+if "M" in fair:
+    print("fairness: marathon M wall=%.1f s (started alone); short requests that arrived mid-marathon: %s"
+          % (fair["M"]["wall"], " ".join("%s ttft=%.1fs wall=%.1fs" % (c, r["ttft"] or -1, r["wall"])
+                                         for c, r in sorted(fair.items()) if c != "M")))
+    print("  (no slicing: a short request would wait the marathon's REMAINING wall, ~%.0f s)" % (fair["M"]["wall"] - 2))
 EOF
 echo "jsonl: $JSONL ; engine logs: logs/p4b-$TS.*.engine.log"
