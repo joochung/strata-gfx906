@@ -309,3 +309,46 @@ if "M" in fair:
     print("  (no slicing: a short request would wait the marathon's REMAINING wall, ~%.0f s)" % (fair["M"]["wall"] - 2))
 EOF
 echo "jsonl: $JSONL ; engine logs: logs/p4b-$TS.*.engine.log"
+
+# the receipt: gates = stage-A engine exactness + fairness + completed-without-errors. Serve-level text equality
+# is INFORMATIONAL: this tier engine reorders float sums as residency drifts (the standing rule), so same-input
+# answers can flip knife-edge within one boot; the exactness gate is the raw protocol test (stage A).
+$PY - "$JSONL" "$AOUT" "$R" "$TS" <<'EOF'
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1])]
+stageA = {}
+for line in open(sys.argv[2]):
+    if line.startswith("STAGE-A-RESULT"):
+        stageA = json.loads(line.split("STAGE-A-RESULT ", 1)[1])
+by = {(r["phase"], r["conv"], r["turn"]): r for r in rows}
+same = tot = 0
+for k in sorted(by):
+    if k[0] != "serial":
+        continue
+    b = by.get(("concurrent",) + k[1:])
+    if b:
+        tot += 1
+        same += by[k]["text"] == b["text"]
+fair = {r["conv"]: r for r in rows if r["phase"] == "fairness"}
+M = fair.get("M", {})
+fairness = {"short_ttft_s": {c: r.get("ttft") for c, r in sorted(fair.items()) if c != "M"},
+            "marathon_wall_s": M.get("wall"),
+            "short_beat_marathons_wall": bool(M) and all(
+                (fair[c].get("ttft") or 9e9) < 0.6 * M["wall"] for c in fair if c != "M")}
+errors = [r for r in rows if r.get("error")]
+reused_concurrent = sum(1 for r in rows if r["phase"] == "concurrent" and (r.get("reused") or 0) > 0)
+stage_a_pass = bool(stageA.get("A2_resumed")) and bool(stageA.get("D2_resumed")) \
+    and bool(stageA.get("A_replay_refused")) and bool(stageA.get("A_replay_matches_fresh"))
+verdict = "GO: park/unpark exact (stage A), slicing fair, all requests completed" \
+    if stage_a_pass and fairness["short_beat_marathons_wall"] and not errors else "NO-GO or INCOMPLETE"
+json.dump({"gate": "P4b.3 witness: DS4.1 serve x park slots x sliced turns", "ts": sys.argv[4],
+           "commit": __import__("subprocess").run(["git", "rev-parse", "--short", "HEAD"],
+                                                  capture_output=True, text=True).stdout.strip(),
+           "stageA": stageA, "fairness": fairness,
+           "text_match_serial_vs_concurrent": "%d/%d (informational - residency knife-edge)" % (same, tot),
+           "requests": len(rows), "errors": len(errors),
+           "concurrent_requests_with_reused_cache": reused_concurrent,
+           "verdict": verdict},
+          open(sys.argv[3], "w"), indent=1)
+print("receipt:", sys.argv[3], "-", verdict)
+EOF

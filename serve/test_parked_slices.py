@@ -33,8 +33,8 @@ import serve.server as server
 FAKE_PARK = r'''import queue, sys, threading, time
 args = sys.argv[1:]
 log = args[args.index("--log") + 1] if "--log" in args else None
-STEP = 0.02
-TOKENS = 12
+STEP = float(args[args.index("--step") + 1]) if "--step" in args else 0.02
+TOKENS = int(args[args.index("--cap") + 1]) if "--cap" in args else 12
 def emit(s):
     sys.stdout.write(s + "\n"); sys.stdout.flush()
 lines = queue.Queue()
@@ -194,16 +194,17 @@ class ParkedSlicesOverHttp(unittest.TestCase):
     def setUp(self):
         self.start()
 
-    def start(self):
+    def start(self, step=0.02, cap=12, slice_tokens=4):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_park.py"
         script.write_text(FAKE_PARK, encoding="utf-8")
         self.log = Path(self.tmp.name) / "gens.log"
         real = server.subprocess.Popen
+        extra = ["--log", str(self.log), "--step", str(step), "--cap", str(cap)]
         with mock.patch.object(server.subprocess, "Popen",
-                               lambda cmd, **kw: real([sys.executable, str(script), "--log", str(self.log)], **kw)):
+                               lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:], *extra], **kw)):
             self.engine = StrataEngine("strata", [])
-        self.engine.slice_tokens = 4
+        self.engine.slice_tokens = slice_tokens
         self.svc = Service(self.engine, ByteTokenizer(),
                            ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
         self.httpd = serve(self.svc, port=0)
@@ -255,6 +256,49 @@ class ParkedSlicesOverHttp(unittest.TestCase):
         self.assertEqual(len(gens), 1)
         self.assertEqual(gens[0].split("max_new=")[1].split()[0], "3")
         self.assertTrue(r["choices"][0]["message"]["content"])
+
+
+class MarathonFairnessOverHttp(unittest.TestCase):
+    """P4b's fairness claim at server level: a long generation holds the engine; a request arriving mid-marathon
+    gets its answer after ~a slice of waiting, NOT after the marathon finishes. Slow fake engine (0.03 s/token):
+    a 96-token marathon is ~2.9 s of wall; a slice of 16 is ~0.5 s. Un-sliced, the short request's wait would be
+    the marathon's REMAINING wall (~2.3 s) before its own ~0.13 s of work - sliced, the seam cuts that to a
+    slice or two."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        script = Path(self.tmp.name) / "fake_park.py"
+        script.write_text(FAKE_PARK, encoding="utf-8")
+        self.log = Path(self.tmp.name) / "gens.log"
+        real = server.subprocess.Popen
+        extra = ["--log", str(self.log), "--step", "0.03", "--cap", "200"]
+        with mock.patch.object(server.subprocess, "Popen",
+                               lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:], *extra], **kw)):
+            self.engine = StrataEngine("strata", [])
+        self.engine.slice_tokens = 16
+        self.svc = Service(self.engine, ByteTokenizer(),
+                           ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    tearDown = ParkedSlicesOverHttp.tearDown
+    chat = ParkedSlicesOverHttp.chat
+
+    def test_short_request_beats_the_marathons_wall(self):
+        out = {}
+        th = threading.Thread(target=lambda: out.update(m=self.chat("AAAAAAAA", 96)))
+        th.start()
+        time.sleep(0.7)                                      # arrive after ~1.5 slices
+        t0 = time.time()
+        out["s"] = self.chat("BBBB", 4)
+        waited = time.time() - t0
+        th.join(60)
+        self.assertEqual(len(out["m"]["choices"][0]["message"]["content"]), 96)
+        self.assertLess(waited, 1.9, "short request waited like there was no slice seam (%.2f s)" % waited)
+        gens = [l.strip() for l in self.log.read_text().splitlines() if l.startswith("GEN ")]
+        kinds = [int(l.split("kind=")[1].split()[0]) for l in gens]
+        first_a = kinds.index(65)
+        self.assertTrue(any(k == 66 for k in kinds[first_a + 1:]), "short request never interleaved")
 
 
 if __name__ == "__main__":

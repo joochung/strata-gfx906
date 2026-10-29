@@ -3291,6 +3291,12 @@ class Service:
             holds = False
             try:
                 while not holds:
+                    # GIL fairness: a thread that just released a lock and immediately re-acquires it usually BEATS
+                    # the waiter it woke (the woken thread needs the GIL first). Without this window the seam released
+                    # and re-acquired in the same breath - observed in the P4b.3 witness: queued=1, seam fired, 0
+                    # beats, the short request still waited the whole marathon. The slice costs 1 ms; the waiter
+                    # gets a real chance to take the turn.
+                    time.sleep(0.002)
                     holds = self.fifo.acquire(timeout=QUEUE_BEAT_S)
                     if not holds:
                         yield None
