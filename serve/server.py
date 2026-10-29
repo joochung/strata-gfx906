@@ -812,6 +812,14 @@ class StrataEngine:
     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
+    # P4b (docs/gfx906/P4B-SESSIONS.md 3): the ported engines advertise park slots on their READY line
+    # ("READY <ctx> stop slots=N", ds41/glm --park-slots).  With slots, a generation runs in slices of
+    # slice_tokens and the service's yield_turn seam gives a queued request its turn between slices; the engine
+    # remembers each conversation in a park slot, so the next slice resumes with zero re-feed.  Native and
+    # batch engines never see any of this (session_slots stays 0).
+    session_slots = 0
+    slice_tokens = 16                    # config "slice_tokens" overrides (0: never slice)
+    yield_turn = None                    # Service.__init__ wires the service's turn-yielding generator seam
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
@@ -908,6 +916,8 @@ class StrataEngine:
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                # P4b: "slots=N" only appears for --park-slots > 1; an engine that does not print it keeps 0
+                self.session_slots = next((int(t.split("=", 1)[1]) for t in f[2:] if t.startswith("slots=")), 0)
                 break
         loading.set()
         if self.max_context <= 0:
@@ -1947,6 +1957,48 @@ class StrataEngine:
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, request_id=None):
+        """P4b (docs/gfx906/P4B-SESSIONS.md 3): with engine-advertised park slots and a service seam, drive the
+        generation in slices of slice_tokens and hand the FIFO to a queued request between slices - so a
+        concurrent user waits one slice (~seconds), not the whole generation (~30-50 s).  Each slice is a complete
+        GEN ending in DONE; the engine parked the conversation, so the next slice RESUMEs at zero re-feed.
+        Ownership invariant: this generator holds the service FIFO at every exit path (yield_turn re-acquires
+        before completing or closing, so the caller's ExitStack always releases a turn this request holds).
+        Engines without slots, native batch, and requests within one slice: today's path, unchanged."""
+        sl = int(getattr(self, "slice_tokens", 0) or 0)
+        yt = getattr(self, "yield_turn", None)
+        if (sl <= 0 or not getattr(self, "session_slots", 0) or getattr(self, "batch", 0)
+                or yt is None or not max_new or int(max_new) <= sl):
+            yield from self._generate_once(ids, max_new, sampling, cancel, embeddings, request_id)
+            return
+        n0, got, cur, slices = int(max_new), 0, list(ids), []
+        while got < n0:
+            if cancel.is_set():
+                return
+            for t in self._generate_once(cur, min(n0 - got, sl), sampling, cancel, embeddings, request_id):
+                if t is not None:
+                    got += 1
+                    cur.append(t)
+                yield t                       # a None heartbeat keeps the SSE stream alive within a slice
+            slices.append(dict(self.last))    # this slice's DONE figures
+            if got >= n0 or cancel.is_set():
+                break
+            hand = yt()                       # the service's seam: empty when nobody is queued (we keep the engine)
+            try:
+                for hb in hand:
+                    yield hb                  # None between the queue beats: the caller turns it into an SSE ping
+            finally:
+                close = getattr(hand, "close", None)   # a bare iterator (nobody queued) has none
+                if close is not None:
+                    close()                   # abandoned mid-wait: close() re-acquires the turn inside the seam
+        merged = dict(slices[-1]) if slices else dict(self.last)
+        if len(slices) > 1:                   # the caller records ONE segment per pass: give it whole-request totals
+            merged["generated"] = sum(int(s.get("generated", 0)) for s in slices)
+            merged["prompt_ms"] = round(sum(float(s.get("prompt_ms", 0.0)) for s in slices), 1)
+            merged["decode_ms"] = round(sum(float(s.get("decode_ms", 0.0)) for s in slices), 1)
+            merged["slices"] = len(slices)
+        self.last = merged
+
+    def _generate_once(self, ids, max_new, sampling, cancel, embeddings=None, request_id=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
@@ -3155,6 +3207,10 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        # P4b: the sliced-generation seam (StrataEngine.generate).  Set unconditionally: whether a generation
+        # slices is decided at generation time by engine.session_slots, which only the ported engines' READY
+        # "slots=N" suffix ever sets (the native engine and batch mode never enter that path).
+        engine.yield_turn = self._yield_turn
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -3219,6 +3275,29 @@ class Service:
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+
+    def _yield_turn(self):
+        """P4b: the sliced-generation seam handed to StrataEngine.yield_turn.  Returns an iterator:
+        empty when nobody is queued (the slicing request keeps the engine, no handoff cost); otherwise it has
+        RELEASED the fifo and yields a heartbeat per queue beat until the turn comes back.  Both the finish and
+        the close path leave this request holding the fifo again - the request's ExitStack always releases only
+        a turn this request actually holds (docs/gfx906/P4B-SESSIONS.md 3)."""
+        with self.status_lock:
+            if self.status.get("queued", 0) <= 0:
+                return iter(())
+        self.fifo.release()
+
+        def beat():
+            holds = False
+            try:
+                while not holds:
+                    holds = self.fifo.acquire(timeout=QUEUE_BEAT_S)
+                    if not holds:
+                        yield None
+            finally:
+                if not holds:                 # abandoned while waiting: the caller's ExitStack releases the turn it
+                    self.fifo.acquire()       # believes this request holds, so wait until we truly hold it again
+        return beat()
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -7012,6 +7091,7 @@ def main() -> int:
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
+        engine.slice_tokens = int(cfg.get("slice_tokens", engine.slice_tokens))   # P4b: slice size for park-slot engines
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop()) if not groups else None
