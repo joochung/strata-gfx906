@@ -83,6 +83,7 @@ struct Args {
     std::string backend = "cuda", experts = "gpu";
     int64_t slots = 0;            // 0 = auto (free VRAM after the dense half, minus --vram-margin)
     int tier_cards = 1;           // P6.4: --tier-cards N stripes the expert tier over N cards (1 = today, byte-identical)
+    int park_slots = 1;           // P4b: --serve parks N conversations (docs/gfx906/P4B-SESSIONS.md); 1 = today's single park
     // defaults = the measured best decode config on the 4090 (2026-10-11): --pcie 0.75 --pf-b 1.43 --vram-lru
     double vram_margin_gib = 1.0, pcie = 0.75, arena_gib = 60.0, pf_b = 1.43;
     double tier_batch_pcie = -1.0;   // < 0 = STRATA_TIER_BATCH_PCIE / 1.0
@@ -166,6 +167,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, ':')) a.engram.push_back(d); }
         else if (k == "--slots") { const std::string v = next(); a.slots = v == "auto" ? 0 : std::atoll(v.c_str()); }
         else if (k == "--tier-cards") a.tier_cards = std::atoi(next().c_str());
+        else if (k == "--park-slots") a.park_slots = std::atoi(next().c_str());
         else if (k == "--vram-margin") a.vram_margin_gib = std::atof(next().c_str());
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
         else if (k == "--rank") a.rank = next();
@@ -661,6 +663,8 @@ int main(int argc, char ** argv) {
     if (a.tier_cards < 1) { std::fprintf(stderr, "ds41_generate: --tier-cards must be >= 1\n"); return 2; }
     if (a.tier_cards > 1 && (a.serve || !a.split.gpus.empty() || a.experts == "cpu"))
         { std::fprintf(stderr, "ds41_generate: --tier-cards %d refuses --serve, --gpus staging and --experts cpu\n", a.tier_cards); return 2; }
+    if (a.park_slots < 1 || a.park_slots > 16)
+        { std::fprintf(stderr, "ds41_generate: --park-slots must be 1..16\n"); return 2; }
     if (!a.build_mirror.empty()) {   // the second-drive blob mirror (STRATA_BLOB_MIRROR): coldest experts first
         std::string err;
         if (a.mirror_gib < 0) {   // --check-mirror F: open it with every blob compared against the model file
@@ -2236,11 +2240,22 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
         // STRATA_SERVE_PARK_MIN: only conversations of >= this many tokens (default 2048); STRATA_SERVE_PARK_MAX: the
         // most positions a side request may write (prompt + max tokens, default 65536 ~ 1 GB of host memory).
         const bool park_on = !(std::getenv("STRATA_SERVE_PARK") && std::getenv("STRATA_SERVE_PARK")[0] == '0');
-        const int park_min = std::getenv("STRATA_SERVE_PARK_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PARK_MIN")) : 2048;
+        // P4b: with N slots every active slice must be parkable - an unparked short conversation re-prefills at the
+        // batch crossover (16.8 s + n/250, the STRATA_SERVE_STEP_MAX note below); the 2048 floor exists to avoid
+        // parking trivia when there is only ONE slot (the harness pattern STRATA_SERVE_PARK was written for).
+        const int park_min = std::getenv("STRATA_SERVE_PARK_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PARK_MIN"))
+                                                                  : (a.park_slots > 1 ? 128 : 2048);
         const int64_t park_max = std::getenv("STRATA_SERVE_PARK_MAX") ? std::atoll(std::getenv("STRATA_SERVE_PARK_MAX")) : 65536;
         std::vector<int> park_hist;       // the parked conversation's tokens (its snapshot length)
         std::vector<float> park_logits;
         int64_t park_rows = 0;            // positions saved: a request writing past this invalidates the park
+        // P4b (docs/gfx906/P4B-SESSIONS.md 2b): --park-slots N > 1 carries N conversations.  dense's park slot k holds
+        // the host rows, pslots[k] the bookkeeping; the partial-unpark rule applies per slot, unchanged.  Slot 0 with
+        // the variables above is the ORIGINAL single park, so --park-slots 1 keeps today's exact code path.
+        static const bool park_partial = !(std::getenv("STRATA_SERVE_PARK_PARTIAL") && std::getenv("STRATA_SERVE_PARK_PARTIAL")[0] == '0');
+        struct SlotConv { std::vector<int> hist; std::vector<float> logits; int64_t rows = 0; uint64_t last = 0; };
+        std::vector<SlotConv> pslots((size_t) std::max(1, a.park_slots));
+        uint64_t ptick = 0;
         bool cache_open = !defer_vram;   // deferred: the arena only until the first decode
 #if defined(DS41_HAVE_DSPARK)
         // STRATA_SERVE_DSPARK: DSpark's window (main_hidden of the last <= 128 positions) is seeded by running a
@@ -2260,7 +2275,9 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
         const bool pass_bias = !(std::getenv("STRATA_SERVE_PASS_BIAS") && std::getenv("STRATA_SERVE_PASS_BIAS")[0] == '0');
         std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) resident_all(),
                     (long long) tier.arena_experts());
-        std::printf("READY %d stop\n", ctxv);
+        // P4b: the slots suffix is printed ONLY when N > 1, so an existing server parses today's line unchanged.
+        if (a.park_slots > 1) std::printf("READY %d stop slots=%d\n", ctxv, a.park_slots);
+        else std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
         std::string line;
@@ -2295,7 +2312,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
             bool unparked = false;
             int reuse_override = -1;   // a partial unpark: resume at the longest common prefix (see below)
             size_t lp_show = 0;        // how far this request actually continues the PARKED conversation (logged)
-            if (dense.parked()) {   // does this request continue the parked conversation (better than the live one)?
+            if (a.park_slots == 1 && dense.parked()) {   // single-park path: the ORIGINAL code, unchanged for --park-slots 1
                 size_t lp = 0;
                 while (lp < park_hist.size() && lp < ids.size() && park_hist[lp] == ids[lp]) ++lp;
                 lp_show = lp;
@@ -2307,7 +2324,7 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                 // Positional caches make a partial resume safe: unpark() restores positions [0, park_size) and the
                 // forward pass then re-feeds from lp, overwriting the stale tail (that is the documented fix: "resume
                 // at the longest common prefix even when it is below the snapshot").
-                static const bool park_partial = !(std::getenv("STRATA_SERVE_PARK_PARTIAL") && std::getenv("STRATA_SERVE_PARK_PARTIAL")[0] == '0');
+                // P4b: park_partial is hoisted to the serve scope (both the single-slot and the N-slot paths use it).
                 const size_t lp_min = (size_t) std::max<int64_t>(park_min, (int64_t) park_hist.size() * 3 / 4);
                 if (park_partial && lp < park_hist.size() && lp >= lp_min && lp > lcp && dense.unpark()) {
                     std::fprintf(stderr, "serve: unparked the %zu-token conversation at lcp %zu (partial: re-feeds from there)\n",
@@ -2335,6 +2352,36 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                     dense.drop_park();   // this request writes past the saved rows
                     std::fprintf(stderr, "serve: park dropped (request reaches past %lld positions)\n", (long long) park_rows);
                 }
+            } else if (a.park_slots > 1) {   // P4b 2b: scan the N park slots, the best LCP wins (the same full/partial rules)
+                int best = -1; size_t best_lp = 0; bool best_full = false;
+                for (int k = 0; k < a.park_slots; ++k) {
+                    if (!dense.parked(k) || pslots[(size_t) k].hist.empty()) continue;
+                    const std::vector<int> & ph = pslots[(size_t) k].hist;
+                    size_t lp = 0;
+                    while (lp < ph.size() && lp < ids.size() && ph[lp] == ids[lp]) ++lp;
+                    if (lp > lp_show) lp_show = lp;
+                    const bool full = lp == ph.size();
+                    const size_t lp_min = (size_t) std::max<int64_t>(park_min, (int64_t) ph.size() * 3 / 4);
+                    if (lp <= lcp || lp < best_lp || (!full && !(park_partial && lp >= lp_min))) continue;
+                    best = k; best_lp = lp; best_full = full;
+                }
+                if (best >= 0 && dense.unpark(best)) {
+                    SlotConv & sc = pslots[(size_t) best];
+                    std::fprintf(stderr, "serve: unparked slot %d's %zu-token conversation%s\n", best, sc.hist.size(),
+                                 best_full ? "" : " (partial: re-feeds from there)");
+                    hist = sc.hist;
+                    if (best_full) { snap_len = (int) hist.size(); snap_logits = sc.logits; }
+                    else { snap_len = -1; reuse_override = (int) best_lp; }   // resume at lp, re-feed the rest
+                    lcp = best_lp;
+                    unparked = true;
+                    sc.hist.clear(); sc.logits.clear(); sc.rows = 0;   // the slot is consumed: the rows live on the card
+#if defined(DS41_HAVE_DSPARK)
+                    dsp_next = -1;        // DSpark's window holds another conversation's states (acceptance, never output)
+#endif
+                }
+                // no park_rows-drop guard here: that guard freed the SINGLE slot before a long request (a budget call);
+                // with N slots an unmatched arrival just runs - the parks are host-side, and a full one finds a free
+                // slot or evicts LRU when the NEXT unrelated conversation parks.
             }
             int reused = 0;
             bool regen = false;   // the snapshot's own prompt again: nothing new to feed
@@ -2351,12 +2398,28 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
             } else {
                 // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK)
                 const int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;
-                if (park_on && !dense.parked() && snap_len >= park_min && hist.size() >= (size_t) snap_len && rows <= park_max
-                    && dense.park(rows)) {
+                if (park_on && a.park_slots == 1 && !dense.parked() && snap_len >= park_min && hist.size() >= (size_t) snap_len
+                    && rows <= park_max && dense.park(rows)) {
                     park_hist.assign(hist.begin(), hist.begin() + snap_len);
                     park_logits = snap_logits;
                     park_rows = rows;
                     std::fprintf(stderr, "serve: parked the %d-token conversation (%lld positions saved)\n", snap_len, (long long) rows);
+                } else if (park_on && a.park_slots > 1 && snap_len >= park_min && hist.size() >= (size_t) snap_len && rows <= park_max) {
+                    int k = -1;   // a free slot, else the least-recently-parked one (docs/gfx906/P4B-SESSIONS.md 2b)
+                    for (int j = 0; j < a.park_slots; ++j) if (!dense.parked(j)) { k = j; break; }
+                    if (k < 0) {
+                        k = 0;
+                        for (int j = 1; j < a.park_slots; ++j) if (pslots[(size_t) j].last < pslots[(size_t) k].last) k = j;
+                    }
+                    if (dense.park(rows, k)) {
+                        SlotConv & sc = pslots[(size_t) k];
+                        sc.hist.assign(hist.begin(), hist.begin() + snap_len);
+                        sc.logits = snap_logits;
+                        sc.rows = rows;
+                        sc.last = ++ptick;
+                        std::fprintf(stderr, "serve: parked the %d-token conversation into slot %d (%lld positions saved)\n",
+                                     snap_len, k, (long long) rows);
+                    }
                 }
                 hist.clear();
                 snap_len = -1;
@@ -2822,6 +2885,14 @@ std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, e
                              1.0 + (double) rq_acc / rq_pass, 1.0 + (double) sv_acc / std::max(1L, sv_pass));
 #endif
             tier.rebalance_tick(true);   // the gap until the next request: retire a large batch for the reader
+            // P4b 2c: with slots > 1 re-arm the snapshot at THIS request's end, so a slice's park covers
+            // prompt+generated and its continuation resumes at zero re-feed (docs/gfx906/P4B-SESSIONS.md 2c).
+            // Consequence, slots>1 only: the REGENERATE fast path fires at slice ends, a repeated prompt re-feeds
+            // from the prompt-end LCP instead (correct, slower).
+            if (a.park_slots > 1 && !hist.empty() && std::strcmp(finish, "error") != 0 && dense.snapshot((int) hist.size())) {
+                snap_len = (int) hist.size();
+                snap_logits = last_logits;
+            }
             std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
                         (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, total - reused);
             std::fflush(stdout);

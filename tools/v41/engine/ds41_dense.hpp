@@ -311,13 +311,17 @@ public:
     int snapshot_pos() const;
     /// Serve: keep a conversation through an UNRELATED request.  An unrelated request writes its own positions from 0, so
     /// it overwrites the start of every position-indexed cache (compressed KV, indexer keys) and the snapshot rings.
-    /// park(n) copies the snapshot rings + the first n positions' rows of those caches (and their spare rows) to host
-    /// memory; unpark() writes them back and re-arms the snapshot, so restore() resumes the parked conversation.  Valid
-    /// only while no request has written past position n since park (the caller checks).
-    bool park(int64_t positions);
-    bool unpark();
-    void drop_park();
-    bool parked() const;
+    /// Serve: keep a conversation through an UNRELATED request.  An unrelated request writes its own positions from 0, so
+    /// it overwrites the start of every position-indexed cache (compressed KV, indexer keys) and the snapshot rings.
+    /// park(n, slot) copies the snapshot rings + the first n positions' rows of those caches (and their spare rows) to
+    /// host memory in THAT slot; unpark(slot) writes them back and re-arms the snapshot, so restore() resumes the parked
+    /// conversation.  Valid only while no request has written past position n since park (the caller checks).
+    /// P4b (docs/gfx906/P4B-SESSIONS.md 2a): N slots carry N concurrent conversations; slot 0 is the original single
+    /// park (serve's --park-slots 1 path), so default behavior is byte-identical.
+    bool park(int64_t positions, int slot = 0);
+    bool unpark(int slot = 0);
+    void drop_park(int slot = 0);
+    bool parked(int slot = 0) const;
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
     /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns
